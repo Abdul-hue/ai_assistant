@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
-const rateLimit = require('express-rate-limit');
+// Rate limiting disabled - removed express-rate-limit import
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -168,103 +168,11 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // ============================================================================
-// RATE LIMITING (SECURITY: Prevent brute force and DDoS attacks)
+// RATE LIMITING - DISABLED
 // ============================================================================
-// COMMENTED OUT - Rate limiting disabled
-
-// // General API rate limiter
-// const apiLimiter = rateLimit({
-//   windowMs: 15 * 60 * 1000, // 15 minutes
-//   max: 100, // Limit each IP to 100 requests per windowMs
-//   message: 'Too many requests from this IP, please try again after 15 minutes',
-//   standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-//   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-//   handler: (req, res) => {
-//     console.warn(`⚠️ Rate limit exceeded for IP: ${req.ip} on ${req.path}`);
-//     res.status(429).json({
-//       error: 'Too many requests',
-//       message: 'Please slow down and try again later',
-//       retryAfter: Math.ceil(15 * 60) // seconds
-//     });
-//   }
-// });
-
-// // Strict rate limiter for authentication endpoints (SECURITY: Prevent brute force attacks)
-// const authLimiter = rateLimit({
-//   windowMs: 15 * 60 * 1000, // 15 minutes
-//   max: 5, // Limit each IP to 5 login attempts per windowMs
-//   skipSuccessfulRequests: true, // Don't count successful requests
-//   message: 'Too many authentication attempts, please try again after 15 minutes',
-//   handler: (req, res) => {
-//     console.error(`🚨 SECURITY: Auth brute force attempt from IP: ${req.ip}`);
-//     res.status(429).json({
-//       error: 'Too many authentication attempts',
-//       message: 'Account temporarily locked. Please try again after 15 minutes',
-//       retryAfter: Math.ceil(15 * 60)
-//     });
-//   }
-// });
-
-// // Session creation rate limiter (SECURITY: Prevent abuse while allowing OAuth callbacks)
-// // 🔧 FIX: More lenient in development to handle React Strict Mode and OAuth quirks
-// const sessionLimiter = rateLimit({
-//   windowMs: 15 * 60 * 1000, // 15 minutes
-//   max: process.env.NODE_ENV === 'production' ? 10 : 100, // 100 in dev, 10 in prod
-//   message: {
-//     error: 'Too many session requests',
-//     message: 'Please wait before trying again',
-//     retryAfter: 900
-//   },
-//   standardHeaders: true,
-//   legacyHeaders: false,
-//   // 🔧 FIX: Skip rate limiting if valid cookie already exists
-//   skip: async (req) => {
-//     const token = req.cookies?.sb_access_token;
-//     if (!token) {
-//       return false;
-//     }
-
-//     // Verify token is actually valid (not just present)
-//     try {
-//       const { supabaseAdmin } = require('./src/config/supabase');
-//       const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
-      
-//       if (!error && user) {
-//         console.log('⏭️  Skipping rate limit (valid session already exists for:', user.email + ')');
-//         return true; // Skip rate limit
-//       }
-//     } catch (err) {
-//       console.error('Error validating token for rate limit skip:', err.message);
-//     }
-    
-//     return false;
-//   },
-//   handler: (req, res) => {
-//     console.error(`🚨 SECURITY: Session rate limit exceeded for IP: ${req.ip}`);
-//     res.status(429).json({
-//       error: 'Too many session requests',
-//       message: 'Please wait a moment before trying again',
-//       retryAfter: Math.ceil(15 * 60)
-//     });
-//   }
-// });
-
-// // WhatsApp initialization rate limiter (SECURITY: Prevent abuse of WhatsApp sessions)
-// const whatsappInitLimiter = rateLimit({
-//   windowMs: 5 * 60 * 1000, // 5 minutes
-//   max: 10, // Limit to 10 WhatsApp initialization attempts per 5 minutes
-//   message: 'Too many WhatsApp connection attempts, please try again later',
-//   handler: (req, res) => {
-//     console.warn(`⚠️ WhatsApp init rate limit exceeded for IP: ${req.ip}`);
-//     res.status(429).json({
-//       error: 'Too many connection attempts',
-//       message: 'Please wait before trying to connect again',
-//       retryAfter: Math.ceil(5 * 60)
-//     });
-//   }
-// });
-
-// console.log('✅ Rate limiting configured');
+// Rate limiting has been completely removed to prevent issues with frequent polling
+// of the whatsapp-status endpoint. If you need rate limiting in the future, you can
+// re-enable it by installing express-rate-limit and configuring it here.
 
 // ============================================================================
 // MIDDLEWARE
@@ -286,9 +194,7 @@ if (require('fs').existsSync(publicPath)) {
   console.log('✅ Static files served from:', publicPath);
 }
 
-// Apply general rate limiting to all API routes
-// COMMENTED OUT - Rate limiting disabled
-// app.use('/api/', apiLimiter);
+// Rate limiting disabled - no rate limiting applied to API routes
 
 // Request logging (development only)
 if (process.env.NODE_ENV !== 'production') {
@@ -361,21 +267,17 @@ app.get('/api/health/n8n', async (req, res) => {
 });
 
 // ============================================================================
-// API ROUTES (with specific rate limiters)
+// API ROUTES
 // ============================================================================
 
-// Auth routes with rate limiting (SECURITY: Prevent brute force)
-// COMMENTED OUT - Rate limiting disabled
-// app.use('/api/auth/session', sessionLimiter); // More lenient for OAuth callbacks
+// Auth routes (rate limiting disabled)
 app.use('/api/auth', authRoutes);
 
 // Other routes
 app.use('/api/migrate', migrateRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 
-// Agent routes with WhatsApp-specific rate limiting
-// COMMENTED OUT - Rate limiting disabled
-// app.use('/api/agents/:agentId/init-whatsapp', whatsappInitLimiter);
+// Agent routes (rate limiting disabled)
 app.use('/api/agents', agentRoutes);
 app.use('/api/agents', contactsRoutes);
 app.use('/api/profile', profileRoutes);
