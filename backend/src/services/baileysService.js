@@ -34,7 +34,9 @@ const activeSessions = new Map();
 const qrGenerationTracker = new Map();
 const connectionLocks = new Map(); // agentId -> boolean
 const lastConnectionAttempt = new Map(); // agentId -> timestamp ms
-const COOLDOWN_MS = 5000;
+const last401Failure = new Map(); // agentId -> timestamp ms (prevents auto-retry after 401)
+const COOLDOWN_MS = 5000; // 5 seconds between connection attempts
+const FAILURE_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes after 401 errors before allowing retry
 const MESSAGE_FORWARD_TIMEOUT_MS = 10000;
 const DEFAULT_MESSAGE_WEBHOOK_TEST = 'https://auto.nsolbpo.com/webhook-test/a18ff948-9380-4abe-a8d8-0912dae2d8ab';
 const DEFAULT_MESSAGE_WEBHOOK_PROD = 'https://auto.nsolbpo.com/webhook/a18ff948-9380-4abe-a8d8-0912dae2d8ab';
@@ -768,6 +770,13 @@ async function initializeWhatsApp(agentId, userId = null) {
         return;
       }
       
+      // If session is marked as conflict (401 error), stop health check
+      if (session.connectionState === 'conflict' || session.failureReason) {
+        console.log(`[BAILEYS] Health check: Session in conflict state, clearing interval`);
+        clearInterval(healthCheckInterval);
+        return;
+      }
+      
       const now = Date.now();
       const socketAge = now - session.socketCreatedAt;
       const timeSinceLastPing = now - session.lastPingAt;
@@ -787,6 +796,9 @@ async function initializeWhatsApp(agentId, userId = null) {
         clearInterval(healthCheckInterval);
       }
     }, 30000); // Check every 30 seconds
+    
+    // Store interval ID in session so we can clear it if needed
+    sessionData.healthCheckInterval = healthCheckInterval;
 
     console.log(`[BAILEYS] ✅ Socket health monitor started (checks every 30s)`);
 
@@ -876,6 +888,10 @@ async function initializeWhatsApp(agentId, userId = null) {
         
         qrGenerationTracker.delete(agentId);
         console.log(`[BAILEYS] 🛑 QR generation disabled for ${agentId.substring(0, 40)} (connection open)`);
+        
+        // CRITICAL: Clear 401 failure timestamp on successful connection
+        last401Failure.delete(agentId);
+        console.log(`[BAILEYS] ✅ 401 failure cooldown cleared - connection successful`);
         
         const phoneNumber = sock.user?.id || 'Unknown';
         const cleanPhone = phoneNumber.split(':')[0].replace('@s.whatsapp.net', '');
@@ -1041,6 +1057,12 @@ async function initializeWhatsApp(agentId, userId = null) {
             }
           }
 
+          // Stop health check interval to prevent warning spam
+          if (session?.healthCheckInterval) {
+            clearInterval(session.healthCheckInterval);
+            console.log(`[BAILEYS] Health check interval stopped`);
+          }
+
           connectionLocks.delete(agentId);
           lastConnectionAttempt.set(agentId, Date.now());
           
@@ -1064,6 +1086,12 @@ async function initializeWhatsApp(agentId, userId = null) {
           const failureReason = payload?.error || reason || 'conflict';
           console.log(`[BAILEYS] ✅ Session cleared after 401. Failure reason: ${failureReason}`);
 
+          // CRITICAL: Record 401 failure timestamp to prevent automatic retries
+          last401Failure.set(agentId, Date.now());
+          console.log(`[BAILEYS] 🚫 Auto-retry disabled for ${Math.ceil(FAILURE_COOLDOWN_MS / 60000)} minutes after 401 error`);
+
+          // Mark session as conflict and remove from active sessions
+          // This stops the health check and prevents reconnection attempts
           if (session) {
             session.failureReason = failureReason;
             session.failureAt = Date.now();
@@ -1074,7 +1102,13 @@ async function initializeWhatsApp(agentId, userId = null) {
             session.socket = null;
             session.state = null;
             session.saveCreds = null;
+            session.healthCheckInterval = null;
           }
+
+          // Remove from active sessions to fully clean up
+          // User will need to reconnect manually to get a new QR code
+          activeSessions.delete(agentId);
+          console.log(`[BAILEYS] Session removed from active sessions. Manual reconnection required.`);
 
           return;
         }
@@ -1509,6 +1543,56 @@ async function safeInitializeWhatsApp(agentId, userId = null) {
     };
   }
 
+  // CRITICAL: Check if there was a recent 401 failure (prevent auto-retry)
+  const last401 = last401Failure.get(agentId);
+  if (last401 && (now - last401) < FAILURE_COOLDOWN_MS) {
+    const waitMs = FAILURE_COOLDOWN_MS - (now - last401);
+    const waitMinutes = Math.ceil(waitMs / 60000);
+    console.log(`[BAILEYS] 🚫 401 error occurred recently for agent ${agentId.substring(0, 40)}`);
+    console.log(`[BAILEYS] 🚫 Auto-retry blocked. Manual reconnection required. (Wait ${waitMinutes} min or reconnect manually)`);
+    
+    // Check database status
+    const { data: dbSession } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    if (dbSession?.status === 'conflict') {
+      return {
+        success: false,
+        status: 'conflict',
+        error: 'Session conflict detected. Please disconnect and reconnect manually.',
+        requiresManualAction: true
+      };
+    }
+    
+    return {
+      success: false,
+      status: 'cooldown',
+      error: `Recent 401 error. Please wait ${waitMinutes} minute(s) or reconnect manually.`,
+      retryAfter: waitMs,
+      requiresManualAction: true
+    };
+  }
+
+  // CRITICAL: Check database for conflict status before attempting connection
+  const { data: dbSession } = await supabaseAdmin
+    .from('whatsapp_sessions')
+    .select('status, is_active')
+    .eq('agent_id', agentId)
+    .maybeSingle();
+
+  if (dbSession?.status === 'conflict') {
+    console.log(`[BAILEYS] 🚫 Session has conflict status for agent ${agentId.substring(0, 40)} - manual reconnection required`);
+    return {
+      success: false,
+      status: 'conflict',
+      error: 'Session conflict detected. Please disconnect and reconnect manually.',
+      requiresManualAction: true
+    };
+  }
+
   const lastAttempt = lastConnectionAttempt.get(agentId) || 0;
   if (now - lastAttempt < COOLDOWN_MS) {
     const waitMs = COOLDOWN_MS - (now - lastAttempt);
@@ -1536,12 +1620,20 @@ async function disconnectWhatsApp(agentId) {
   
   const session = activeSessions.get(agentId);
   if (session?.socket) {
+    // Stop health check if running
+    if (session.healthCheckInterval) {
+      clearInterval(session.healthCheckInterval);
+    }
     session.socket.ev.removeAllListeners();
     session.socket.end();
   }
   
   activeSessions.delete(agentId);
   qrGenerationTracker.delete(agentId);
+  
+  // Clear 401 failure cooldown on manual disconnect (user wants to reconnect)
+  last401Failure.delete(agentId);
+  console.log(`[BAILEYS] ✅ 401 failure cooldown cleared (manual disconnect)`);
   
   const authDir = path.join(__dirname, '../../auth_sessions', agentId);
   if (fs.existsSync(authDir)) {
@@ -1556,6 +1648,7 @@ async function disconnectWhatsApp(agentId) {
       qr_generated_at: null,
       is_active: false,
       phone_number: null,
+      status: 'disconnected', // Set status to disconnected
       updated_at: new Date().toISOString()
     })
     .eq('agent_id', agentId);
@@ -1947,10 +2040,13 @@ async function initializeExistingSessions() {
     console.log('\n[BAILEYS] ========== STARTUP: CHECKING FOR EXISTING SESSIONS ==========');
     console.log('[BAILEYS] 🔍 Querying database for active WhatsApp sessions...');
     
+    // CRITICAL: Don't auto-reconnect sessions with conflict status (401 errors)
+    // These require manual user intervention
     const { data: activeSessionsData, error } = await supabaseAdmin
       .from('whatsapp_sessions')
       .select('agent_id, phone_number, status')
       .eq('is_active', true)
+      .neq('status', 'conflict') // Exclude conflict status sessions
       .limit(20); // Support up to 20 concurrent connections
     
     if (error) {
@@ -1965,13 +2061,37 @@ async function initializeExistingSessions() {
       return;
     }
     
-    console.log(`[BAILEYS] ✅ Found ${activeSessionsData.length} active session(s) in database:`);
+    // Check for conflict sessions that won't be auto-reconnected
+    const { data: conflictSessions } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('agent_id, status')
+      .eq('is_active', true)
+      .eq('status', 'conflict')
+      .limit(20);
+    
+    if (conflictSessions && conflictSessions.length > 0) {
+      console.log(`[BAILEYS] ⚠️  Found ${conflictSessions.length} session(s) with conflict status (will NOT auto-reconnect):`);
+      conflictSessions.forEach((session, index) => {
+        console.log(`[BAILEYS]    ${index + 1}. Agent: ${session.agent_id.substring(0, 20)}... Status: ${session.status}`);
+      });
+      console.log(`[BAILEYS] ℹ️  These sessions require manual reconnection due to 401 errors (device removed/conflict)`);
+    }
+    
+    if (activeSessionsData.length === 0) {
+      console.log(`[BAILEYS] ℹ️  No active sessions to auto-reconnect (conflict sessions excluded)`);
+      console.log('[BAILEYS] 📝 Connection persistence: When users connect, sessions will persist across server restarts');
+      console.log('[BAILEYS] ========== STARTUP CHECK COMPLETE ==========\n');
+      return;
+    }
+    
+    console.log(`[BAILEYS] ✅ Found ${activeSessionsData.length} active session(s) to auto-reconnect:`);
     activeSessionsData.forEach((session, index) => {
       console.log(`[BAILEYS]    ${index + 1}. Agent: ${session.agent_id.substring(0, 20)}... Phone: ${session.phone_number || 'Unknown'}`);
     });
     
     console.log(`\n[BAILEYS] 🔄 AUTO-RECONNECTING ${activeSessionsData.length} session(s)...`);
-    console.log('[BAILEYS] This ensures WhatsApp connections persist across server restarts.\n');
+    console.log('[BAILEYS] This ensures WhatsApp connections persist across server restarts.');
+    console.log('[BAILEYS] ⚠️  Note: Sessions with conflict status are excluded and require manual reconnection.\n');
     
     // Auto-reconnect each active session
     let successCount = 0;
