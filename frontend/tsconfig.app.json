@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting - SECURITY: Incremental strict mode enablement */
+    "strict": false, // TODO: Enable after fixing all type errors
+    "noImplicitAny": true, // PHASE 1: Prevent implicit any types
+    "noUnusedLocals": false, // TODO: Enable in phase 2
+    "noUnusedParameters": false, // TODO: Enable in phase 2
+    "noFallthroughCasesInSwitch": true, // Prevent switch statement bugs
+
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": ["src"]
+}

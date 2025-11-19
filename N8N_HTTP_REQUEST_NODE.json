@@ -1,0 +1,38 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://connectbot-ai-production-2e05.up.railway.app/api/webhooks/send-message",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ {\"agentId\": $('Prepare AI Context').item.json.agentId, \"to\": $json.numbers, \"message\": $json.content || $json.message} }}",
+        "options": {}
+      },
+      "id": "582d92ae-cdbb-454b-a0cb-cd2f8e4b407f",
+      "name": "Send Response via WhatsApp2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3536,
+        -496
+      ]
+    }
+  ],
+  "connections": {},
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "449dd401701d896f8337691da8e597af971df1cea470044fe6ad5778b4711639"
+  }
+}
+

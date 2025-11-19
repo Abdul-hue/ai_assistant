@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  connectbot-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: connectbot-ai
+    ports:
+      - "3001:3001"
+    # Load all environment variables from backend/.env file
+    # This automatically makes all variables available to the container
+    env_file:
+      - ./backend/.env
+    volumes:
+      # Persist auth_sessions across container restarts
+      # This is critical for WhatsApp session persistence
+      - auth_sessions_data:/app/backend/auth_sessions
+    environment:
+      # Hardcoded values only (all other variables come from env_file)
+      - NODE_ENV=production
+      - PORT=3001
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - connectbot-network
+
+# Named volume for auth_sessions persistence
+volumes:
+  auth_sessions_data:
+    driver: local
+
+networks:
+  connectbot-network:
+    driver: bridge
+

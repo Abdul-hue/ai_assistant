@@ -1,0 +1,48 @@
+{
+  "name": "whatsapp-bot-backend",
+  "version": "1.0.0",
+  "description": "WhatsApp Bot with Baileys integration",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js",
+    "migrate": "node scripts/migrate.js",
+    "migrate:prod": "NODE_ENV=production node scripts/migrate.js",
+    "lint": "eslint src/ app.js",
+    "lint:fix": "eslint src/ app.js --fix",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:whatsapp": "node tests/whatsapp-connection.test.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@supabase/supabase-js": "^2.75.0",
+    "@whiskeysockets/baileys": "^6.7.9",
+    "axios": "^1.12.2",
+    "csv-parse": "^5.5.3",
+    "@pinecone-database/pinecone": "^3.0.1",
+    "pdf-parse": "^1.1.1",
+    "mammoth": "^1.6.0",
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "exceljs": "^4.4.0",
+    "express": "^4.18.2",
+    "express-rate-limit": "^8.1.0",
+    "jsonwebtoken": "^9.0.0",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.16.3",
+    "pino": "^8.21.0",
+    "pino-pretty": "^10.2.0",
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "vcf": "^2.1.1",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
