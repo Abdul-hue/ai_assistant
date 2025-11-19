@@ -1057,11 +1057,32 @@ async function initializeWhatsApp(agentId, userId = null) {
             }
           }
 
+          // CRITICAL: Mark session as conflict FIRST to stop health check
+          // The health check will see conflict state and stop itself
+          const failureReason = payload?.error || reason || 'conflict';
+          if (session) {
+            session.failureReason = failureReason;
+            session.failureAt = Date.now();
+            session.isConnected = false;
+            session.connectionState = 'conflict'; // This triggers health check to stop
+            session.qrCode = null;
+            session.qrGeneratedAt = null;
+            session.socket = null;
+            session.state = null;
+            session.saveCreds = null;
+          }
+
           // Stop health check interval to prevent warning spam
           if (session?.healthCheckInterval) {
             clearInterval(session.healthCheckInterval);
-            console.log(`[BAILEYS] Health check interval stopped`);
+            session.healthCheckInterval = null;
+            console.log(`[BAILEYS] ✅ Health check interval stopped`);
           }
+
+          // Remove from active sessions IMMEDIATELY to stop health check
+          // Health check checks if session exists, so deleting it stops the loop
+          activeSessions.delete(agentId);
+          console.log(`[BAILEYS] ✅ Session removed from active sessions`);
 
           connectionLocks.delete(agentId);
           lastConnectionAttempt.set(agentId, Date.now());
@@ -1083,32 +1104,12 @@ async function initializeWhatsApp(agentId, userId = null) {
             })
             .eq('agent_id', agentId);
           
-          const failureReason = payload?.error || reason || 'conflict';
           console.log(`[BAILEYS] ✅ Session cleared after 401. Failure reason: ${failureReason}`);
 
           // CRITICAL: Record 401 failure timestamp to prevent automatic retries
           last401Failure.set(agentId, Date.now());
           console.log(`[BAILEYS] 🚫 Auto-retry disabled for ${Math.ceil(FAILURE_COOLDOWN_MS / 60000)} minutes after 401 error`);
-
-          // Mark session as conflict and remove from active sessions
-          // This stops the health check and prevents reconnection attempts
-          if (session) {
-            session.failureReason = failureReason;
-            session.failureAt = Date.now();
-            session.isConnected = false;
-            session.connectionState = 'conflict';
-            session.qrCode = null;
-            session.qrGeneratedAt = null;
-            session.socket = null;
-            session.state = null;
-            session.saveCreds = null;
-            session.healthCheckInterval = null;
-          }
-
-          // Remove from active sessions to fully clean up
-          // User will need to reconnect manually to get a new QR code
-          activeSessions.delete(agentId);
-          console.log(`[BAILEYS] Session removed from active sessions. Manual reconnection required.`);
+          console.log(`[BAILEYS] ⚠️  Manual reconnection required - user must click "Connect" to get new QR code`);
 
           return;
         }
