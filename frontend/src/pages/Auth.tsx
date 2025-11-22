@@ -11,6 +11,7 @@ import { supabase } from "@/integrations/supabase/client";
 import GoogleAuthButton from "@/components/GoogleAuthButton.jsx";
 import { useToast } from "@/hooks/use-toast";
 import { API_URL } from "@/config";
+import { CountrySelect } from "@/components/ui/CountrySelect";
 
 const Auth = () => {
   const navigate = useNavigate();
@@ -27,7 +28,8 @@ const Auth = () => {
     password: "",
     fullName: "",
     companyName: "",
-    phoneNumber: ""
+    phoneNumber: "",
+    country: ""
   });
 
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -101,6 +103,15 @@ const Auth = () => {
       return;
     }
 
+    if (!signupData.country) {
+      toast({
+        variant: "destructive",
+        title: "Country required",
+        description: "Please select your country to continue.",
+      });
+      return;
+    }
+
     if (signupData.password !== confirmPassword) {
       toast({
         variant: "destructive",
@@ -124,6 +135,7 @@ const Auth = () => {
           fullName: signupData.fullName,
           companyName: signupData.companyName,
           phoneNumber: signupData.phoneNumber,
+          country: signupData.country,
         }),
       });
 
@@ -132,6 +144,7 @@ const Auth = () => {
         throw new Error(payload.message || payload.error || "Signup failed");
       }
 
+      // Auto-login after signup (email verification disabled)
       const { error: loginError } = await supabase.auth.signInWithPassword({
         email: signupData.email,
         password: signupData.password,
@@ -328,6 +341,17 @@ const Auth = () => {
                         value={signupData.phoneNumber}
                         onChange={(e) => setSignupData({ ...signupData, phoneNumber: e.target.value })}
                         className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50 transition-all duration-300"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="signup-country" className="text-gray-300">
+                        Country <span className="text-red-500">*</span>
+                      </Label>
+                      <CountrySelect
+                        value={signupData.country}
+                        onChange={(value) => setSignupData({ ...signupData, country: value })}
+                        placeholder="Select your country"
+                        required
                       />
                     </div>
                     <div className="space-y-2">

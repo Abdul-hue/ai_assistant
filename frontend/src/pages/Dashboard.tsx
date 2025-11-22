@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
+import { formatDistanceToNow } from "date-fns";
 import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Bot, MessageSquare, Loader2, Calendar as CalendarIcon, Eye, Users, Trash2, LayoutDashboard, Settings, Home, RefreshCw, AlertCircle } from "lucide-react";
+import { Plus, Bot, MessageSquare, Loader2, Calendar as CalendarIcon, Eye, Users, Trash2, LayoutDashboard, Settings, Home, RefreshCw, AlertCircle, Globe, Clock, User } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import AgentDetailsModal from "@/components/AgentDetailsModal";
 import ContactsManagementDialog from "@/components/agents/ContactsManagementDialog";
@@ -331,75 +332,101 @@ const Dashboard = () => {
               {agents.map((agent) => (
                 <Card 
                   key={agent.id} 
-                  className="glass-card hover:border-primary/50 transition-all duration-300 hover:scale-105 cursor-pointer group"
-                  onClick={() => {
-                    setSelectedAgentId(agent.id);
-                    setModalOpen(true);
-                  }}
+                  className="glass-card hover:border-primary/50 transition-all duration-300 hover:scale-105"
                 >
                   <CardHeader>
-                    <div className="flex items-start justify-between">
-                      <div className="space-y-1 flex-1">
-                        <CardTitle className="text-lg text-white group-hover:text-primary transition-colors">
+                    <div className="flex items-start justify-between mb-3">
+                      <div className="flex-1">
+                        <CardTitle className="text-white text-xl mb-2">
                           {agent.agent_name}
                         </CardTitle>
-                        <CardDescription className="line-clamp-2 text-gray-400">
-                          {agent.description || "No description"}
-                        </CardDescription>
+                        
+                        {/* Owner Name Only */}
+                        {agent.agent_owner_name && (
+                          <div className="flex items-center gap-2 text-sm text-gray-400">
+                            <User className="w-4 h-4" />
+                            <span>{agent.agent_owner_name}</span>
+                          </div>
+                        )}
                       </div>
+                      
+                      {/* Status Badge */}
                       <Badge 
-                        variant={agent.status === "active" ? "default" : "secondary"}
-                        className={agent.status === "active" ? "bg-gradient-success text-white" : "bg-gray-800 text-gray-300"}
+                        variant={agent.status === 'active' ? 'default' : 'secondary'}
+                        className={agent.status === 'active' ? 'bg-green-500' : ''}
                       >
                         {agent.status}
                       </Badge>
                     </div>
                   </CardHeader>
-                  <CardContent>
-                    <div className="space-y-3 text-sm">
-                      {agent.whatsapp_phone_number ? (
-                        <p className="flex items-center gap-2 text-gray-300">
-                          <MessageSquare className="h-4 w-4 text-primary" />
-                          {agent.whatsapp_phone_number}
-                        </p>
-                      ) : (
-                        <p className="text-gray-500 italic">Not connected</p>
-                      )}
-                      <p className="text-xs text-gray-500">
-                        Created {new Date(agent.created_at).toLocaleDateString()}
-                      </p>
+
+                  <CardContent className="space-y-3">
+                    {/* WhatsApp Number */}
+                    <div className="flex items-center gap-2 text-sm">
+                      <MessageSquare className="w-4 h-4 text-green-400" />
+                      <span className="text-gray-400">WhatsApp:</span>
+                      <span className="text-white font-medium">
+                        {agent.whatsapp_phone_number || 'Not connected'}
+                      </span>
+                    </div>
+
+                    {/* Languages - Show count or first language */}
+                    {agent.response_languages && agent.response_languages.length > 0 && (
+                      <div className="flex items-center gap-2 text-sm">
+                        <Globe className="w-4 h-4 text-blue-400" />
+                        <span className="text-gray-400">Languages:</span>
+                        <span className="text-white capitalize">
+                          {agent.response_languages.length === 1 
+                            ? agent.response_languages[0]
+                            : `${agent.response_languages.length} languages`
+                          }
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Contact Count */}
+                    <div className="flex items-center gap-2 text-sm">
+                      <Users className="w-4 h-4 text-cyan-400" />
+                      <span className="text-gray-400">Contacts:</span>
                       <ContactCountBadge agentId={agent.id} />
-                      <div className="flex items-center gap-1 text-xs text-primary pt-2">
-                        <Eye className="h-3 w-3" />
-                        <span>Click for details</span>
-                      </div>
-                      <div className="pt-3 flex gap-2" onClick={(event) => event.stopPropagation()}>
-                        <ContactsManagementDialog
-                          agentId={agent.id}
-                          agentName={agent.agent_name}
-                        />
-                        <Button
-                          variant="destructive"
-                          size="sm"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setAgentToDelete(agent);
-                          }}
-                          disabled={deleteAgentMutation.isPending && agentToDelete?.id === agent.id}
-                          className="hover:scale-105 transition-transform"
-                        >
-                          {deleteAgentMutation.isPending && agentToDelete?.id === agent.id ? (
-                            "Deleting..."
-                          ) : (
-                            <>
-                              <Trash2 className="mr-1 h-4 w-4" />
-                              Delete
-                            </>
-                          )}
-                        </Button>
-                      </div>
+                    </div>
+
+                    {/* Created Date */}
+                    <div className="flex items-center gap-2 text-sm text-gray-500">
+                      <CalendarIcon className="w-4 h-4" />
+                      <span>{formatDistanceToNow(new Date(agent.created_at), { addSuffix: true })}</span>
                     </div>
                   </CardContent>
+
+                  <CardFooter className="flex gap-2 border-t border-white/10 pt-4">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => {
+                        setSelectedAgentId(agent.id);
+                        setModalOpen(true);
+                      }}
+                      className="flex-1"
+                    >
+                      <Eye className="w-4 h-4 mr-2" />
+                      View Details
+                    </Button>
+                    <ContactsManagementDialog
+                      agentId={agent.id}
+                      agentName={agent.agent_name}
+                    />
+                    <Button
+                      size="sm"
+                      variant="destructive"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setAgentToDelete(agent);
+                      }}
+                      disabled={deleteAgentMutation.isPending && agentToDelete?.id === agent.id}
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </Button>
+                  </CardFooter>
                 </Card>
               ))}
             </div>

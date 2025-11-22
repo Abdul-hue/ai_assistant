@@ -102,7 +102,7 @@ router.post('/session', async (req, res) => {
  */
 router.post('/email-signup', async (req, res) => {
   try {
-    const { email, password, fullName, companyName, phoneNumber } = req.body || {};
+    const { email, password, fullName, companyName, phoneNumber, country } = req.body || {};
 
     if (!email || !password) {
       return res.status(400).json({
@@ -111,16 +111,24 @@ router.post('/email-signup', async (req, res) => {
       });
     }
 
+    if (!country) {
+      return res.status(400).json({
+        error: 'Missing fields',
+        message: 'Country is required',
+      });
+    }
+
     const metadata = {
       full_name: fullName || '',
       company_name: companyName || '',
       phone_number: phoneNumber || '',
+      country: country || '',
     };
 
     const { data, error } = await supabaseAdmin.auth.admin.createUser({
       email,
       password,
-      email_confirm: true,
+      email_confirm: true,  // ⚠️ TEMPORARY: Email verification disabled for testing
       user_metadata: metadata,
     });
 

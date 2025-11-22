@@ -94,8 +94,9 @@ async function getOrCreateProfile(user) {
     id: user.id,
     email: user.email,
     full_name: user.user_metadata?.full_name || '',
-    company_name: '',
+    company_name: user.user_metadata?.company_name || '',
     phone_number: user.user_metadata?.phone_number || '',
+    country: user.user_metadata?.country || '',
     avatar_url: null,
   };
 
@@ -125,22 +126,28 @@ router.get('/', authMiddleware, async (req, res) => {
 router.put('/', authMiddleware, async (req, res) => {
   try {
     const schema = z.object({
-      full_name: z.string().max(255).optional(),
-      company_name: z.string().max(255).optional(),
-      phone_number: z.string().max(50).optional(),
+      full_name: z.string().max(255).optional().nullable(),
+      company_name: z.string().max(255).optional().nullable(),
+      phone_number: z.string().max(50).optional().nullable(),
+      country: z.string().max(100).optional().nullable(),
     });
 
     const parsed = schema.safeParse(req.body);
     if (!parsed.success) {
+      logger.error({ error: parsed.error.issues }, '[PROFILE] ❌ Validation failed');
       return res.status(400).json({ error: 'Invalid input', details: parsed.error.issues });
     }
 
+    // Handle empty strings as null
     const updatePayload = {
-      full_name: parsed.data.full_name ?? null,
-      company_name: parsed.data.company_name ?? null,
-      phone_number: parsed.data.phone_number ?? null,
+      full_name: parsed.data.full_name || null,
+      company_name: parsed.data.company_name || null,
+      phone_number: parsed.data.phone_number || null,
+      country: parsed.data.country || null,
       updated_at: new Date().toISOString(),
     };
+
+    logger.info({ userId: req.user.id, updatePayload }, '[PROFILE] 📝 Updating profile');
 
     const { data, error } = await supabaseAdmin
       .from('profiles')
@@ -150,13 +157,15 @@ router.put('/', authMiddleware, async (req, res) => {
       .single();
 
     if (error) {
+      logger.error({ error: error.message, code: error.code, details: error.details }, '[PROFILE] ❌ Database update failed');
       throw error;
     }
 
+    logger.info({ userId: req.user.id, updatedProfile: data }, '[PROFILE] ✅ Profile updated successfully');
     res.json({ profile: data });
   } catch (error) {
-    logger.error({ error: error.message }, '[PROFILE] ❌ Failed to update profile');
-    res.status(500).json({ error: 'Failed to update profile' });
+    logger.error({ error: error.message, stack: error.stack }, '[PROFILE] ❌ Failed to update profile');
+    res.status(500).json({ error: 'Failed to update profile', message: error.message });
   }
 });
 

@@ -24,7 +24,7 @@ import { Skeleton } from '@/components/ui/skeleton';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { useAgentDetails } from '@/hooks';
 import { formatDistanceToNow } from 'date-fns';
-import { Copy, Check, AlertCircle } from 'lucide-react';
+import { Copy, Check, AlertCircle, User, Bot, MessageSquare, Globe, Clock, Calendar } from 'lucide-react';
 import WhatsAppConnectionPanel from './WhatsAppConnectionPanel';
 import type { FileMetadata, IntegrationEndpoint } from '@/types/agent.types';
 
@@ -91,37 +91,160 @@ export default function AgentDetailsModal({ open, onOpenChange, agentId }: Agent
                 <TabsTrigger value="statistics">Statistics</TabsTrigger>
               </TabsList>
               
-              {/* TAB 1: OVERVIEW */}
+              {/* TAB 1: OVERVIEW - Complete Information */}
               <TabsContent value="overview" className="space-y-4 mt-4">
+                {/* Basic Information Card */}
                 <Card>
                   <CardHeader>
-                    <CardTitle>Basic Information</CardTitle>
+                    <CardTitle className="text-lg">Basic Information</CardTitle>
                   </CardHeader>
-                  <CardContent className="space-y-4">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <InfoField label="Agent Name" value={data.agent.agent_name} />
-                      <InfoField label="Description" value={data.agent.description || 'No description'} />
-                      <InfoField 
-                        label="Created" 
-                        value={formatDistanceToNow(new Date(data.agent.created_at), { addSuffix: true })} 
-                      />
-                      <InfoField 
-                        label="Last Updated" 
-                        value={formatDistanceToNow(new Date(data.agent.updated_at), { addSuffix: true })} 
-                      />
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm text-muted-foreground">Status:</span>
+                  <CardContent>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <p className="text-sm text-gray-400">Agent Name</p>
+                        <p className="text-white font-medium text-lg">{data.agent.agent_name}</p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-400">Status</p>
                         <Badge variant={data.agent.is_active ? 'default' : 'secondary'}>
                           {data.agent.is_active ? '🟢 Active' : '🔴 Inactive'}
                         </Badge>
                       </div>
-                      <InfoField 
-                        label="Agent ID" 
-                        value={data.agent.id}
-                        copyable
-                        onCopy={() => handleCopy(data.agent.id, 'id')}
-                        copied={copiedField === 'id'}
-                      />
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Owner Information Card */}
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-lg flex items-center gap-2">
+                      <User className="w-5 h-5" />
+                      Owner Information
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <p className="text-sm text-gray-400">Owner Name</p>
+                        <p className="text-white font-medium">{data.agent.agent_owner_name || 'N/A'}</p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-400">Owner Phone</p>
+                        <p className="text-white font-medium">{data.agent.agent_phone_number || 'N/A'}</p>
+                      </div>
+                    </div>
+                    
+                    {data.agent.description && (
+                      <div className="mt-4">
+                        <p className="text-sm text-gray-400 mb-2">Notes</p>
+                        <p className="text-white bg-white/5 p-3 rounded-lg">
+                          {data.agent.description}
+                        </p>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+
+                {/* Agent Details Card */}
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-lg flex items-center gap-2">
+                      <Bot className="w-5 h-5" />
+                      Agent Details
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="space-y-4">
+                      <div>
+                        <p className="text-sm text-gray-400">WhatsApp Number</p>
+                        <p className="text-white font-medium flex items-center gap-2">
+                          <MessageSquare className="w-4 h-4 text-green-400" />
+                          {data.agent.whatsapp_phone_number || 'Not connected'}
+                        </p>
+                      </div>
+
+                      <div>
+                        <p className="text-sm text-gray-400 mb-2">Response Languages</p>
+                        <div className="flex flex-wrap gap-2">
+                          {data.agent.response_languages?.map((lang: string) => (
+                            <Badge key={lang} variant="outline" className="capitalize">
+                              {lang}
+                            </Badge>
+                          )) || <span className="text-gray-500">Not configured</span>}
+                        </div>
+                      </div>
+
+                      <div>
+                        <p className="text-sm text-gray-400">Timezone</p>
+                        <p className="text-white font-medium flex items-center gap-2">
+                          <Clock className="w-4 h-4 text-purple-400" />
+                          {data.agent.timezone || 'UTC'}
+                        </p>
+                      </div>
+
+                      {data.agent.persona && (
+                        <div>
+                          <p className="text-sm text-gray-400 mb-2">Persona</p>
+                          <p className="text-white bg-white/5 p-3 rounded-lg whitespace-pre-wrap">
+                            {data.agent.persona}
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Timestamps Card */}
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-lg flex items-center gap-2">
+                      <Calendar className="w-5 h-5" />
+                      Timestamps
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <p className="text-sm text-gray-400">Created</p>
+                        <p className="text-white">
+                          {formatDistanceToNow(new Date(data.agent.created_at), { addSuffix: true })}
+                        </p>
+                        <p className="text-xs text-gray-500">
+                          {new Date(data.agent.created_at).toLocaleString()}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-400">Last Updated</p>
+                        <p className="text-white">
+                          {formatDistanceToNow(new Date(data.agent.updated_at), { addSuffix: true })}
+                        </p>
+                        <p className="text-xs text-gray-500">
+                          {new Date(data.agent.updated_at).toLocaleString()}
+                        </p>
+                      </div>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                {/* Agent ID Card */}
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-lg">Agent ID</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg font-mono text-sm">
+                      <span className="text-white">{data.agent.id}</span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => handleCopy(data.agent.id, 'id')}
+                      >
+                        {copiedField === 'id' ? (
+                          <Check className="w-4 h-4 text-green-400" />
+                        ) : (
+                          <Copy className="w-4 h-4" />
+                        )}
+                      </Button>
                     </div>
                   </CardContent>
                 </Card>

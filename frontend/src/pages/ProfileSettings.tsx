@@ -11,6 +11,7 @@ import { uploadAvatar, deleteAvatar, updateProfile } from '@/lib/api/profile';
 import { useAuth } from '@/context/AuthContext.jsx';
 import ProfileAvatarMenu from '@/components/ProfileAvatarMenu';
 import { Camera, Loader2, Trash2 } from 'lucide-react';
+import { CountrySelect } from '@/components/ui/CountrySelect';
 
 const ProfileSettings = () => {
   const navigate = useNavigate();
@@ -20,6 +21,7 @@ const ProfileSettings = () => {
     full_name: '',
     company_name: '',
     phone_number: '',
+    country: '',
   });
   const [saving, setSaving] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -49,6 +51,7 @@ const ProfileSettings = () => {
       full_name: profile.full_name || '',
       company_name: profile.company_name || '',
       phone_number: profile.phone_number || '',
+      country: profile.country || '',
     });
     setPreviewUrl(profile.avatar_url || null);
   }, [profile, refreshProfile]);
@@ -242,6 +245,15 @@ const ProfileSettings = () => {
                     placeholder="+123456789"
                   />
                 </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="country">Country</Label>
+                <CountrySelect
+                  value={formData.country}
+                  onChange={(value) => handleInputChange('country', value)}
+                  placeholder="Select your country"
+                />
               </div>
 
               <div className="space-y-2">

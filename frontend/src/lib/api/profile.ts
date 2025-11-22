@@ -6,6 +6,7 @@ export interface Profile {
   full_name: string | null;
   company_name: string | null;
   phone_number: string | null;
+  country: string | null;
   avatar_url: string | null;
   created_at?: string;
   updated_at?: string;
@@ -31,6 +32,7 @@ export async function updateProfile(payload: {
   full_name?: string;
   company_name?: string;
   phone_number?: string;
+  country?: string;
 }): Promise<Profile> {
   const response = await fetch(`${API_URL}/api/profile`, {
     method: 'PUT',
