@@ -168,11 +168,51 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 // ============================================================================
-// RATE LIMITING - DISABLED
+// RATE LIMITING - SELECTIVE (Security Enhancement)
 // ============================================================================
-// Rate limiting has been completely removed to prevent issues with frequent polling
-// of the whatsapp-status endpoint. If you need rate limiting in the future, you can
-// re-enable it by installing express-rate-limit and configuring it here.
+// Rate limiting applied to sensitive endpoints to prevent abuse
+// Status checks are NOT rate limited to allow frequent polling
+let rateLimit = null;
+try {
+  rateLimit = require('express-rate-limit');
+} catch (e) {
+  console.warn('⚠️  express-rate-limit not installed. Rate limiting disabled.');
+  console.warn('⚠️  Install with: npm install express-rate-limit');
+}
+
+// Rate limiter for WhatsApp initialization (prevent spam)
+const whatsappInitLimiter = rateLimit ? rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 connection attempts per 15 minutes
+  message: 'Too many WhatsApp connection attempts. Please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    // Skip rate limiting in development
+    return process.env.NODE_ENV === 'development';
+  }
+}) : (req, res, next) => next();
+
+// Rate limiter for message sending
+const messageSendLimiter = rateLimit ? rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30, // 30 messages per minute per user
+  message: 'Message rate limit exceeded. Please slow down.',
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req, res) => {
+    // Rate limit per user ID (preferred) or fall back to default IP handling
+    if (req.user?.id) {
+      return `user:${req.user.id}`;
+    }
+    // Return undefined to use express-rate-limit's default IP handling (IPv6-safe)
+    return undefined;
+  },
+  skip: (req) => {
+    // Skip rate limiting in development
+    return process.env.NODE_ENV === 'development';
+  }
+}) : (req, res, next) => next();
 
 // ============================================================================
 // MIDDLEWARE
@@ -403,5 +443,9 @@ process.on('SIGINT', () => {
   });
 });
 
+// Export both app and rate limiters
 module.exports = app;
-exports = app;
+module.exports.rateLimiters = {
+  whatsappInitLimiter,
+  messageSendLimiter
+};

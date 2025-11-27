@@ -29,6 +29,20 @@ let audioBucketName = process.env.AUDIO_BUCKET || DEFAULT_AUDIO_BUCKET;
 const DEFAULT_AUDIO_SIGNED_URL_TTL = 60 * 60 * 24 * 7; // 7 days
 let audioBucketChecked = false;
 
+// SECURITY: Generate unique instance ID for multi-instance prevention
+const os = require('os');
+const INSTANCE_ID = `${os.hostname()}-${process.pid}-${Date.now()}`;
+const INSTANCE_HOSTNAME = os.hostname();
+const INSTANCE_PID = process.pid;
+
+// Log instance information on startup
+console.log('\n[BAILEYS] ========== INSTANCE INFORMATION ==========');
+console.log(`[BAILEYS] Instance ID: ${INSTANCE_ID}`);
+console.log(`[BAILEYS] Hostname: ${INSTANCE_HOSTNAME}`);
+console.log(`[BAILEYS] Process ID: ${INSTANCE_PID}`);
+console.log(`[BAILEYS] Started at: ${new Date().toISOString()}`);
+console.log('[BAILEYS] ===============================================\n');
+
 // Store active sessions in memory
 const activeSessions = new Map();
 const qrGenerationTracker = new Map();
@@ -376,6 +390,25 @@ async function restoreCredsFromDatabase(agentId) {
   console.log(`[BAILEYS] 🔄 Attempting to restore credentials from database...`);
   
   try {
+    // CRITICAL: Check session status first - don't restore if corrupted/conflict
+    const { data: sessionStatus, error: statusError } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status, is_active')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    if (statusError) {
+      console.error(`[BAILEYS] ⚠️ Error checking session status:`, statusError);
+      // Continue to try restore, but log warning
+    } else if (sessionStatus) {
+      // Don't restore if session is in conflict or disconnected state
+      if (sessionStatus.status === 'conflict' || sessionStatus.status === 'disconnected') {
+        console.log(`[BAILEYS] ⚠️ Session is in ${sessionStatus.status} state - skipping credential restore`);
+        console.log(`[BAILEYS] This indicates corrupted/invalid credentials - will generate fresh QR`);
+        return false;
+      }
+    }
+    
     const { data, error } = await supabaseAdmin
       .from('whatsapp_sessions')
       .select('session_data')
@@ -389,6 +422,13 @@ async function restoreCredsFromDatabase(agentId) {
       return false;
     }
     
+    // Validate credentials structure before restoring
+    const creds = data.session_data.creds;
+    if (!creds || typeof creds !== 'object') {
+      console.log(`[BAILEYS] ⚠️ Invalid credentials structure in database - skipping restore`);
+      return false;
+    }
+    
     const authPath = path.join(__dirname, '../../auth_sessions', agentId);
     const credsPath = path.join(authPath, 'creds.json');
     
@@ -398,10 +438,10 @@ async function restoreCredsFromDatabase(agentId) {
     }
     
     // Write credentials to file
-    fs.writeFileSync(credsPath, JSON.stringify(data.session_data.creds, null, 2));
+    fs.writeFileSync(credsPath, JSON.stringify(creds, null, 2));
     
     console.log(`[BAILEYS] ✅ Credentials restored from database to ${credsPath}`);
-    console.log(`[BAILEYS] Restored creds: has me=${!!data.session_data.creds.me}, registered=${data.session_data.creds.registered}`);
+    console.log(`[BAILEYS] Restored creds: has me=${!!creds.me}, registered=${creds.registered}`);
     
     return true;
   } catch (error) {
@@ -440,62 +480,106 @@ async function ensureAgentIsolation(agentId) {
   console.log(`[BAILEYS] 🔒 Ensuring agent isolation for: ${agentId.substring(0, 40)}`);
   
   try {
-    // Step 1: Check if agent already has active session
+    // Step 1: Check if agent already has active session IN THIS INSTANCE
     const existingSession = activeSessions.get(agentId);
     if (existingSession && existingSession.isConnected) {
-      console.log(`[BAILEYS] ⚠️ Agent already has active connection - disconnecting old one`);
+      console.log(`[BAILEYS] ⚠️ Agent already has active connection in this instance - disconnecting old one`);
       await disconnectWhatsApp(agentId);
     }
     
-    // Step 2: Check if credentials being restored belong to another agent
-    const { data: dbSession } = await supabaseAdmin
+    // Step 2: Check database for OTHER instances using this agent
+    const { data: dbSession, error: dbError } = await supabaseAdmin
       .from('whatsapp_sessions')
-      .select('agent_id, phone_number, is_active')
+      .select('agent_id, phone_number, is_active, instance_id, instance_hostname, instance_pid, last_heartbeat')
       .eq('agent_id', agentId)
       .maybeSingle();
     
+    if (dbError) {
+      console.error(`[BAILEYS] ⚠️ Database error checking isolation:`, dbError);
+      // Continue anyway - don't block initialization
+      return;
+    }
+    
+    if (dbSession && dbSession.is_active && dbSession.instance_id) {
+      // Another instance is using this agent
+      if (dbSession.instance_id !== INSTANCE_ID) {
+        const timeSinceHeartbeat = dbSession.last_heartbeat 
+          ? Date.now() - new Date(dbSession.last_heartbeat).getTime()
+          : null;
+        
+        // If other instance had heartbeat within last 5 minutes, it's likely still active
+        if (timeSinceHeartbeat && timeSinceHeartbeat < 5 * 60 * 1000) {
+          console.error(`[BAILEYS] ❌ MULTI-INSTANCE CONFLICT DETECTED!`);
+          console.error(`[BAILEYS] ❌ Agent ${agentId.substring(0, 40)} is ALREADY ACTIVE on another instance:`);
+          console.error(`[BAILEYS] ❌ Other Instance ID: ${dbSession.instance_id}`);
+          console.error(`[BAILEYS] ❌ Other Hostname: ${dbSession.instance_hostname}`);
+          console.error(`[BAILEYS] ❌ Other PID: ${dbSession.instance_pid}`);
+          console.error(`[BAILEYS] ❌ Last Heartbeat: ${timeSinceHeartbeat / 1000}s ago`);
+          console.error(`[BAILEYS] ❌ Phone: ${dbSession.phone_number}`);
+          console.error(`[BAILEYS] `);
+          console.error(`[BAILEYS] 🚨 CRITICAL: This will cause 401/440 errors and session conflicts!`);
+          console.error(`[BAILEYS] 🚨 ACTION REQUIRED: Stop the other instance or use a different agent.`);
+          console.error(`[BAILEYS] `);
+          console.error(`[BAILEYS] Current Instance: ${INSTANCE_HOSTNAME} (${INSTANCE_ID})`);
+          console.error(`[BAILEYS] Other Instance: ${dbSession.instance_hostname} (${dbSession.instance_id})`);
+          
+          // Mark as conflict in database
+          await supabaseAdmin
+            .from('whatsapp_sessions')
+            .update({
+              status: 'conflict',
+              updated_at: new Date().toISOString()
+            })
+            .eq('agent_id', agentId);
+          
+          throw new Error(`Multi-instance conflict: Agent ${agentId.substring(0, 20)} is already active on ${dbSession.instance_hostname}`);
+        } else {
+          // Stale heartbeat (>5 min) - assume other instance died, we can take over
+          console.log(`[BAILEYS] ⚠️ Found stale session from another instance (heartbeat ${timeSinceHeartbeat ? Math.round(timeSinceHeartbeat/1000) : 'unknown'}s ago)`);
+          console.log(`[BAILEYS] ⚠️ Assuming other instance crashed - taking over session`);
+          console.log(`[BAILEYS] Previous Instance: ${dbSession.instance_hostname} (${dbSession.instance_id})`);
+          console.log(`[BAILEYS] New Instance: ${INSTANCE_HOSTNAME} (${INSTANCE_ID})`);
+        }
+      } else {
+        // Same instance - this is fine
+        console.log(`[BAILEYS] ✅ Session belongs to this instance - proceeding`);
+      }
+    }
+    
+    // Step 3: Check if phone number is used by another agent
     if (dbSession && dbSession.phone_number && dbSession.is_active) {
       const phoneNumber = dbSession.phone_number;
       
-      // Check if another agent is using this phone number
       const { data: conflictingSessions } = await supabaseAdmin
         .from('whatsapp_sessions')
-        .select('agent_id, phone_number')
+        .select('agent_id, phone_number, instance_id, instance_hostname')
         .eq('phone_number', phoneNumber)
         .eq('is_active', true)
         .neq('agent_id', agentId);
       
       if (conflictingSessions && conflictingSessions.length > 0) {
-        console.error(`[BAILEYS] ❌ CRITICAL: Phone ${phoneNumber} is already linked to another agent`);
-        console.error(`[BAILEYS] ❌ Conflicting agents:`, conflictingSessions.map(s => s.agent_id));
-        
-        // Mark current session as inactive to prevent confusion
-        await supabaseAdmin
-          .from('whatsapp_sessions')
-          .update({
-            is_active: false,
-            status: 'disconnected',
-            updated_at: new Date().toISOString()
-          })
-          .eq('agent_id', agentId);
-        
-        throw new Error('This WhatsApp number is already connected to another agent. Please disconnect it first.');
+        console.error(`[BAILEYS] ❌ PHONE NUMBER CONFLICT: ${phoneNumber} is linked to multiple agents:`);
+        conflictingSessions.forEach((session, i) => {
+          console.error(`[BAILEYS] ❌   ${i+1}. Agent: ${session.agent_id.substring(0, 20)} on ${session.instance_hostname}`);
+        });
+        console.error(`[BAILEYS] ❌ This violates WhatsApp's one-device-per-number policy!`);
       }
     }
     
-    // Step 3: Check in-memory sessions for phone number conflicts
+    // Step 4: Check in-memory sessions for phone number conflicts
     if (dbSession && dbSession.phone_number) {
       const phoneNumber = dbSession.phone_number;
       
       for (const [otherId, session] of activeSessions.entries()) {
         if (otherId !== agentId && session.phoneNumber === phoneNumber && session.isConnected) {
-          console.error(`[BAILEYS] ❌ CRITICAL: Phone ${phoneNumber} is in use by agent ${otherId}`);
-          throw new Error('This WhatsApp number is currently in use by another agent.');
+          console.error(`[BAILEYS] ❌ MEMORY CONFLICT: Phone ${phoneNumber} is in use by agent ${otherId.substring(0, 20)}`);
+          throw new Error(`Phone number ${phoneNumber} is currently in use by another agent.`);
         }
       }
     }
     
     console.log(`[BAILEYS] ✅ Agent isolation verified - safe to proceed`);
+    
   } catch (error) {
     console.error(`[BAILEYS] ❌ Agent isolation check failed:`, error.message);
     throw error;
@@ -618,15 +702,40 @@ async function initializeWhatsApp(agentId, userId = null) {
     } else {
       console.log(`[BAILEYS] 🆕 No credentials file found locally`);
       
-      // CRITICAL: Try to restore from Supabase before generating new QR
-      console.log(`[BAILEYS] 🔍 Checking Supabase for backed-up credentials...`);
-      const restored = await restoreCredsFromDatabase(agentId);
+      // CRITICAL: Check if session is in conflict/corrupted state before restoring
+      const { data: sessionData } = await supabaseAdmin
+        .from('whatsapp_sessions')
+        .select('status, is_active')
+        .eq('agent_id', agentId)
+        .maybeSingle();
       
-      if (restored) {
-        console.log(`[BAILEYS] ✅ Credentials restored from Supabase - will use them`);
-        useFileAuth = true;
+      // If session is in conflict state, don't restore credentials - force fresh QR
+      if (sessionData && (sessionData.status === 'conflict' || sessionData.status === 'disconnected')) {
+        console.log(`[BAILEYS] ⚠️ Session is in ${sessionData.status} state - clearing and generating fresh QR`);
+        // Clear any corrupted credentials from database
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({
+            session_data: null,
+            qr_code: null,
+            qr_generated_at: null,
+            is_active: false,
+            status: 'disconnected',
+            updated_at: new Date().toISOString()
+          })
+          .eq('agent_id', agentId);
+        console.log(`[BAILEYS] ✅ Cleared corrupted session data - will generate fresh QR`);
       } else {
-        console.log(`[BAILEYS] 🆕 No credentials in Supabase either - will generate QR`);
+        // CRITICAL: Try to restore from Supabase before generating new QR
+        console.log(`[BAILEYS] 🔍 Checking Supabase for backed-up credentials...`);
+        const restored = await restoreCredsFromDatabase(agentId);
+        
+        if (restored) {
+          console.log(`[BAILEYS] ✅ Credentials restored from Supabase - will use them`);
+          useFileAuth = true;
+        } else {
+          console.log(`[BAILEYS] 🆕 No credentials in Supabase either - will generate QR`);
+        }
       }
     }
 
@@ -699,13 +808,13 @@ async function initializeWhatsApp(agentId, userId = null) {
       logger: pino({ level: 'debug' }), // Use debug for troubleshooting
       browser: Browsers.ubuntu('Chrome'),
       
-      // CRITICAL FIX: More aggressive timeouts to keep socket alive during QR scan
-      keepAliveIntervalMs: 15000, // Send keepalive every 15s (was 30s)
+      // OPTIMIZED: Balanced timeouts for stability and performance
+      keepAliveIntervalMs: 20000, // Send keepalive every 20s (balanced)
       defaultQueryTimeoutMs: 120000,
       connectTimeoutMs: 120000,
-      qrTimeout: 180000, // QR valid for 3 minutes (was 2min)
+      qrTimeout: 180000, // QR valid for 3 minutes (WhatsApp standard)
       
-      retryRequestDelayMs: 250, // Faster retries (was 500ms)
+      retryRequestDelayMs: 500, // Balanced retries (was 250ms, too aggressive)
       maxMsgRetryCount: 5, // More retries (was 3)
       emitOwnEvents: true, // CRITICAL: May be needed for QR events
       fireInitQueries: true, // CRITICAL: Fire initial queries immediately
@@ -760,6 +869,32 @@ async function initializeWhatsApp(agentId, userId = null) {
     activeSessions.set(agentId, sessionData);
 
     console.log(`[BAILEYS] ✅ Session stored in memory with health monitoring`);
+    
+    // CRITICAL: Start heartbeat mechanism for instance tracking
+    const heartbeatInterval = setInterval(async () => {
+      const session = activeSessions.get(agentId);
+      if (!session) {
+        clearInterval(heartbeatInterval);
+        return;
+      }
+      
+      if (session.isConnected) {
+        try {
+          await supabaseAdmin
+            .from('whatsapp_sessions')
+            .update({
+              last_heartbeat: new Date().toISOString(),
+              updated_at: new Date().toISOString()
+            })
+            .eq('agent_id', agentId);
+        } catch (error) {
+          console.error(`[BAILEYS] Heartbeat failed for ${agentId}:`, error.message);
+        }
+      }
+    }, 60000); // Every minute
+    
+    // Store heartbeat interval for cleanup
+    sessionData.heartbeatInterval = heartbeatInterval;
     
     // CRITICAL: Add socket health check to detect premature disconnects
     const healthCheckInterval = setInterval(() => {
@@ -906,16 +1041,22 @@ async function initializeWhatsApp(agentId, userId = null) {
               .upsert({
                 agent_id: agentId,
                 phone_number: cleanPhone,
-                status: 'connected', // CRITICAL: Set status field
+                status: 'connected',
                 is_active: true,
                 qr_code: null,
                 qr_generated_at: null,
                 last_connected: new Date().toISOString(),
-                updated_at: new Date().toISOString()
+                updated_at: new Date().toISOString(),
+                // Instance tracking
+                instance_id: INSTANCE_ID,
+                instance_hostname: INSTANCE_HOSTNAME,
+                instance_pid: INSTANCE_PID,
+                instance_started_at: new Date().toISOString(),
+                last_heartbeat: new Date().toISOString()
               }, {
                 onConflict: 'agent_id'
               })
-            .select();
+              .select();
           
           if (updateError) {
             console.error(`[BAILEYS] ❌ DB update error:`, updateError);
@@ -1012,6 +1153,76 @@ async function initializeWhatsApp(agentId, userId = null) {
           return; // Don't continue processing
         }
         
+        // CRITICAL: Handle error 440 - Stream Conflict (Session Replaced)
+        if (statusCode === 440) {
+          console.log(`[BAILEYS] ⚠️ Error 440 - Stream Conflict (session replaced)`);
+          console.log(`[BAILEYS] This means the WhatsApp session was opened elsewhere`);
+          console.log(`[BAILEYS] Common causes: Multiple devices, QR scanned again, or credential sharing`);
+          
+          // Mark session as conflict and clean up
+          if (session) {
+            session.isConnected = false;
+            session.connectionState = 'conflict';
+            session.failureReason = 'Session replaced - WhatsApp opened on another device';
+            session.failureAt = Date.now();
+          }
+          
+          // Stop health check and heartbeat to prevent warning spam
+          if (session?.healthCheckInterval) {
+            clearInterval(session.healthCheckInterval);
+            session.healthCheckInterval = null;
+            console.log(`[BAILEYS] ✅ Health check stopped`);
+          }
+          if (session?.heartbeatInterval) {
+            clearInterval(session.heartbeatInterval);
+            session.heartbeatInterval = null;
+            console.log(`[BAILEYS] ✅ Heartbeat stopped`);
+          }
+          
+          // Clean up socket
+          if (session?.socket) {
+            try {
+              session.socket.ev.removeAllListeners();
+              session.socket.end();
+            } catch (e) {
+              console.log(`[BAILEYS] Socket cleanup: ${e.message}`);
+            }
+          }
+          
+          // Remove from active sessions
+          activeSessions.delete(agentId);
+          qrGenerationTracker.delete(agentId);
+          connectionLocks.delete(agentId);
+          
+          // Clear auth directory - credentials are invalidated
+          const authDir = path.join(__dirname, '../../auth_sessions', agentId);
+          if (fs.existsSync(authDir)) {
+            fs.rmSync(authDir, { recursive: true, force: true });
+            console.log(`[BAILEYS] 🗑️ Cleared auth directory (credentials invalidated)`);
+          }
+          
+          // Update database
+          await supabaseAdmin
+            .from('whatsapp_sessions')
+            .update({
+              session_data: null,
+              qr_code: null,
+              qr_generated_at: null,
+              is_active: false,
+              status: 'conflict',
+              updated_at: new Date().toISOString()
+            })
+            .eq('agent_id', agentId);
+          
+          console.log(`[BAILEYS] ✅ Session cleared. User must reconnect manually.`);
+          console.log(`[BAILEYS] 💡 TIP: Ensure no other devices/instances are using this agent.`);
+          
+          // Record failure to prevent auto-retry
+          last401Failure.set(agentId, Date.now());
+          
+          return; // Don't continue processing
+        }
+        
         // CRITICAL: Handle error 515 - Restart Required (EXPECTED after QR pairing!)
         if (statusCode === 515) {
           console.log(`[BAILEYS] 🔄 Error 515 - Stream Errored (restart required)`);
@@ -1045,6 +1256,90 @@ async function initializeWhatsApp(agentId, userId = null) {
         
         qrGenerationTracker.delete(agentId);
         
+        // CRITICAL: Handle Bad MAC errors (session corruption) - detect from error message
+        const errorMessage = reason || payload?.error || data?.reason || '';
+        const isBadMacError = errorMessage.includes('Bad MAC') || 
+                             errorMessage.includes('Bad MAC Error') ||
+                             errorMessage.includes('session error') ||
+                             (statusCode === 401 && errorMessage.includes('MAC'));
+        
+        if (isBadMacError) {
+          console.log(`[BAILEYS] ❌ Bad MAC Error detected - Session corruption detected`);
+          console.log(`[BAILEYS] This indicates session keys are corrupted or out of sync`);
+          console.log(`[BAILEYS] Clearing corrupted credentials and forcing fresh QR on next connect`);
+          
+          if (session?.socket) {
+            try {
+              session.socket.ev.removeAllListeners();
+              session.socket.end?.();
+            } catch (err) {
+              console.log('[BAILEYS] Socket cleanup after Bad MAC failed:', err.message);
+            }
+          }
+
+          // Mark session as corrupted
+          const failureReason = 'Session corruption (Bad MAC) - credentials invalidated';
+          if (session) {
+            session.failureReason = failureReason;
+            session.failureAt = Date.now();
+            session.isConnected = false;
+            session.connectionState = 'conflict';
+            session.qrCode = null;
+            session.qrGeneratedAt = null;
+            session.socket = null;
+            session.state = null;
+            session.saveCreds = null;
+          }
+
+          // Stop health check and heartbeat intervals
+          if (session?.healthCheckInterval) {
+            clearInterval(session.healthCheckInterval);
+            session.healthCheckInterval = null;
+            console.log(`[BAILEYS] ✅ Health check interval stopped`);
+          }
+          if (session?.heartbeatInterval) {
+            clearInterval(session.heartbeatInterval);
+            session.heartbeatInterval = null;
+            console.log(`[BAILEYS] ✅ Heartbeat interval stopped`);
+          }
+
+          // Remove from active sessions
+          activeSessions.delete(agentId);
+          console.log(`[BAILEYS] ✅ Session removed from active sessions`);
+
+          connectionLocks.delete(agentId);
+          lastConnectionAttempt.set(agentId, Date.now());
+          
+          // CRITICAL: Clear corrupted credentials completely
+          const authDir = path.join(__dirname, '../../auth_sessions', agentId);
+          if (fs.existsSync(authDir)) {
+            fs.rmSync(authDir, { recursive: true, force: true });
+            console.log(`[BAILEYS] 🗑️ Cleared corrupted auth directory`);
+          }
+          
+          // Update database - mark as conflict and clear session data
+          await supabaseAdmin
+            .from('whatsapp_sessions')
+            .update({
+              session_data: null,
+              qr_code: null,
+              qr_generated_at: null,
+              is_active: false,
+              status: 'conflict',
+              phone_number: null,
+              updated_at: new Date().toISOString()
+            })
+            .eq('agent_id', agentId);
+          
+          console.log(`[BAILEYS] ✅ Corrupted session cleared. Failure reason: ${failureReason}`);
+          console.log(`[BAILEYS] 🚫 Auto-retry disabled - manual reconnection required`);
+          console.log(`[BAILEYS] ⚠️  User must click "Connect" to get fresh QR code`);
+
+          // Record failure to prevent auto-retry
+          last401Failure.set(agentId, Date.now());
+          return;
+        }
+        
         if (statusCode === 401) {
           console.log(`[BAILEYS] ❌ 401 - Clearing session due to conflict or device removal`);
           
@@ -1072,11 +1367,16 @@ async function initializeWhatsApp(agentId, userId = null) {
             session.saveCreds = null;
           }
 
-          // Stop health check interval to prevent warning spam
+          // Stop health check and heartbeat intervals
           if (session?.healthCheckInterval) {
             clearInterval(session.healthCheckInterval);
             session.healthCheckInterval = null;
             console.log(`[BAILEYS] ✅ Health check interval stopped`);
+          }
+          if (session?.heartbeatInterval) {
+            clearInterval(session.heartbeatInterval);
+            session.heartbeatInterval = null;
+            console.log(`[BAILEYS] ✅ Heartbeat interval stopped`);
           }
 
           // Remove from active sessions IMMEDIATELY to stop health check
@@ -1100,6 +1400,7 @@ async function initializeWhatsApp(agentId, userId = null) {
               qr_generated_at: null,
               is_active: false,
               status: 'conflict',
+              phone_number: null,
               updated_at: new Date().toISOString()
             })
             .eq('agent_id', agentId);
@@ -1621,13 +1922,28 @@ async function disconnectWhatsApp(agentId) {
   
   const session = activeSessions.get(agentId);
   if (session?.socket) {
-    // Stop health check if running
+    // Stop health check and heartbeat if running
     if (session.healthCheckInterval) {
       clearInterval(session.healthCheckInterval);
+    }
+    if (session.heartbeatInterval) {
+      clearInterval(session.heartbeatInterval);
     }
     session.socket.ev.removeAllListeners();
     session.socket.end();
   }
+  
+  // Clear instance tracking on disconnect
+  await supabaseAdmin
+    .from('whatsapp_sessions')
+    .update({
+      instance_id: null,
+      instance_hostname: null,
+      instance_pid: null,
+      last_heartbeat: null,
+      updated_at: new Date().toISOString()
+    })
+    .eq('agent_id', agentId);
   
   activeSessions.delete(agentId);
   qrGenerationTracker.delete(agentId);
@@ -1759,17 +2075,34 @@ async function getWhatsAppStatus(agentId) {
         response.phone_number = data.phone_number;
       }
 
-      if (!response.connected) {
-        if (data.is_active && data.status === 'connected') {
-          response.connected = true;
-          response.is_active = true;
-          response.status = 'connected';
-          response.qr_code = null;
+      // CRITICAL: Only trust database status if there's no active session in memory
+      // If memory session exists, it's the source of truth (more recent)
+      if (!response.connected && !session) {
+        // No active session in memory - check database
+        if (data.is_active && data.status === 'connected' && data.phone_number) {
+          // Database says connected, but verify it's not stale
+          // If status is conflict, don't trust is_active
+          if (data.status !== 'conflict') {
+            response.connected = true;
+            response.is_active = true;
+            response.status = 'connected';
+            response.qr_code = null;
+          } else {
+            // Status is conflict - mark as disconnected
+            response.connected = false;
+            response.is_active = false;
+            response.status = 'conflict';
+          }
         } else if (data.qr_code) {
           response.qr_code = data.qr_code;
           response.status = 'qr_pending';
         } else if (data.status) {
           response.status = data.status;
+          // If status is conflict, ensure is_active is false
+          if (data.status === 'conflict') {
+            response.is_active = false;
+            response.connected = false;
+          }
         }
       }
 
