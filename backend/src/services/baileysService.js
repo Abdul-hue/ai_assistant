@@ -744,6 +744,11 @@ async function initializeWhatsApp(agentId, userId = null) {
     if (useFileAuth) {
       // Load existing credentials from files
       console.log(`[BAILEYS] 📂 Loading credentials from files...`);
+      // Ensure directory exists before loading
+      if (!fs.existsSync(authPath)) {
+        fs.mkdirSync(authPath, { recursive: true });
+        console.log(`[BAILEYS] 📁 Created auth directory: ${authPath}`);
+      }
       const authState = await useMultiFileAuthState(authPath);
       state = authState.state;
       saveCredsToFile = authState.saveCreds;
@@ -782,8 +787,19 @@ async function initializeWhatsApp(agentId, userId = null) {
 
     // Wrap saveCreds to also sync to database
     const saveCreds = async () => {
-      await saveCredsToFile(); // Save to files first
-      await syncCredsToDatabase(agentId); // Then sync to database
+      try {
+        // Ensure directory exists before saving
+        if (!fs.existsSync(authPath)) {
+          fs.mkdirSync(authPath, { recursive: true });
+          console.log(`[BAILEYS] 📁 Created auth directory: ${authPath}`);
+        }
+        await saveCredsToFile(); // Save to files first
+        await syncCredsToDatabase(agentId); // Then sync to database
+      } catch (error) {
+        console.error(`[BAILEYS] ❌ Error saving credentials:`, error.message);
+        // Re-throw to ensure the error is visible
+        throw error;
+      }
     };
 
     const credStatus = state.creds ? `🔑 Loaded credentials (registered: ${state.creds.registered})` : '🆕 No credentials - will generate QR';
@@ -840,11 +856,17 @@ async function initializeWhatsApp(agentId, userId = null) {
     sock.ev.on('creds.update', async () => {
       console.log(`[BAILEYS] 🔐 ============ CREDS.UPDATE FIRED ============`);
       
-      // saveCreds handles both file save and database sync
-      await saveCreds();
-      
-      console.log(`[BAILEYS] ✅ Credentials saved during pairing`);
-      console.log(`[BAILEYS] 🔐 ============ CREDS.UPDATE COMPLETE ============\n`);
+      try {
+        // saveCreds handles both file save and database sync
+        await saveCreds();
+        console.log(`[BAILEYS] ✅ Credentials saved during pairing`);
+        console.log(`[BAILEYS] 🔐 ============ CREDS.UPDATE COMPLETE ============\n`);
+      } catch (error) {
+        console.error(`[BAILEYS] ❌ Error saving credentials:`, error.message);
+        console.error(`[BAILEYS] Error details:`, error);
+        // Don't throw - allow connection to continue even if credential save fails
+        // The directory will be created on next attempt
+      }
     });
 
     // Store session with health monitoring

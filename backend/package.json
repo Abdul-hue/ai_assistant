@@ -21,11 +21,7 @@
     "@pinecone-database/pinecone": "^3.0.1",
     "@supabase/supabase-js": "^2.75.0",
     "@whiskeysockets/baileys": "^6.7.9",
-<<<<<<< HEAD
-    "axios": "^1.12.2",
-=======
     "axios": "^1.13.2",
->>>>>>> 5100719 (gmail integration)
     "bcryptjs": "^2.4.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
