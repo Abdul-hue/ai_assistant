@@ -13,6 +13,11 @@ import ProfileSettings from "./pages/ProfileSettings";
 import Privacy from "./pages/Privacy";
 import Terms from "./pages/Terms";
 import NotFound from "./pages/NotFound";
+// Gmail pages removed - all functionality consolidated in GmailModal component
+import OutlookInbox from "./pages/OutlookInbox";
+import OutlookSent from "./pages/OutlookSent";
+import OutlookCompose from "./pages/OutlookCompose";
+import OutlookSettings from "./pages/OutlookSettings";
 
 const queryClient = new QueryClient();
 
@@ -37,6 +42,12 @@ const App = () => (
             <Route path="/profile" element={<ProfileSettings />} />
             <Route path="/privacy" element={<Privacy />} />
             <Route path="/terms" element={<Terms />} />
+            {/* Gmail Routes - Removed: All functionality consolidated in GmailModal component */}
+            {/* Outlook Routes */}
+            <Route path="/outlook/inbox" element={<OutlookInbox />} />
+            <Route path="/outlook/sent" element={<OutlookSent />} />
+            <Route path="/outlook/compose" element={<OutlookCompose />} />
+            <Route path="/outlook/settings" element={<OutlookSettings />} />
             {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
             <Route path="*" element={<NotFound />} />
           </Routes>

@@ -7,6 +7,7 @@ node_modules/
 .env.production
 .env.test
 .env.example
+.env.example.txt
 # Session files (SECURITY: Never commit authentication data)
 auth_info_baileys/
 auth_sessions/

@@ -5,7 +5,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Bot, MessageSquare, Loader2, Calendar as CalendarIcon, Eye, Users, Trash2, LayoutDashboard, Settings, Home, RefreshCw, AlertCircle, Globe, Clock, User } from "lucide-react";
+import { Plus, Bot, MessageSquare, Loader2, Calendar as CalendarIcon, Eye, Users, Trash2, LayoutDashboard, Settings, Home, RefreshCw, AlertCircle, Globe, Clock, User, Mail } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import AgentDetailsModal from "@/components/AgentDetailsModal";
 import ContactsManagementDialog from "@/components/agents/ContactsManagementDialog";
@@ -13,6 +13,7 @@ import { useContactCount } from "@/hooks/useContacts";
 import { useDeleteAgent } from "@/hooks/useAgents";
 import { useDashboardStats } from "@/hooks/useDashboardStats";
 import ProfileAvatarMenu from "@/components/ProfileAvatarMenu";
+import GmailModal from "@/components/GmailModal";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -80,6 +81,7 @@ const Dashboard = () => {
   // Modal state
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const [gmailModalOpen, setGmailModalOpen] = useState(false);
 
   useEffect(() => {
     checkAuth();
@@ -170,6 +172,26 @@ const Dashboard = () => {
           >
             <CalendarIcon className="h-5 w-5" />
             Calendar
+          </Button>
+          <Button
+            variant="ghost"
+            className={`w-full justify-start gap-3 hover:bg-white/10 transition-all duration-300 ${
+              gmailModalOpen ? "bg-primary/20 text-primary border-l-2 border-primary" : "text-gray-400"
+            }`}
+            onClick={() => setGmailModalOpen(true)}
+          >
+            <Mail className="h-5 w-5" />
+            Gmail
+          </Button>
+          <Button
+            variant="ghost"
+            className={`w-full justify-start gap-3 hover:bg-white/10 transition-all duration-300 ${
+              isActive("/outlook/inbox") || isActive("/outlook/sent") || isActive("/outlook/compose") || isActive("/outlook/settings") ? "bg-primary/20 text-primary border-l-2 border-primary" : "text-gray-400"
+            }`}
+            onClick={() => navigate("/outlook/inbox")}
+          >
+            <Mail className="h-5 w-5" />
+            Outlook
           </Button>
           <Button
             variant="ghost"
@@ -469,6 +491,12 @@ const Dashboard = () => {
           if (!open) setSelectedAgentId(null);
         }}
         agentId={selectedAgentId}
+      />
+      
+      {/* Gmail Modal */}
+      <GmailModal
+        open={gmailModalOpen}
+        onOpenChange={setGmailModalOpen}
       />
     </div>
   );

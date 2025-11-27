@@ -1,11 +1,26 @@
 require('dotenv').config();
 const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 // Rate limiting disabled - removed express-rate-limit import
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
+
+// Initialize Socket.IO
+const io = new Server(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    methods: ['GET', 'POST'],
+    credentials: true,
+  },
+});
+
+// Make io available globally
+app.set('io', io);
 
 // Trust proxy (required when behind reverse proxy like Nginx)
 // Only trust the first proxy (Nginx) for security
@@ -24,6 +39,8 @@ const agentDocumentsRoute = require('./src/routes/agentDocuments');
 const contactsRoutes = require('./src/routes/contacts');
 const profileRoutes = require('./src/routes/profile');
 const dashboardRoutes = require('./src/routes/dashboard');
+const gmailRoutes = require('./src/routes/gmail');
+const emailActionsRoutes = require('./src/routes/emailActions');
 
 // ============================================================================
 // ENVIRONMENT VALIDATION
@@ -313,6 +330,10 @@ app.get('/api/health/n8n', async (req, res) => {
 // Auth routes (rate limiting disabled)
 app.use('/api/auth', authRoutes);
 
+// Gmail routes
+app.use('/api/gmail', gmailRoutes);
+app.use('/api/emails', emailActionsRoutes);
+
 // Other routes
 app.use('/api/migrate', migrateRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
@@ -403,7 +424,334 @@ process.on('unhandledRejection', (reason, promise) => {
 const { initializeExistingSessions } = require('./src/services/baileysService');
 
 // Start the server
-const server = app.listen(PORT, '0.0.0.0', async () => {
+// Socket.IO connection handling
+io.on('connection', (socket) => {
+  // Extract User ID from query parameter or handshake
+  const userId = socket.handshake.query.userId || socket.handshake.headers['user-id'];
+  
+  console.log(`\n👤 User connected: ${socket.id}`);
+  console.log(`   User ID: ${userId || 'NOT PROVIDED'}`);
+  
+  if (!userId) {
+    console.error('   ❌ No User ID provided');
+    socket.emit('error', {
+      message: 'User ID required',
+      details: 'Please provide a User ID to connect',
+    });
+    socket.disconnect(true);
+    return;
+  }
+
+  // User joins their room
+  socket.on('join_user', (data) => {
+    const requestUserId = data?.userId || userId;
+    console.log(`👥 User ${requestUserId} joined room`);
+    socket.join(requestUserId);
+  });
+
+  // Request initial emails
+  socket.on('get_initial_emails', async (data) => {
+    try {
+      const requestUserId = data?.userId || userId;
+      console.log(`\n📧 Request: get_initial_emails from ${requestUserId}`);
+      
+      if (!requestUserId) {
+        socket.emit('error', { message: 'User ID required' });
+        return;
+      }
+
+      // Get email account from database
+      const { supabaseAdmin } = require('./src/config/supabase');
+      const { data: emailAccount, error: dbError } = await supabaseAdmin
+        .from('email_accounts')
+        .select('access_token, refresh_token, token_expires_at, email')
+        .eq('user_id', requestUserId)
+        .eq('provider', 'gmail')
+        .eq('is_active', true)
+        .single();
+
+      if (dbError || !emailAccount?.access_token) {
+        console.log(`   ⚠️  Gmail not connected for user ${requestUserId}`);
+        // Send empty array instead of error - allows frontend to show "not connected" state
+        socket.emit('initial_emails', { emails: [] });
+        return;
+      }
+
+      console.log(`   ✅ Access token retrieved successfully`);
+
+      // Create OAuth client
+      const { google } = require('googleapis');
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        process.env.GOOGLE_REDIRECT_URI
+      );
+
+      // Set credentials
+      const expiryDate = emailAccount.token_expires_at 
+        ? new Date(emailAccount.token_expires_at).getTime() 
+        : null;
+      
+      oauth2Client.setCredentials({
+        access_token: emailAccount.access_token,
+        refresh_token: emailAccount.refresh_token,
+        expiry_date: expiryDate,
+      });
+
+      // Check if token needs refresh (less than 5 minutes left)
+      if (expiryDate) {
+        const now = Date.now();
+        const timeLeft = expiryDate - now;
+
+        if (timeLeft < 5 * 60 * 1000) { // Less than 5 minutes left
+          console.log('   🔄 Token expiring soon, refreshing...');
+          
+          if (!emailAccount.refresh_token) {
+            console.error('   ❌ No refresh token available');
+            socket.emit('error', {
+              message: 'Token expired and no refresh token available',
+              details: 'Please re-authenticate with Gmail',
+            });
+            return;
+          }
+
+          try {
+            const { credentials } = await oauth2Client.refreshAccessToken();
+            
+            // Update in database
+            const newExpiresAt = credentials.expiry_date 
+              ? new Date(credentials.expiry_date).toISOString()
+              : credentials.expires_in
+                ? new Date(Date.now() + credentials.expires_in * 1000).toISOString()
+                : null;
+            
+            await supabaseAdmin
+              .from('email_accounts')
+              .update({
+                access_token: credentials.access_token,
+                refresh_token: credentials.refresh_token || emailAccount.refresh_token,
+                token_expires_at: newExpiresAt,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('user_id', requestUserId)
+              .eq('provider', 'gmail');
+            
+            oauth2Client.setCredentials(credentials);
+            console.log('   ✅ Token refreshed successfully');
+          } catch (refreshError) {
+            console.error('   ❌ Token refresh failed:', refreshError.message);
+            socket.emit('error', {
+              message: 'Failed to refresh Gmail token',
+              details: 'Please re-authenticate',
+            });
+            return;
+          }
+        }
+      }
+
+      // ✅ ALWAYS FETCH FROM GMAIL API (no cache)
+      const { getInitialEmails } = require('./src/services/gmailWatchService');
+      
+      console.log('   📧 Fetching directly from Gmail API (no cache)...');
+      const emails = await getInitialEmails(oauth2Client, requestUserId, 20);
+      const validEmails = emails.filter(e => e !== null);
+      
+      // Note: getInitialEmails still saves to Supabase for real-time notifications, but we don't read from it
+
+      // Helper function to format email time
+      const formatEmailTime = (dateString) => {
+        try {
+          const emailDate = new Date(dateString);
+          const now = new Date();
+          const diffMs = now - emailDate;
+          const diffMins = Math.floor(diffMs / 60000);
+          const diffHours = Math.floor(diffMins / 60);
+          const diffDays = Math.floor(diffHours / 24);
+
+          if (diffMins < 1) return 'now';
+          if (diffMins < 60) return `${diffMins}m ago`;
+          if (diffHours < 24) return `${diffHours}h ago`;
+          if (diffDays < 7) return `${diffDays}d ago`;
+          return emailDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        } catch {
+          return 'Unknown';
+        }
+      };
+
+      // Helper function to get avatar initials
+      const getAvatarInitials = (from) => {
+        const emailMatch = from.match(/([A-Za-z]+)/);
+        return emailMatch ? emailMatch[1].substring(0, 2).toUpperCase() : 'EM';
+      };
+
+      // Format emails for frontend
+      const formattedEmails = validEmails.map(email => ({
+        id: email.id || email.messageId,
+        messageId: email.id || email.messageId,
+        from: email.from,
+        fromEmail: email.fromEmail || email.from,
+        to: email.to,
+        subject: email.subject || '(No subject)',
+        preview: email.snippet || '',
+        snippet: email.snippet || '',
+        body: email.body || email.snippet || '',
+        bodyHtml: email.bodyHtml || '',
+        date: email.date,
+        time: formatEmailTime(email.date),
+        avatar: getAvatarInitials(email.from),
+        hasAttachment: email.attachments && email.attachments.length > 0,
+        attachments: email.attachments || [],
+      }));
+
+      console.log(`   ✅ Sending ${formattedEmails.length} emails to frontend (from Gmail API)`);
+      socket.emit('initial_emails', { emails: formattedEmails });
+    } catch (error) {
+      console.error('❌ Error getting initial emails:', error);
+      socket.emit('error', { 
+        message: error.message || 'Failed to fetch emails',
+        error: error.toString()
+      });
+    }
+  });
+
+  // Refresh emails - fetch from Gmail API directly (no cache)
+  socket.on('refresh_emails', async (data) => {
+    try {
+      const requestUserId = data?.userId || userId;
+      
+      console.log(`\n🔄 Request: refresh_emails from ${requestUserId} (fetching from Gmail API)`);
+      
+      if (!requestUserId) {
+        socket.emit('error', { message: 'User ID required' });
+        return;
+      }
+
+      // Get user's Gmail auth from database
+      const { supabaseAdmin } = require('./src/config/supabase');
+      const { data: emailAccount, error: dbError } = await supabaseAdmin
+        .from('email_accounts')
+        .select('id, access_token, refresh_token, token_expires_at, email')
+        .eq('user_id', requestUserId)
+        .eq('provider', 'gmail')
+        .eq('is_active', true)
+        .single();
+
+      if (dbError || !emailAccount?.access_token) {
+        socket.emit('error', { message: 'Gmail not connected' });
+        return;
+      }
+
+      // Create OAuth client
+      const { google } = require('googleapis');
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        process.env.GOOGLE_REDIRECT_URI
+      );
+
+      // Set credentials and refresh if needed
+      const expiryDate = emailAccount.token_expires_at ? new Date(emailAccount.token_expires_at).getTime() : null;
+      oauth2Client.setCredentials({
+        access_token: emailAccount.access_token,
+        refresh_token: emailAccount.refresh_token,
+        expiry_date: expiryDate,
+      });
+
+      // Refresh token if needed
+      if (expiryDate && (expiryDate - Date.now() < 5 * 60 * 1000)) {
+        try {
+          const { credentials } = await oauth2Client.refreshAccessToken();
+          await supabaseAdmin
+            .from('email_accounts')
+            .update({
+              access_token: credentials.access_token,
+              refresh_token: credentials.refresh_token || emailAccount.refresh_token,
+              token_expires_at: credentials.expiry_date ? new Date(credentials.expiry_date).toISOString() : null,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('user_id', requestUserId)
+            .eq('provider', 'gmail');
+          oauth2Client.setCredentials(credentials);
+        } catch (refreshError) {
+          socket.emit('error', { message: 'Failed to refresh Gmail token' });
+          return;
+        }
+      }
+
+      // Fetch from Gmail API directly (no cache)
+      const { getInitialEmails } = require('./src/services/gmailWatchService');
+      const emails = await getInitialEmails(oauth2Client, requestUserId, 20);
+      const validEmails = emails.filter(e => e !== null);
+
+      // Format emails for frontend
+      const formatEmailTime = (dateString) => {
+        try {
+          const emailDate = new Date(dateString);
+          const now = new Date();
+          const diffMs = now - emailDate;
+          const diffMins = Math.floor(diffMs / 60000);
+          const diffHours = Math.floor(diffMins / 60);
+          const diffDays = Math.floor(diffHours / 24);
+
+          if (diffMins < 1) return 'now';
+          if (diffMins < 60) return `${diffMins}m ago`;
+          if (diffHours < 24) return `${diffHours}h ago`;
+          if (diffDays < 7) return `${diffDays}d ago`;
+          return emailDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        } catch {
+          return 'Unknown';
+        }
+      };
+
+      const getAvatarInitials = (from) => {
+        const emailMatch = from.match(/([A-Za-z]+)/);
+        return emailMatch ? emailMatch[1].substring(0, 2).toUpperCase() : 'EM';
+      };
+
+      const formattedEmails = validEmails.map(email => ({
+        id: email.id || email.messageId,
+        messageId: email.id || email.messageId,
+        from: email.from,
+        fromEmail: email.fromEmail || email.from,
+        to: email.to,
+        subject: email.subject || '(No subject)',
+        preview: email.snippet || '',
+        snippet: email.snippet || '',
+        body: email.body || email.snippet || '',
+        bodyHtml: email.bodyHtml || '',
+        date: email.date,
+        time: formatEmailTime(email.date),
+        avatar: getAvatarInitials(email.from),
+        hasAttachment: email.attachments && email.attachments.length > 0,
+        attachments: email.attachments || [],
+      }));
+
+      // Emit refresh complete with all emails (frontend will update the list)
+      socket.emit('refresh_complete', { 
+        newEmailsCount: formattedEmails.length,
+        emails: formattedEmails // Send all emails so frontend can update
+      });
+      
+      console.log(`   ✅ Refreshed ${formattedEmails.length} emails from Gmail API`);
+    } catch (error) {
+      console.error('❌ Error refreshing emails:', error);
+      socket.emit('error', { 
+        message: error.message || 'Failed to refresh emails',
+        error: error.toString()
+      });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log(`\n👋 User disconnected: ${socket.id} (${userId || 'unknown'})`);
+  });
+
+  socket.on('error', (error) => {
+    console.error(`❌ Socket error for ${userId}:`, error);
+  });
+});
+
+server.listen(PORT, '0.0.0.0', async () => {
   console.log('\n' + '='.repeat(60));
   console.log('🚀 Backend Server Started Successfully');
   console.log('='.repeat(60));
@@ -424,6 +772,31 @@ const server = app.listen(PORT, '0.0.0.0', async () => {
       console.log('⚠️  WhatsApp session initialization failed, but server is running');
     }
   }, 3000); // Wait 3 seconds for database to be ready
+
+  // Start scheduled email check job (every 15 minutes)
+  const { checkForNewEmailsForAllAccounts } = require('./src/services/gmailWatchService');
+  
+  // Run immediately after 10 seconds (give server time to fully start)
+  setTimeout(async () => {
+    console.log('📧 Starting initial email check...');
+    try {
+      await checkForNewEmailsForAllAccounts();
+    } catch (error) {
+      console.error('Error in initial email check:', error.message);
+    }
+  }, 10000);
+
+  // Then run every 15 minutes (900,000 ms)
+  const EMAIL_CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes
+  setInterval(async () => {
+    try {
+      await checkForNewEmailsForAllAccounts();
+    } catch (error) {
+      console.error('Error in scheduled email check:', error.message);
+    }
+  }, EMAIL_CHECK_INTERVAL);
+
+  console.log(`📧 Scheduled email check: Every 15 minutes`);
 });
 
 // Graceful shutdown
