@@ -13,7 +13,12 @@ import ProfileSettings from "./pages/ProfileSettings";
 import Privacy from "./pages/Privacy";
 import Terms from "./pages/Terms";
 import NotFound from "./pages/NotFound";
-// Gmail pages removed - all functionality consolidated in GmailModal component
+// Gmail pages
+import GmailInbox from "./pages/GmailInbox";
+import GmailSent from "./pages/GmailSent";
+import GmailCompose from "./pages/GmailCompose";
+import GmailSettings from "./pages/GmailSettings";
+// Outlook pages
 import OutlookInbox from "./pages/OutlookInbox";
 import OutlookSent from "./pages/OutlookSent";
 import OutlookCompose from "./pages/OutlookCompose";
@@ -42,7 +47,11 @@ const App = () => (
             <Route path="/profile" element={<ProfileSettings />} />
             <Route path="/privacy" element={<Privacy />} />
             <Route path="/terms" element={<Terms />} />
-            {/* Gmail Routes - Removed: All functionality consolidated in GmailModal component */}
+            {/* Gmail Routes */}
+            <Route path="/gmail/inbox" element={<GmailInbox />} />
+            <Route path="/gmail/sent" element={<GmailSent />} />
+            <Route path="/gmail/compose" element={<GmailCompose />} />
+            <Route path="/gmail/settings" element={<GmailSettings />} />
             {/* Outlook Routes */}
             <Route path="/outlook/inbox" element={<OutlookInbox />} />
             <Route path="/outlook/sent" element={<OutlookSent />} />
