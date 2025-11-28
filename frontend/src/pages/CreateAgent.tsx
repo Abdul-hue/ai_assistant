@@ -8,13 +8,12 @@ import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { ArrowLeft, Bot, Loader2, MessageSquare, LayoutDashboard, Plus, Calendar as CalendarIcon, Settings, Home, User, Phone, FileText, Globe, Clock, Building2, Users, Upload, Trash2 } from "lucide-react";
+import { ArrowLeft, Bot, Loader2, MessageSquare, LayoutDashboard, Plus, Calendar as CalendarIcon, Settings, Home, User, Phone, FileText, Globe, Clock, Building2, Users, Upload, Trash2, Eye, EyeOff } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import AgentQRCode from "@/components/AgentQRCode";
-import IntegrationEndpointsSection from "@/components/agents/IntegrationEndpointsSection";
 import KnowledgeBaseFilesSection from "@/components/agents/KnowledgeBaseFilesSection";
 import ContactUploadDialog from "@/components/agents/ContactUploadDialog";
-import type { IntegrationEndpoint, FileMetadata } from "@/types/agent.types";
+import type { FileMetadata } from "@/types/agent.types";
 import {
   uploadAgentFile as uploadFileToStorage,
   updateAgentFiles as persistAgentFiles,
@@ -31,6 +30,7 @@ const CreateAgent = () => {
   const [showQRCode, setShowQRCode] = useState(false);
   const [createdAgentId, setCreatedAgentId] = useState("");
   const [contactFile, setContactFile] = useState<File | null>(null);
+  const [showAccessToken, setShowAccessToken] = useState(false);
 
   const [draftAgentId, setDraftAgentId] = useState<string>(() => crypto.randomUUID());
   const [formData, setFormData] = useState({
@@ -44,21 +44,21 @@ const CreateAgent = () => {
     agentName: "",
     agentCountryCode: "+92",
     agentPhoneNumber: "",
-    responseLanguages: ["english"], // Array for multiple languages
     timezone: "Asia/Karachi",
     persona: "",
     agentType: "custom",
     
-    // Company Integration (kept for backwards compatibility)
+    // Company Integration
     description: "",
     whatsappPhoneNumber: "",
     initialPrompt: "",
-    companyData: {
-      erpSystem: "",
-      crmSystem: "",
-    },
+    companyIntegrations: [
+      {
+        endpoint_url: "",
+        access_token: "",
+      }
+    ],
   });
-  const [integrationEndpoints, setIntegrationEndpoints] = useState<IntegrationEndpoint[]>([]);
   const [pendingFiles, setPendingFiles] = useState<FileMetadata[]>([]);
   const uploadContacts = useUploadContacts();
 
@@ -208,37 +208,27 @@ const CreateAgent = () => {
 
       const phoneNumber = agentFullPhone; // For backwards compatibility
 
-      if (integrationEndpoints.length > 10) {
-        throw new Error('Maximum 10 endpoints allowed');
-      }
+      // Validate and sanitize company integrations
+      const sanitizedCompanyIntegrations = formData.companyIntegrations
+        .filter(integration => integration.endpoint_url?.trim() || integration.access_token?.trim())
+        .map(integration => ({
+          endpoint_url: integration.endpoint_url?.trim() || null,
+          access_token: integration.access_token?.trim() || null,
+        }));
 
-      const sanitizedEndpoints: IntegrationEndpoint[] = integrationEndpoints.map((endpoint) => ({
-        id: endpoint.id || crypto.randomUUID(),
-        name: endpoint.name.trim(),
-        url: endpoint.url.trim(),
-      }));
-
-      const seenNames = new Set<string>();
-      sanitizedEndpoints.forEach((endpoint) => {
-        if (!endpoint.name) {
-          throw new Error('Endpoint name is required');
-        }
-
-        try {
-          const url = new URL(endpoint.url);
-          if (url.protocol !== 'https:') {
-            throw new Error('Endpoint URLs must use HTTPS');
+      // Validate URLs
+      for (const integration of sanitizedCompanyIntegrations) {
+        if (integration.endpoint_url) {
+          try {
+            const url = new URL(integration.endpoint_url);
+            if (url.protocol !== 'https:') {
+              throw new Error('Company integration URLs must use HTTPS');
+            }
+          } catch (error) {
+            throw new Error('Invalid URL format in company integration');
           }
-        } catch (error) {
-          throw new Error('Invalid URL format');
         }
-
-        const key = endpoint.name.toLowerCase();
-        if (seenNames.has(key)) {
-          throw new Error('Endpoint name already exists');
-        }
-        seenNames.add(key);
-      });
+      }
       
       const { data, error } = await supabase
         .from("agents")
@@ -251,14 +241,13 @@ const CreateAgent = () => {
           // Agent Configuration
           agent_name: formData.agentName,
           whatsapp_phone_number: agentFullPhone,
-          response_languages: formData.responseLanguages, // Already an array
           timezone: formData.timezone,
           persona: formData.persona,
           // Company Integration
           agent_type: formData.agentType,
           initial_prompt: formData.persona, // Also save in initial_prompt for backwards compatibility
-          company_data: formData.companyData,
-          integration_endpoints: sanitizedEndpoints,
+          company_data: sanitizedCompanyIntegrations.length > 0 ? sanitizedCompanyIntegrations : null,
+          integration_endpoints: [],
           uploaded_files: [],
           id: draftAgentId,
           status: "active"
@@ -325,7 +314,6 @@ const CreateAgent = () => {
       }
 
       setCreatedAgentId(data.id);
-      setIntegrationEndpoints(sanitizedEndpoints);
       setPendingFiles([]);
       setContactFile(null);
       setShowQRCode(true);
@@ -396,9 +384,6 @@ const CreateAgent = () => {
                     <span className="font-medium">Phone:</span> {formData.agentCountryCode}{formData.agentPhoneNumber}
                   </p>
                   <p className="text-sm text-muted-foreground">
-                    <span className="font-medium">Languages:</span> {formData.responseLanguages.map(l => l.charAt(0).toUpperCase() + l.slice(1)).join(', ')}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
                     <span className="font-medium">Agent ID:</span> {createdAgentId.substring(0, 8)}...
                   </p>
                 </div>
@@ -420,7 +405,6 @@ const CreateAgent = () => {
                       agentName: "",
                       agentCountryCode: "+92",
                       agentPhoneNumber: "",
-                      responseLanguages: ["english"],
                       timezone: "Asia/Karachi",
                       persona: "",
                       agentType: "custom",
@@ -428,12 +412,13 @@ const CreateAgent = () => {
                       description: "",
                       whatsappPhoneNumber: "",
                       initialPrompt: "",
-                      companyData: {
-                        erpSystem: "",
-                        crmSystem: "",
-                      },
+                      companyIntegrations: [
+                        {
+                          endpoint_url: "",
+                          access_token: "",
+                        }
+                      ],
                     });
-                    setIntegrationEndpoints([]);
                     setPendingFiles([]);
                     setContactFile(null);
                     setDraftAgentId(crypto.randomUUID());
@@ -746,88 +731,6 @@ const CreateAgent = () => {
                 <p className="text-xs text-gray-400">WhatsApp number for this agent</p>
               </div>
 
-              {/* Response Languages - Multi-Select Checkbox Grid */}
-              <div className="space-y-2">
-                <Label className="text-gray-300">
-                  Response Languages <span className="text-red-500">*</span>
-                </Label>
-                <p className="text-xs text-gray-400 mb-3">
-                  Select languages your agent can respond in (English is required)
-                </p>
-                
-                {/* Checkbox Grid */}
-                <div className="grid grid-cols-2 md:grid-cols-3 gap-2 p-4 bg-white/5 rounded-lg border border-white/10 max-h-[300px] overflow-y-auto">
-                  {[
-                    { code: 'english', name: 'English', flag: '🇺🇸', required: true },
-                    { code: 'spanish', name: 'Spanish', flag: '🇪🇸' },
-                    { code: 'hindi', name: 'Hindi', flag: '🇮🇳' },
-                    { code: 'arabic', name: 'Arabic', flag: '🇸🇦' },
-                    { code: 'urdu', name: 'Urdu', flag: '🇵🇰' },
-                    { code: 'french', name: 'French', flag: '🇫🇷' },
-                    { code: 'german', name: 'German', flag: '🇩🇪' },
-                    { code: 'portuguese', name: 'Portuguese', flag: '🇵🇹' },
-                    { code: 'russian', name: 'Russian', flag: '🇷🇺' },
-                    { code: 'chinese', name: 'Chinese', flag: '🇨🇳' },
-                    { code: 'japanese', name: 'Japanese', flag: '🇯🇵' },
-                    { code: 'korean', name: 'Korean', flag: '🇰🇷' },
-                    { code: 'italian', name: 'Italian', flag: '🇮🇹' },
-                    { code: 'dutch', name: 'Dutch', flag: '🇳🇱' },
-                    { code: 'turkish', name: 'Turkish', flag: '🇹🇷' },
-                    { code: 'bengali', name: 'Bengali', flag: '🇧🇩' },
-                    { code: 'vietnamese', name: 'Vietnamese', flag: '🇻🇳' },
-                    { code: 'thai', name: 'Thai', flag: '🇹🇭' },
-                    { code: 'indonesian', name: 'Indonesian', flag: '🇮🇩' },
-                    { code: 'malay', name: 'Malay', flag: '🇲🇾' },
-                    { code: 'filipino', name: 'Filipino', flag: '🇵🇭' },
-                  ].map((lang) => {
-                    const isChecked = formData.responseLanguages.includes(lang.code);
-                    const isDisabled = lang.required;
-                    
-                    return (
-                      <label
-                        key={lang.code}
-                        className={`
-                          flex items-center gap-2 p-2.5 rounded-md cursor-pointer transition-all
-                          ${isChecked 
-                            ? 'bg-primary/20 border-2 border-primary' 
-                            : 'bg-white/5 border border-white/10 hover:bg-white/10'
-                          }
-                          ${isDisabled ? 'opacity-75 cursor-not-allowed' : ''}
-                        `}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={isChecked}
-                          disabled={isDisabled}
-                          onChange={(e) => {
-                            if (e.target.checked) {
-                              setFormData({
-                                ...formData,
-                                responseLanguages: [...formData.responseLanguages, lang.code]
-                              });
-                            } else {
-                              setFormData({
-                                ...formData,
-                                responseLanguages: formData.responseLanguages.filter(l => l !== lang.code)
-                              });
-                            }
-                          }}
-                          className="rounded border-white/20"
-                        />
-                        <span className="text-lg">{lang.flag}</span>
-                        <span className="text-white text-sm flex-1">{lang.name}</span>
-                        {lang.required && (
-                          <span className="text-xs text-gray-400">(Required)</span>
-                        )}
-                      </label>
-                    );
-                  })}
-                </div>
-                
-                <p className="text-xs text-gray-400 mt-2">
-                  Selected: {formData.responseLanguages.length} language{formData.responseLanguages.length !== 1 ? 's' : ''}
-                </p>
-              </div>
 
               {/* Timezone */}
               <div className="space-y-2">
@@ -901,59 +804,111 @@ const CreateAgent = () => {
           {/* SECTION 3: Company Integration */}
           <Card className="glass-card shadow-glow border-white/10">
             <CardHeader className="pb-6">
-              <CardTitle className="text-2xl font-bold text-white mb-2 flex items-center gap-2">
-                <Building2 className="w-6 h-6 text-primary" />
-                Company Integration
-                <Badge variant="secondary" className="ml-2 text-xs">Optional</Badge>
-              </CardTitle>
-              <CardDescription className="text-gray-400 text-base">
-                Connect your business systems (optional)
-              </CardDescription>
+              <div className="flex items-center justify-between">
+                <div>
+                  <CardTitle className="text-2xl font-bold text-white mb-2 flex items-center gap-2">
+                    <Building2 className="w-6 h-6 text-primary" />
+                    Company Integration
+                    <Badge variant="secondary" className="ml-2 text-xs">Optional</Badge>
+                  </CardTitle>
+                  <CardDescription className="text-gray-400 text-base">
+                    Connect your business systems (optional)
+                  </CardDescription>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setFormData({
+                    ...formData,
+                    companyIntegrations: [
+                      ...formData.companyIntegrations,
+                      { endpoint_url: "", access_token: "" }
+                    ]
+                  })}
+                  className="text-white border-white/20 hover:bg-white/10"
+                >
+                  <Plus className="h-4 w-4 mr-2" />
+                  Add Integration
+                </Button>
+              </div>
             </CardHeader>
-            <CardContent className="space-y-4"  >
-                
-                <div className="space-y-2">
-                  <Label htmlFor="erp-system" className="text-gray-300">ERP System</Label>
-                  <select
-                    id="erp-system"
-                    className="w-full rounded-md border border-white/10 bg-white/5 text-white px-3 py-2 focus:border-primary focus:ring-primary/50 transition-all duration-300"
-                    value={formData.companyData.erpSystem}
-                    onChange={(e) => setFormData({
-                      ...formData,
-                      companyData: { ...formData.companyData, erpSystem: e.target.value }
-                    })}
-                  >
-                    <option value="" className="bg-[#0a0a0a]">Select ERP System</option>
-                    <option value="sap" className="bg-[#0a0a0a]">SAP</option>
-                    <option value="oracle" className="bg-[#0a0a0a]">Oracle</option>
-                    <option value="netsuite" className="bg-[#0a0a0a]">NetSuite</option>
-                    <option value="custom" className="bg-[#0a0a0a]">Custom API</option>
-                  </select>
-                </div>
+            <CardContent className="space-y-6">
+              {formData.companyIntegrations.map((integration, index) => (
+                <div key={index} className="space-y-4 p-4 rounded-lg border border-white/10 bg-white/5">
+                  <div className="flex items-center justify-between mb-2">
+                    <h4 className="text-sm font-semibold text-white">Integration {index + 1}</h4>
+                    {formData.companyIntegrations.length > 1 && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          const updated = formData.companyIntegrations.filter((_, i) => i !== index);
+                          setFormData({
+                            ...formData,
+                            companyIntegrations: updated.length > 0 ? updated : [{ endpoint_url: "", access_token: "" }]
+                          });
+                        }}
+                        className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    )}
+                  </div>
+                  
+                  <div className="space-y-2">
+                    <Label htmlFor={`endpoint-url-${index}`} className="text-gray-300">Endpoint URL</Label>
+                    <Input
+                      id={`endpoint-url-${index}`}
+                      type="url"
+                      className="w-full rounded-md border border-white/10 bg-white/5 text-white px-3 py-2 focus:border-primary focus:ring-primary/50 transition-all duration-300"
+                      placeholder="https://api.yourcompany.com/webhook"
+                      value={integration.endpoint_url}
+                      onChange={(e) => {
+                        const updated = [...formData.companyIntegrations];
+                        updated[index] = { ...updated[index], endpoint_url: e.target.value };
+                        setFormData({ ...formData, companyIntegrations: updated });
+                      }}
+                    />
+                    <p className="text-xs text-gray-400">Webhook URL for company system integration</p>
+                  </div>
 
-                <div className="space-y-2">
-                  <Label htmlFor="crm-system" className="text-gray-300">CRM System</Label>
-                  <select
-                    id="crm-system"
-                    className="w-full rounded-md border border-white/10 bg-white/5 text-white px-3 py-2 focus:border-primary focus:ring-primary/50 transition-all duration-300"
-                    value={formData.companyData.crmSystem}
-                    onChange={(e) => setFormData({
-                      ...formData,
-                      companyData: { ...formData.companyData, crmSystem: e.target.value }
-                    })}
-                  >
-                    <option value="" className="bg-[#0a0a0a]">Select CRM System</option>
-                    <option value="salesforce" className="bg-[#0a0a0a]">Salesforce</option>
-                    <option value="hubspot" className="bg-[#0a0a0a]">HubSpot</option>
-                    <option value="zoho" className="bg-[#0a0a0a]">Zoho</option>
-                    <option value="custom" className="bg-[#0a0a0a]">Custom API</option>
-                  </select>
+                  <div className="space-y-2">
+                    <Label htmlFor={`access-token-${index}`} className="text-gray-300 flex items-center gap-2">
+                      Access Token
+                      <Badge variant="outline" className="text-xs">Optional</Badge>
+                    </Label>
+                    <div className="relative">
+                      <Input
+                        id={`access-token-${index}`}
+                        type={showAccessToken ? "text" : "password"}
+                        className="w-full rounded-md border border-white/10 bg-white/5 text-white px-3 py-2 pr-10 focus:border-primary focus:ring-primary/50 transition-all duration-300"
+                        placeholder="your-access-token-here"
+                        value={integration.access_token}
+                        onChange={(e) => {
+                          const updated = [...formData.companyIntegrations];
+                          updated[index] = { ...updated[index], access_token: e.target.value };
+                          setFormData({ ...formData, companyIntegrations: updated });
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowAccessToken(!showAccessToken)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white transition-colors"
+                        aria-label={showAccessToken ? "Hide access token" : "Show access token"}
+                      >
+                        {showAccessToken ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
+                    <p className="text-xs text-gray-400">Authentication token for your company API (if required)</p>
+                  </div>
                 </div>
-
-                <IntegrationEndpointsSection
-                  endpoints={integrationEndpoints}
-                  onChange={setIntegrationEndpoints}
-                />
+              ))}
             </CardContent>
           </Card>
 

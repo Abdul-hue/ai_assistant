@@ -217,6 +217,9 @@ router.get('/:id/details', authMiddleware, validateUUID('id'), async (req, res) 
       };
     }
 
+    // Integration endpoints are stored in the agents.integration_endpoints JSONB column
+    // No separate query needed - they're already in agentData
+
     // Build statistics object
     const statistics = {
       total_messages: totalMessages || 0,
@@ -226,10 +229,12 @@ router.get('/:id/details', authMiddleware, validateUUID('id'), async (req, res) 
     };
 
     // Build complete response
+    // integration_endpoints are already in agentData.integration_endpoints (JSONB column)
     const response = {
       agent: {
         ...agentData,
-        whatsapp_session: whatsappSession
+        whatsapp_session: whatsappSession,
+        // integration_endpoints is already in agentData from the JSONB column
       },
       statistics
     };
@@ -246,54 +251,237 @@ router.get('/:id/details', authMiddleware, validateUUID('id'), async (req, res) 
   }
 });
 
+// GET /api/agents/:id/debug-connection
+// Diagnostic endpoint to check connection status
+router.get('/:id/debug-connection', authMiddleware, validateUUID('id'), async (req, res) => {
+  try {
+    const { id: agentId } = req.params;
+    const userId = req.user.id;
+    
+    // Verify agent belongs to user
+    const { data: agentData, error: agentError } = await supabase
+      .from('agents')
+      .select('id, user_id')
+      .eq('id', agentId)
+      .eq('user_id', userId)
+      .single();
+    
+    if (agentError || !agentData) {
+      return res.status(404).json({
+        status: 'not_found',
+        message: 'Agent not found or you do not have access to it'
+      });
+    }
+    
+    // Check in-memory session
+    const { activeSessions, getWhatsAppStatus } = require('../services/baileysService');
+    const session = activeSessions.get(agentId);
+    
+    // Check database
+    const { data: dbSession } = await supabase
+      .from('whatsapp_sessions')
+      .select('*')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    // Get status
+    const statusResult = await getWhatsAppStatus(agentId);
+    
+    if (!session) {
+      return res.json({
+        status: 'not_found',
+        message: 'Agent not in active sessions',
+        in_memory: false,
+        database_state: {
+          status: dbSession?.status,
+          is_active: dbSession?.is_active,
+          phone_number: dbSession?.phone_number,
+          last_error: dbSession?.last_error,
+          last_heartbeat: dbSession?.last_heartbeat
+        },
+        recommendation: 'Call /api/agents/:id/init-whatsapp to connect'
+      });
+    }
+    
+    res.json({
+      status: 'found',
+      in_memory: true,
+      memory_state: {
+        is_connected: session.isConnected || false,
+        connection_state: session.connectionState || 'unknown',
+        phone_number: session.phoneNumber || null,
+        socket_age_ms: session.socketCreatedAt ? Date.now() - session.socketCreatedAt : null,
+        last_activity_ms: session.lastActivity ? Date.now() - session.lastActivity : null,
+        reconnect_attempts: session.reconnectAttempts || 0
+      },
+      database_state: {
+        status: dbSession?.status,
+        is_active: dbSession?.is_active,
+        phone_number: dbSession?.phone_number,
+        last_error: dbSession?.last_error,
+        last_heartbeat: dbSession?.last_heartbeat
+      },
+      status_result: {
+        connected: statusResult.connected,
+        is_active: statusResult.is_active,
+        status: statusResult.status
+      },
+      recommendation: !session.isConnected ? 'Connection lost - needs reconnection' : 'Connected and healthy'
+    });
+  } catch (error) {
+    console.error('[DEBUG-CONNECTION] Error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message
+    });
+  }
+});
+
 // PUT /api/agents/:id (update agent configuration)
 // SECURITY: Input validation with Zod
-router.put('/:id', authMiddleware, validateUUID('id'), validate(updateAgentSchema), async (req, res) => {
+router.put('/:id', authMiddleware, validateUUID('id'), (req, res, next) => {
+  // Log incoming request before validation
+  console.log('📥 [UPDATE-AGENT] Incoming request:', {
+    method: req.method,
+    path: req.path,
+    agentId: req.params.id,
+    userId: req.user?.id,
+    body: JSON.stringify(req.body, null, 2),
+    bodyKeys: Object.keys(req.body || {}),
+  });
+  next();
+}, validate(updateAgentSchema), async (req, res) => {
   try {
-    const { id } = req.params;
+    const agentId = req.params.id;
     const userId = req.user.id;
-    const { name, description, systemPrompt, erpCrsData, integrationEndpoints, uploadedFiles } = req.body;
+    
+    console.log('✅ [UPDATE-AGENT] Validation passed, processing update:', {
+      agentId,
+      userId,
+      validatedBody: JSON.stringify(req.body, null, 2),
+    });
+    
+    const {
+      name, description, systemPrompt, webhookUrl,
+      enableChatHistory, erpCrsData, featureToggles,
+      integrationEndpoints, isActive,
+      ownerName, ownerPhone, timezone, webhookEnabled,
+    } = req.body;
 
-    const endpointsWithIds = Array.isArray(integrationEndpoints)
-      ? integrationEndpoints.map((endpoint) => ({
-          id: endpoint.id || randomUUID(),
-          name: endpoint.name,
-          url: endpoint.url,
-        }))
-      : undefined;
+    // Verify agent belongs to user
+    const { data: existingAgent, error: fetchError } = await supabase
+      .from('agents')
+      .select('id, user_id')
+      .eq('id', agentId)
+      .eq('user_id', userId)
+      .single();
 
-    const result = await pool.query(
-      `UPDATE agents SET
-        agent_name = COALESCE($1, agent_name),
-        description = COALESCE($2, description),
-        initial_prompt = COALESCE($3, initial_prompt),
-        company_data = COALESCE($4::jsonb, company_data),
-        integration_endpoints = COALESCE($5::jsonb, integration_endpoints),
-        uploaded_files = COALESCE($6::jsonb, uploaded_files),
-        updated_at = NOW()
-       WHERE id = $7 AND user_id = $8
-       RETURNING *`,
-      [
-        name,
-        description,
-        systemPrompt,
-        erpCrsData ? JSON.stringify(erpCrsData) : null,
-        endpointsWithIds ? JSON.stringify(endpointsWithIds) : null,
-        uploadedFiles ? JSON.stringify(uploadedFiles) : null,
-        id,
-        userId,
-      ]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Agent not found' });
+    if (fetchError || !existingAgent) {
+      return res.status(404).json({
+        error: 'NOT_FOUND',
+        message: 'Agent not found or you do not have permission to edit it',
+      });
     }
 
-    console.log(`✅ Agent updated: ${id}`);
-    res.json(result.rows[0]);
+    // Prepare update object (only include provided fields)
+    const updateData = {};
+    if (name !== undefined) updateData.agent_name = name;
+    if (description !== undefined) updateData.description = description;
+    if (systemPrompt !== undefined) updateData.initial_prompt = systemPrompt; // Use initial_prompt (actual column name)
+    if (webhookUrl !== undefined) updateData.webhook_url = webhookUrl || null;
+    if (enableChatHistory !== undefined) updateData.enable_chat_history = enableChatHistory;
+    if (erpCrsData !== undefined) updateData.company_data = erpCrsData;
+    if (featureToggles !== undefined) updateData.feature_toggles = featureToggles;
+    if (isActive !== undefined) updateData.is_active = isActive;
+    if (ownerName !== undefined) updateData.agent_owner_name = ownerName || null;
+    if (ownerPhone !== undefined) updateData.agent_phone_number = ownerPhone || null;
+    if (timezone !== undefined) updateData.timezone = timezone || null;
+    if (webhookEnabled !== undefined) updateData.webhook_enabled = webhookEnabled;
+    
+    // Handle integration endpoints - store in JSONB column
+    if (integrationEndpoints !== undefined) {
+      // Transform endpoints to match the expected format
+      const endpointsToStore = Array.isArray(integrationEndpoints) && integrationEndpoints.length > 0
+        ? integrationEndpoints.map(ep => ({
+            id: ep.id || require('crypto').randomUUID(),
+            name: ep.name,
+            url: ep.url,
+            method: ep.method || 'POST',
+            headers: ep.headers || {},
+          }))
+        : [];
+      
+      // Update the integration_endpoints JSONB column
+      updateData.integration_endpoints = endpointsToStore;
+    }
+    
+    updateData.updated_at = new Date().toISOString();
+
+    // Update agent
+    const { data: updatedAgent, error: updateError } = await supabase
+      .from('agents')
+      .update(updateData)
+      .eq('id', agentId)
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (updateError) {
+      console.error('❌ Error updating agent:', updateError);
+      return res.status(500).json({
+        error: 'UPDATE_FAILED',
+        message: 'Failed to update agent',
+      });
+    }
+
+    // Handle integration endpoints - store in JSONB column
+    if (integrationEndpoints !== undefined) {
+      // Transform endpoints to match the expected format
+      const endpointsToStore = Array.isArray(integrationEndpoints) && integrationEndpoints.length > 0
+        ? integrationEndpoints.map(ep => ({
+            id: ep.id || require('crypto').randomUUID(),
+            name: ep.name,
+            url: ep.url,
+            method: ep.method || 'POST',
+            headers: ep.headers || {},
+          }))
+        : [];
+      
+      // Update the integration_endpoints JSONB column
+      updateData.integration_endpoints = endpointsToStore;
+    }
+
+    // Fetch complete agent data (integration_endpoints are in the JSONB column)
+    const { data: completeAgent, error: fetchCompleteError } = await supabase
+      .from('agents')
+      .select('*')
+      .eq('id', agentId)
+      .single();
+
+    if (fetchCompleteError) {
+      console.error('❌ Error fetching complete agent data:', fetchCompleteError);
+      // Still return the updated agent even if we can't fetch it again
+      return res.json({
+        success: true,
+        data: updatedAgent,
+        message: 'Agent updated successfully',
+      });
+    }
+
+    // Integration endpoints are already in the completeAgent.integration_endpoints JSONB column
+    const responseData = completeAgent;
+
+    res.json({
+      success: true,
+      data: responseData,
+      message: 'Agent updated successfully',
+    });
   } catch (error) {
-    console.error('Update agent error:', error.message);
-    res.status(500).json({ error: error.message });
+    console.error('❌ Error in update agent route:', error);
+    res.status(500).json({
+      error: 'INTERNAL_ERROR',
+      message: 'Failed to update agent',
+    });
   }
 });
 

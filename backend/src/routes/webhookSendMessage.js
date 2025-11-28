@@ -1,7 +1,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { supabaseAdmin } = require('../config/supabase');
-const { sendMessage, getWhatsAppStatus } = require('../services/baileysService');
+const { sendMessage, getWhatsAppStatus, initializeWhatsApp, activeSessions } = require('../services/baileysService');
 
 const router = express.Router();
 
@@ -125,15 +125,57 @@ router.post('/', async (req, res) => {
 
     // Check WhatsApp connection status
     const statusResult = await getWhatsAppStatus(agentId);
+    const session = activeSessions.get(agentId);
     
-    if (!statusResult.connected || !statusResult.is_active) {
-      console.warn(`${logPrefix} WhatsApp not connected for agent ${agentId}`);
-      return res.status(400).json({
-        success: false,
-        error: 'WhatsApp not connected',
-        details: `Agent ${agentData.agent_name} is not connected to WhatsApp. Status: ${statusResult.status}`,
-        status: statusResult.status
-      });
+    if (!statusResult.connected || !statusResult.is_active || !session || !session.isConnected) {
+      console.warn(`${logPrefix} ⚠️  Agent not connected, attempting to reconnect...`);
+      
+      // Get user_id from database
+      const { data: agentWithUser } = await supabaseAdmin
+        .from('agents')
+        .select('user_id')
+        .eq('id', agentId)
+        .single();
+      
+      if (!agentWithUser) {
+        return res.status(404).json({
+          success: false,
+          error: 'AGENT_NOT_FOUND',
+          details: 'Agent not found in database'
+        });
+      }
+      
+      // Attempt to reconnect
+      try {
+        console.log(`${logPrefix} 🔄 Initiating reconnection...`);
+        await initializeWhatsApp(agentId, agentWithUser.user_id);
+        
+        // Wait a bit for connection to establish
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        
+        // Check if now connected
+        const reconnectedStatus = await getWhatsAppStatus(agentId);
+        const reconnectedSession = activeSessions.get(agentId);
+        
+        if (!reconnectedStatus.connected || !reconnectedStatus.is_active || !reconnectedSession || !reconnectedSession.isConnected) {
+          return res.status(503).json({
+            success: false,
+            error: 'RECONNECTION_FAILED',
+            details: 'Failed to reconnect WhatsApp. Please scan QR code.',
+            action_required: 'scan_qr',
+            status: reconnectedStatus.status
+          });
+        }
+        
+        console.log(`${logPrefix} ✅ Reconnected successfully`);
+      } catch (reconnectError) {
+        console.error(`${logPrefix} ❌ Reconnection error:`, reconnectError);
+        return res.status(503).json({
+          success: false,
+          error: 'RECONNECTION_ERROR',
+          details: reconnectError.message
+        });
+      }
     }
 
     // Send message via Baileys

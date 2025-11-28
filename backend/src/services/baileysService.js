@@ -345,6 +345,17 @@ async function syncCredsToDatabase(agentId) {
     const authPath = path.join(__dirname, '../../auth_sessions', agentId);
     const credsPath = path.join(authPath, 'creds.json');
     
+    // Ensure directory exists before checking for file
+    if (!fs.existsSync(authPath)) {
+      try {
+        fs.mkdirSync(authPath, { recursive: true });
+        console.log(`[BAILEYS] 📁 Created auth directory for sync: ${authPath}`);
+      } catch (mkdirError) {
+        console.error(`[BAILEYS] ❌ Error creating auth directory for sync:`, mkdirError);
+        return;
+      }
+    }
+    
     if (!fs.existsSync(credsPath)) {
       console.log(`[BAILEYS] ℹ️ No credentials file to sync`);
       return;
@@ -475,6 +486,19 @@ async function checkNetworkRequirements() {
   });
 }
 
+// Helper function to check if a PID exists on the system
+function isPidAlive(pid) {
+  if (!pid) return false;
+  try {
+    // Signal 0 doesn't kill the process, just checks if it exists
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // ESRCH = No such process
+    return false;
+  }
+}
+
 // CRITICAL: Ensure agent has unique session - prevent credential sharing
 async function ensureAgentIsolation(agentId) {
   console.log(`[BAILEYS] 🔒 Ensuring agent isolation for: ${agentId.substring(0, 40)}`);
@@ -507,13 +531,25 @@ async function ensureAgentIsolation(agentId) {
           ? Date.now() - new Date(dbSession.last_heartbeat).getTime()
           : null;
         
-        // If other instance had heartbeat within last 5 minutes, it's likely still active
-        if (timeSinceHeartbeat && timeSinceHeartbeat < 5 * 60 * 1000) {
+        // Check if PID actually exists (for same hostname only)
+        const pidExists = dbSession.instance_hostname === INSTANCE_HOSTNAME && dbSession.instance_pid
+          ? isPidAlive(dbSession.instance_pid)
+          : null;
+        
+        // If PID doesn't exist (dead process), take over immediately
+        if (pidExists === false) {
+          // PID doesn't exist - process is dead, we can take over
+          console.log(`[BAILEYS] ⚠️ Found dead instance (PID ${dbSession.instance_pid} doesn't exist)`);
+          console.log(`[BAILEYS] ⚠️ Taking over session from dead instance`);
+          console.log(`[BAILEYS] Previous Instance: ${dbSession.instance_hostname} (${dbSession.instance_id})`);
+          console.log(`[BAILEYS] New Instance: ${INSTANCE_HOSTNAME} (${INSTANCE_ID})`);
+        } else if (timeSinceHeartbeat && timeSinceHeartbeat < 5 * 60 * 1000) {
+          // PID exists or unknown, and heartbeat is recent - real conflict
           console.error(`[BAILEYS] ❌ MULTI-INSTANCE CONFLICT DETECTED!`);
           console.error(`[BAILEYS] ❌ Agent ${agentId.substring(0, 40)} is ALREADY ACTIVE on another instance:`);
           console.error(`[BAILEYS] ❌ Other Instance ID: ${dbSession.instance_id}`);
           console.error(`[BAILEYS] ❌ Other Hostname: ${dbSession.instance_hostname}`);
-          console.error(`[BAILEYS] ❌ Other PID: ${dbSession.instance_pid}`);
+          console.error(`[BAILEYS] ❌ Other PID: ${dbSession.instance_pid} ${pidExists === true ? '(ALIVE)' : pidExists === false ? '(DEAD)' : '(UNKNOWN - different hostname)'}`);
           console.error(`[BAILEYS] ❌ Last Heartbeat: ${timeSinceHeartbeat / 1000}s ago`);
           console.error(`[BAILEYS] ❌ Phone: ${dbSession.phone_number}`);
           console.error(`[BAILEYS] `);
@@ -788,17 +824,29 @@ async function initializeWhatsApp(agentId, userId = null) {
     // Wrap saveCreds to also sync to database
     const saveCreds = async () => {
       try {
-        // Ensure directory exists before saving
-        if (!fs.existsSync(authPath)) {
-          fs.mkdirSync(authPath, { recursive: true });
-          console.log(`[BAILEYS] 📁 Created auth directory: ${authPath}`);
+        // CRITICAL: Ensure directory exists before saving (with error handling)
+        try {
+          if (!fs.existsSync(authPath)) {
+            fs.mkdirSync(authPath, { recursive: true });
+            console.log(`[BAILEYS] 📁 Created auth directory: ${authPath}`);
+          }
+        } catch (mkdirError) {
+          console.error(`[BAILEYS] ❌ Error creating auth directory:`, mkdirError);
+          throw new Error(`Failed to create auth directory: ${mkdirError.message}`);
         }
+        
+        // Verify directory exists before attempting to save
+        if (!fs.existsSync(authPath)) {
+          throw new Error(`Auth directory does not exist after creation attempt: ${authPath}`);
+        }
+        
         await saveCredsToFile(); // Save to files first
         await syncCredsToDatabase(agentId); // Then sync to database
       } catch (error) {
-        console.error(`[BAILEYS] ❌ Error saving credentials:`, error.message);
-        // Re-throw to ensure the error is visible
-        throw error;
+        console.error(`[BAILEYS] ❌ Error saving credentials:`, error);
+        console.error(`[BAILEYS] Error details:`, error);
+        // Don't re-throw - log the error but don't crash the connection
+        // The credentials will be saved on next update attempt
       }
     };
 
@@ -2491,6 +2539,66 @@ async function initializeExistingSessions() {
   }
 }
 
+/**
+ * Reconnect all agents that were active before server restart
+ * Called on server startup to restore connections
+ */
+async function reconnectAllAgents() {
+  try {
+    console.log('[RECONNECT-ALL] 🔍 Finding agents to reconnect...');
+    
+    // Get all agents that were connected or active
+    const { data: sessions, error } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('agent_id, user_id, status, phone_number')
+      .in('status', ['connected', 'qr_pending', 'connecting'])
+      .eq('is_active', true);
+    
+    if (error) {
+      console.error('[RECONNECT-ALL] ❌ Error fetching sessions:', error);
+      return;
+    }
+    
+    if (!sessions || sessions.length === 0) {
+      console.log('[RECONNECT-ALL] ℹ️  No agents to reconnect');
+      return;
+    }
+    
+    console.log(`[RECONNECT-ALL] 📱 Found ${sessions.length} agent(s) to reconnect`);
+    
+    // Reconnect each agent
+    for (const session of sessions) {
+      try {
+        console.log(`[RECONNECT-ALL] 🔌 Reconnecting agent: ${session.agent_id}`);
+        
+        // Small delay between reconnections to avoid overwhelming the server
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        // Initialize the connection (will use existing credentials)
+        await initializeWhatsApp(session.agent_id, session.user_id);
+        
+        console.log(`[RECONNECT-ALL] ✅ Agent ${session.agent_id} reconnected`);
+      } catch (error) {
+        console.error(`[RECONNECT-ALL] ❌ Failed to reconnect ${session.agent_id}:`, error.message);
+        
+        // Update status to error
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({
+            status: 'error',
+            last_error: error.message,
+            is_active: false
+          })
+          .eq('agent_id', session.agent_id);
+      }
+    }
+    
+    console.log('[RECONNECT-ALL] ✅ Reconnection process complete');
+  } catch (error) {
+    console.error('[RECONNECT-ALL] ❌ Error in reconnectAllAgents:', error);
+  }
+}
+
 module.exports = {
   initializeWhatsApp,
   safeInitializeWhatsApp,
@@ -2505,5 +2613,6 @@ module.exports = {
   updateIntegrationEndpoints,
   activeSessions,
   initializeExistingSessions,
-  subscribeToAgentEvents
+  subscribeToAgentEvents,
+  reconnectAllAgents
 };

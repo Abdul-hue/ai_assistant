@@ -10,9 +10,18 @@ const { ZodError } = require('zod');
  */
 const validate = (schema, source = 'body') => {
   return async (req, res, next) => {
+    // Get the data to validate based on source - declare outside try-catch for error handling
+    let dataToValidate;
     try {
       // Get the data to validate based on source
-      const dataToValidate = req[source];
+      dataToValidate = req[source];
+      
+      console.log(`🔍 [VALIDATION] Starting validation for ${req.method} ${req.path}`, {
+        source,
+        dataType: typeof dataToValidate,
+        dataKeys: dataToValidate && typeof dataToValidate === 'object' ? Object.keys(dataToValidate) : 'N/A',
+        dataPreview: dataToValidate ? JSON.stringify(dataToValidate, null, 2).substring(0, 500) : 'null/undefined', // First 500 chars
+      });
       
       // Validate the data
       const validatedData = await schema.parseAsync(dataToValidate);
@@ -20,10 +29,9 @@ const validate = (schema, source = 'body') => {
       // Replace the request data with validated/sanitized data
       req[source] = validatedData;
       
-      // Log validation success in development
-      if (process.env.NODE_ENV !== 'production') {
-        console.log(`✅ Validation passed for ${req.method} ${req.path}`);
-      }
+      console.log(`✅ [VALIDATION] Validation passed for ${req.method} ${req.path}`, {
+        validatedKeys: validatedData && typeof validatedData === 'object' ? Object.keys(validatedData) : 'N/A',
+      });
       
       next();
     } catch (error) {
@@ -32,10 +40,15 @@ const validate = (schema, source = 'body') => {
         const errors = error.errors.map(err => ({
           field: err.path.join('.'),
           message: err.message,
-          code: err.code
+          code: err.code,
+          path: err.path,
         }));
         
-        console.warn(`⚠️ Validation failed for ${req.method} ${req.path}:`, errors);
+        console.error(`❌ [VALIDATION] Zod validation failed for ${req.method} ${req.path}:`, {
+          errors,
+          errorCount: errors.length,
+          requestData: dataToValidate ? JSON.stringify(dataToValidate, null, 2) : 'null/undefined',
+        });
         
         return res.status(400).json({
           error: 'Validation failed',
@@ -44,11 +57,25 @@ const validate = (schema, source = 'body') => {
         });
       }
       
-      // Handle other errors
-      console.error('❌ Validation middleware error:', error);
+      // Handle other errors (non-Zod errors)
+      console.error('❌ [VALIDATION] Non-Zod error during validation:', {
+        errorType: error.constructor.name,
+        errorMessage: error.message,
+        errorStack: error.stack,
+        requestPath: `${req.method} ${req.path}`,
+        requestData: dataToValidate ? JSON.stringify(dataToValidate, null, 2) : 'null/undefined',
+        source,
+        reqBody: req.body ? JSON.stringify(req.body, null, 2).substring(0, 500) : 'null/undefined',
+      });
+      
       return res.status(500).json({
         error: 'Internal server error',
-        message: 'An error occurred during validation'
+        message: 'An error occurred during validation',
+        details: process.env.NODE_ENV === 'development' ? {
+          message: error.message,
+          type: error.constructor.name,
+          stack: error.stack,
+        } : undefined
       });
     }
   };

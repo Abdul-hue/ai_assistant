@@ -36,6 +36,7 @@ const webhookSendMessageRoute = require('./src/routes/webhookSendMessage');
 const extractPdfRoute = require('./src/routes/extractPdf');
 const processAgentFileRoute = require('./src/routes/processAgentFile');
 const agentDocumentsRoute = require('./src/routes/agentDocuments');
+const agentFileRoutes = require('./src/routes/agentFileRoutes');
 const contactsRoutes = require('./src/routes/contacts');
 const profileRoutes = require('./src/routes/profile');
 const dashboardRoutes = require('./src/routes/dashboard');
@@ -339,6 +340,8 @@ app.use('/api/migrate', migrateRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
 
 // Agent routes (rate limiting disabled)
+// IMPORTANT: Register more specific routes BEFORE general routes
+app.use('/api/agents', agentFileRoutes); // File routes must come before general agent routes
 app.use('/api/agents', agentRoutes);
 app.use('/api/agents', contactsRoutes);
 app.use('/api/profile', profileRoutes);
@@ -772,6 +775,28 @@ server.listen(PORT, '0.0.0.0', async () => {
       console.log('⚠️  WhatsApp session initialization failed, but server is running');
     }
   }, 3000); // Wait 3 seconds for database to be ready
+  
+  // Also call reconnectAllAgents as a backup (handles edge cases)
+  setTimeout(async () => {
+    try {
+      const { reconnectAllAgents } = require('./src/services/baileysService');
+      console.log('[STARTUP] 🔄 Running reconnectAllAgents as backup...');
+      await reconnectAllAgents();
+      console.log('[STARTUP] ✅ Backup reconnection complete');
+    } catch (error) {
+      console.error('[STARTUP] ❌ Error in backup reconnection:', error);
+    }
+  }, 5000); // Wait 5 seconds after initializeExistingSessions
+  
+  // Start connection monitoring
+  setTimeout(() => {
+    try {
+      const { startMonitoring } = require('./src/services/connectionMonitor');
+      startMonitoring();
+    } catch (error) {
+      console.error('[STARTUP] ❌ Error starting connection monitor:', error);
+    }
+  }, 10000); // Start monitoring after 10 seconds
 
   // Start scheduled email check job (every 15 minutes)
   const { checkForNewEmailsForAllAccounts } = require('./src/services/gmailWatchService');
