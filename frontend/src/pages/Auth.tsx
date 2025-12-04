@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -12,11 +12,21 @@ import GoogleAuthButton from "@/components/GoogleAuthButton.jsx";
 import { useToast } from "@/hooks/use-toast";
 import { API_URL } from "@/config";
 import { CountrySelect } from "@/components/ui/CountrySelect";
+import { useAuth } from "@/context/AuthContext";
 
 const Auth = () => {
   const navigate = useNavigate();
   const { toast } = useToast();
+  const { user, loading: authLoading } = useAuth();
   const [isLoading, setIsLoading] = useState(false);
+
+  // Redirect authenticated users to dashboard
+  useEffect(() => {
+    // Wait for AuthContext to finish loading before checking
+    if (!authLoading && user) {
+      navigate("/dashboard", { replace: true });
+    }
+  }, [user, authLoading, navigate]);
 
   const [loginData, setLoginData] = useState({
     email: "",
@@ -170,6 +180,23 @@ const Auth = () => {
       setIsLoading(false);
     }
   };
+
+  // Show loading state while checking authentication
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <div className="h-8 w-8 border-4 border-primary border-t-transparent rounded-full animate-spin"></div>
+          <p className="text-gray-400">Checking authentication...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // If user is authenticated, don't render auth form (redirect will happen)
+  if (user) {
+    return null; // Redirect is handled in useEffect
+  }
 
   return (
     <div className="min-h-screen bg-black relative overflow-hidden flex items-center justify-center p-4">

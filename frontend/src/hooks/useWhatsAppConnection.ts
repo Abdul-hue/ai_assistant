@@ -13,12 +13,44 @@ import { API_URL } from '@/config';
 
 /**
  * Get Supabase session token for Authorization header
+ * 🔧 FIX: Fetch from backend endpoint to ensure token is available even after page refresh
  */
 async function getAuthToken(): Promise<string | null> {
   try {
+    // First, try to get from Supabase client (fast path if session is in memory)
     const { supabase } = await import('@/integrations/supabase/client');
     const { data: { session } } = await supabase.auth.getSession();
-    return session?.access_token || null;
+    if (session?.access_token) {
+      return session.access_token;
+    }
+
+    // Fallback: Fetch from backend endpoint (works even after page refresh)
+    try {
+      const { API_URL } = await import('@/config');
+      const response = await fetch(`${API_URL}/api/auth/session-token`, {
+        credentials: 'include', // Send HttpOnly cookies
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.access_token) {
+          // Optionally restore the session in Supabase client for future use
+          await supabase.auth.setSession({
+            access_token: data.access_token,
+            refresh_token: data.refresh_token || '',
+          });
+          return data.access_token;
+        }
+      } else if (response.status === 404) {
+        // Endpoint not found - server might need restart, but continue anyway
+        console.warn('⚠️  /api/auth/session-token endpoint not found (404). Backend may need restart.');
+      }
+    } catch (fetchError) {
+      // Network error or endpoint not available - non-critical, continue
+      console.warn('⚠️  Failed to fetch session token from backend:', fetchError);
+    }
+
+    return null;
   } catch (error) {
     console.error('Failed to get auth token:', error);
     return null;

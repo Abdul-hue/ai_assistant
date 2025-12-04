@@ -35,6 +35,19 @@ async function monitorConnections() {
       
       // Case 1: Session in DB but not in memory
       if (!memorySession) {
+        // ⚠️ CRITICAL: Check status FIRST - don't retry FATAL errors (conflict/disconnected)
+        if (status === 'conflict' || status === 'disconnected') {
+          console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - status is '${status}' (FATAL error - requires manual reconnection)`);
+          console.log(`[CONNECTION-MONITOR] ℹ️  Status 'conflict' = 401/404/440 error, 'disconnected' = manual disconnect`);
+          continue;
+        }
+        
+        // Also skip if status is 'retrying' (already being handled by retry logic)
+        if (status === 'retrying') {
+          console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - already retrying`);
+          continue;
+        }
+        
         console.log(`[CONNECTION-MONITOR] ⚠️  Agent ${agent_id.substring(0, 8)}... is active in DB but not in memory - reconnecting`);
         
         try {
@@ -49,6 +62,24 @@ async function monitorConnections() {
       
       // Case 2: Session in memory but not connected
       if (!memorySession.isConnected) {
+        // ⚠️ CRITICAL: Check status FIRST - don't retry FATAL errors
+        if (status === 'conflict' || status === 'disconnected') {
+          console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - status is '${status}' (FATAL error - requires manual reconnection)`);
+          continue;
+        }
+        
+        // Also check session failure reason (from 401/404 errors)
+        if (memorySession.failureReason || memorySession.connectionState === 'conflict') {
+          console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - session has failure reason: ${memorySession.failureReason || 'conflict'}`);
+          continue;
+        }
+        
+        // Skip if already retrying
+        if (status === 'retrying') {
+          console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - already retrying`);
+          continue;
+        }
+        
         console.log(`[CONNECTION-MONITOR] ⚠️  Agent ${agent_id.substring(0, 8)}... in memory but not connected - reconnecting`);
         
         try {
@@ -67,6 +98,18 @@ async function monitorConnections() {
         const minutesSinceHeartbeat = (Date.now() - lastHeartbeatDate.getTime()) / 1000 / 60;
         
         if (minutesSinceHeartbeat > 5) {
+          // ⚠️ CRITICAL: Check status FIRST - don't retry FATAL errors
+          if (status === 'conflict' || status === 'disconnected') {
+            console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - stale heartbeat but status is '${status}' (FATAL error)`);
+            continue;
+          }
+          
+          // Skip if already retrying
+          if (status === 'retrying') {
+            console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - already retrying`);
+            continue;
+          }
+          
           console.log(`[CONNECTION-MONITOR] ⚠️  Agent ${agent_id.substring(0, 8)}... has stale heartbeat (${Math.floor(minutesSinceHeartbeat)} min) - reconnecting`);
           
           try {

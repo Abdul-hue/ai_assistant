@@ -79,6 +79,9 @@ export interface AgentListItem {
   is_active: boolean;
   created_at: string;
   updated_at: string;
+  agent_owner_name?: string | null;
+  whatsapp_phone_number?: string | null;
+  response_languages?: string[] | null;
 }
 
 // WhatsApp connection mutation payloads

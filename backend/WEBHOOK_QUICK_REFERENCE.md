@@ -70,6 +70,7 @@ WEBHOOK_RETRY_INITIAL_DELAY=2000
   "messageId": "message-id",
   "from": "923359503935",      // Clean phone number
   "to": "923336906200",        // Clean phone number
+  "senderName": "Ahmed Khan",  // WhatsApp display name or null
   "conversationId": "923359503935@s.whatsapp.net",
   "messageType": "TEXT",       // or "AUDIO"
   "type": "text",              // lowercase
@@ -82,10 +83,31 @@ WEBHOOK_RETRY_INITIAL_DELAY=2000
     "phoneNumber": "923336906200",
     "direction": "incoming",
     "remoteJid": "923359503935@s.whatsapp.net",
-    "messageId": "3EB0EF457E9242C65E8C73"
+    "messageId": "3EB0EF457E9242C65E8C73",
+    "senderName": "Ahmed Khan"  // Same as top-level senderName
   }
 }
 ```
+
+### Sender Name Extraction
+
+The `senderName` field is extracted from the WhatsApp message using the following priority:
+
+1. **`message.pushName`** - Primary source, the name set by the sender in WhatsApp
+2. **`message.verifiedBisName`** - For verified business accounts (WhatsApp Business API)
+3. **`message.notify`** - Fallback name field used by older WhatsApp versions
+4. **`null`** - If no name is available from any source
+
+**When senderName is null:**
+- The sender has not set a display name in WhatsApp
+- The contact is not saved on the agent's phone
+- Privacy settings prevent name sharing
+- Message from unknown/new contact
+
+**Handling null values in n8n:**
+- Use `from` (phone number) as fallback display
+- Format as: `senderName || from || 'Unknown'`
+- Example: `"Ahmed Khan" || "923336906200" || "Unknown"`
 
 ---
 

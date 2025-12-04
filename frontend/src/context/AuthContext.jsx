@@ -62,6 +62,38 @@ export function AuthProvider({ children }) {
           const data = await response.json();
           setUser(data.user);
           console.log('✅ Existing session restored:', data.user.email);
+          
+          // 🔧 FIX: Restore Supabase client session from cookies
+          // This ensures direct Supabase queries (like supabase.from("agents")) work on refresh
+          try {
+            const tokenResponse = await fetch(`${API_URL}/api/auth/session-token`, {
+              credentials: 'include',
+            });
+            
+            if (tokenResponse.ok) {
+              const tokenData = await tokenResponse.json();
+              if (tokenData.access_token) {
+                // Restore Supabase client session
+                const { data: sessionData, error: sessionError } = await supabase.auth.setSession({
+                  access_token: tokenData.access_token,
+                  refresh_token: tokenData.refresh_token || '',
+                });
+                
+                if (sessionError) {
+                  console.warn('⚠️  Failed to restore Supabase session:', sessionError.message);
+                } else {
+                  console.log('✅ Supabase client session restored');
+                  setSession(sessionData.session);
+                }
+              }
+            } else {
+              console.warn('⚠️  Failed to get session token:', tokenResponse.status);
+            }
+          } catch (tokenError) {
+            console.warn('⚠️  Error restoring Supabase session:', tokenError.message);
+            // Non-critical error - continue anyway
+          }
+          
           await loadProfile();
         } else if (response.status === 401) {
           // ✅ This is NORMAL when user is not logged in

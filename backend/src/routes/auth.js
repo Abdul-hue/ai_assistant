@@ -187,6 +187,52 @@ router.get('/me', authMiddleware, async (req, res) => {
 });
 
 /**
+ * GET /api/auth/session-token
+ * Get current session tokens from cookies (for Supabase client restoration)
+ * SECURITY: Returns tokens from HttpOnly cookies so frontend can restore Supabase client session
+ */
+router.get('/session-token', authMiddleware, async (req, res) => {
+  try {
+    // Get tokens from cookies
+    const accessToken = req.cookies?.sb_access_token;
+    const refreshToken = req.cookies?.sb_refresh_token;
+
+    if (!accessToken) {
+      return res.status(401).json({ 
+        error: 'No session token found',
+        message: 'No access token in cookies'
+      });
+    }
+
+    // Verify token is still valid
+    const { data: { user }, error } = await supabaseAdmin.auth.getUser(accessToken);
+
+    if (error || !user) {
+      console.error('❌ Token validation failed:', error?.message);
+      return res.status(401).json({ 
+        error: 'Invalid or expired token',
+        message: error?.message || 'Token validation failed'
+      });
+    }
+
+    console.log('✅ Session token retrieved for:', user.email);
+
+    res.json({ 
+      success: true,
+      access_token: accessToken,
+      refresh_token: refreshToken || null,
+      expires_at: null, // Supabase will handle expiration
+    });
+  } catch (error) {
+    console.error('❌ Error fetching session token:', error.message);
+    res.status(500).json({ 
+      error: 'Failed to fetch session token',
+      message: 'Internal server error'
+    });
+  }
+});
+
+/**
  * POST /api/auth/logout
  * Clear Supabase session cookies
  * SECURITY: Removes HttpOnly cookies to invalidate session

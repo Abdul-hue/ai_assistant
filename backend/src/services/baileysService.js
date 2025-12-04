@@ -395,6 +395,125 @@ async function syncCredsToDatabase(agentId) {
   }
 }
 
+// Validate credential freshness before using existing credentials
+// Returns { valid: boolean, reason: string }
+async function validateCredentialFreshness(agentId, creds) {
+  console.log(`[BAILEYS] 🔍 Validating credential freshness for ${agentId.substring(0, 40)}...`);
+  
+  try {
+    // CRITICAL: Add timeout to prevent hanging on slow database queries
+    const DB_QUERY_TIMEOUT_MS = 5000; // 5 seconds
+    
+    let sessionData, statusError;
+    try {
+      // Create timeout promise
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Database query timeout')), DB_QUERY_TIMEOUT_MS)
+      );
+      
+      // Race database query against timeout
+      const queryPromise = supabaseAdmin
+        .from('whatsapp_sessions')
+        .select('status, is_active, disconnected_at, updated_at')
+        .eq('agent_id', agentId)
+        .maybeSingle();
+      
+      const result = await Promise.race([queryPromise, timeoutPromise]);
+      sessionData = result.data;
+      statusError = result.error;
+    } catch (timeoutError) {
+      if (timeoutError.message === 'Database query timeout') {
+        console.error(`[BAILEYS] ❌ Database query timeout after ${DB_QUERY_TIMEOUT_MS}ms`);
+        // On timeout, be conservative and reject credentials
+        return {
+          valid: false,
+          reason: `Database query timeout - cannot verify credential freshness`
+        };
+      }
+      // Re-throw other errors
+      throw timeoutError;
+    }
+    
+    if (statusError) {
+      console.warn(`[BAILEYS] ⚠️ Error checking session status:`, statusError);
+      // If we can't check status, be conservative and reject credentials
+      return {
+        valid: false,
+        reason: `Database status check failed: ${statusError.message}`
+      };
+    }
+    
+    if (sessionData) {
+      // CRITICAL: If status is 'disconnected' or 'conflict', credentials are stale
+      if (sessionData.status === 'disconnected') {
+        console.log(`[BAILEYS] ❌ Credentials rejected: Session status is 'disconnected' (manual disconnect)`);
+        return {
+          valid: false,
+          reason: 'Session was manually disconnected - credentials are stale'
+        };
+      }
+      
+      if (sessionData.status === 'conflict') {
+        console.log(`[BAILEYS] ❌ Credentials rejected: Session status is 'conflict' (401/440 error)`);
+        return {
+          valid: false,
+          reason: 'Session has conflict status - credentials are invalidated'
+        };
+      }
+      
+      // Check if credentials are older than disconnect timestamp (if available)
+      if (sessionData.disconnected_at && creds) {
+        const disconnectTime = new Date(sessionData.disconnected_at).getTime();
+        // If we have a way to timestamp credentials, check them
+        // For now, we rely on status check above
+      }
+    }
+    
+    // Check 2: Credential structure - must have me.id to be valid
+    if (!creds || typeof creds !== 'object') {
+      console.log(`[BAILEYS] ❌ Credentials rejected: Invalid structure (not an object)`);
+      return {
+        valid: false,
+        reason: 'Invalid credential structure'
+      };
+    }
+    
+    if (!creds.me || !creds.me.id) {
+      console.log(`[BAILEYS] ❌ Credentials rejected: Missing device ID (me.id)`);
+      return {
+        valid: false,
+        reason: 'Credentials missing device ID - not paired'
+      };
+    }
+    
+    // Check 3: Registration state - if registered=false AND status is disconnected, credentials are stale
+    // Note: registered=false is normal after QR pairing, so we only check this in combination with status
+    if (creds.registered === false && sessionData?.status === 'disconnected') {
+      console.log(`[BAILEYS] ❌ Credentials rejected: Unregistered credentials from disconnected session`);
+      return {
+        valid: false,
+        reason: 'Unregistered credentials from disconnected session'
+      };
+    }
+    
+    // All checks passed
+    console.log(`[BAILEYS] ✅ Credentials validated: Fresh and valid`);
+    console.log(`[BAILEYS] Device ID: ${creds.me.id.split(':')[0]}, Registered: ${creds.registered}, Status: ${sessionData?.status || 'unknown'}`);
+    return {
+      valid: true,
+      reason: 'Credentials are fresh and valid'
+    };
+    
+  } catch (error) {
+    console.error(`[BAILEYS] ❌ Error validating credentials:`, error);
+    // On error, be conservative and reject credentials
+    return {
+      valid: false,
+      reason: `Validation error: ${error.message}`
+    };
+  }
+}
+
 // Restore credentials from database to files
 // Called when local files don't exist but database might have saved credentials
 async function restoreCredsFromDatabase(agentId) {
@@ -437,6 +556,14 @@ async function restoreCredsFromDatabase(agentId) {
     const creds = data.session_data.creds;
     if (!creds || typeof creds !== 'object') {
       console.log(`[BAILEYS] ⚠️ Invalid credentials structure in database - skipping restore`);
+      return false;
+    }
+    
+    // CRITICAL: Validate credential freshness before restoring
+    const validation = await validateCredentialFreshness(agentId, creds);
+    if (!validation.valid) {
+      console.log(`[BAILEYS] ⚠️ Credentials in database are stale: ${validation.reason}`);
+      console.log(`[BAILEYS] Will not restore - will generate fresh QR instead`);
       return false;
     }
     
@@ -683,6 +810,69 @@ async function initializeWhatsApp(agentId, userId = null) {
       qrGenerationTracker.delete(agentId);
     }
 
+    // CRITICAL FIX B: Check database status FIRST before checking local files
+    // This prevents using stale credentials from manual disconnects
+    console.log(`[BAILEYS] 🔍 Checking database status FIRST (before local files)...`);
+    const { data: dbSessionStatus, error: dbStatusError } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status, is_active, disconnected_at, session_data')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    if (dbStatusError) {
+      console.warn(`[BAILEYS] ⚠️ Error checking database status:`, dbStatusError);
+    }
+    
+    // CRITICAL: If status is 'disconnected', force fresh start (delete local files, clear DB)
+    if (dbSessionStatus && dbSessionStatus.status === 'disconnected') {
+      console.log(`[BAILEYS] ⚠️ Database status is 'disconnected' - forcing fresh start`);
+      console.log(`[BAILEYS] This indicates a manual disconnect - all credentials must be cleared`);
+      
+      // Delete local auth directory completely (with error handling)
+      const authPath = path.join(__dirname, '../../auth_sessions', agentId);
+      if (fs.existsSync(authPath)) {
+        console.log(`[BAILEYS] 🗑️ Deleting local auth directory (disconnected session)...`);
+        try {
+          fs.rmSync(authPath, { recursive: true, force: true });
+          console.log(`[BAILEYS] ✅ Local credentials deleted successfully`);
+        } catch (deleteError) {
+          console.error(`[BAILEYS] ❌ Failed to delete local auth directory:`, deleteError.message);
+          console.error(`[BAILEYS] Error details:`, deleteError);
+          // Continue anyway - database cleanup is more important
+          // User may need to manually delete directory if permissions issue
+        }
+      } else {
+        console.log(`[BAILEYS] ℹ️ No local auth directory to delete`);
+      }
+      
+      // Clear database session data completely
+      try {
+        const { error: dbClearError } = await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({
+            session_data: null,
+            qr_code: null,
+            qr_generated_at: null,
+            is_active: false,
+            status: 'disconnected',
+            updated_at: new Date().toISOString()
+          })
+          .eq('agent_id', agentId);
+        
+        if (dbClearError) {
+          console.error(`[BAILEYS] ❌ Failed to clear database session data:`, dbClearError);
+          throw new Error(`Database cleanup failed: ${dbClearError.message}`);
+        }
+        console.log(`[BAILEYS] ✅ Database cleared successfully`);
+      } catch (dbError) {
+        console.error(`[BAILEYS] ❌ Database cleanup error:`, dbError);
+        // Don't throw - allow initialization to continue with fresh QR
+      }
+      
+      console.log(`[BAILEYS] ✅ Fresh start complete - will generate fresh QR`);
+      // Continue to fresh QR generation below
+    }
+    
     // Mark session as initializing in database before proceeding
     try {
       await supabaseAdmin
@@ -704,64 +894,65 @@ async function initializeWhatsApp(agentId, userId = null) {
     console.log(`[BAILEYS] 📂 Loading authentication state...`);
     const authPath = path.join(__dirname, '../../auth_sessions', agentId);
 
-    // CRITICAL: Check if valid credentials exist (for 515 restart)
-    // After QR pairing, credentials have 'me' object but registered=false initially
-    // They become registered=true only after first successful connection
-    // So we check for 'me' object, not registration status
+    // CRITICAL FIX B: Only check local files if status is NOT 'disconnected'
+    // If we just cleared everything above, skip local file check
     const credsFile = path.join(authPath, 'creds.json');
-    const hasValidCreds = fs.existsSync(credsFile);
+    const hasValidCreds = fs.existsSync(credsFile) && 
+                         dbSessionStatus && 
+                         dbSessionStatus.status !== 'disconnected';
     
     let useFileAuth = false;
     
     if (hasValidCreds) {
-      // Check if credentials are valid by looking for 'me' object
-      // FIX: Don't check registered=true, as it's false after QR pairing!
+      // CRITICAL: Validate credentials before using them
       try {
         const credsContent = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
         
-        // Valid credentials = has 'me' object (phone number/ID assigned)
-        // registered flag is false after QR pairing, true after first connection
-        const isValidCreds = credsContent.me && credsContent.me.id;
+        // Check credential structure first
+        const hasValidStructure = credsContent.me && credsContent.me.id;
         
-        if (isValidCreds) {
-          console.log(`[BAILEYS] ✅ Found valid credentials with paired device - loading...`);
-          console.log(`[BAILEYS] Device ID: ${credsContent.me.id.split(':')[0]}`);
-          console.log(`[BAILEYS] Registration status: ${credsContent.registered} (false after QR pairing is normal)`);
-          useFileAuth = true;
+        if (hasValidStructure) {
+          // CRITICAL: Validate credential freshness (checks database status, timestamps, etc.)
+          const validation = await validateCredentialFreshness(agentId, credsContent);
+          
+          if (validation.valid) {
+            console.log(`[BAILEYS] ✅ Found valid and fresh credentials with paired device - loading...`);
+            console.log(`[BAILEYS] Device ID: ${credsContent.me.id.split(':')[0]}`);
+            console.log(`[BAILEYS] Registration status: ${credsContent.registered} (false after QR pairing is normal)`);
+            console.log(`[BAILEYS] Validation reason: ${validation.reason}`);
+            useFileAuth = true;
+          } else {
+            console.log(`[BAILEYS] ❌ Credentials rejected: ${validation.reason}`);
+            console.log(`[BAILEYS] Will generate fresh QR instead`);
+            // Delete stale credentials
+            if (fs.existsSync(authPath)) {
+              console.log(`[BAILEYS] 🗑️ Deleting stale credentials...`);
+              fs.rmSync(authPath, { recursive: true, force: true });
+            }
+          }
         } else {
           console.log(`[BAILEYS] ⚠️ Found credentials without device pairing - will generate fresh QR`);
           console.log(`[BAILEYS] Creds status: has me=${!!credsContent.me}, has me.id=${!!credsContent.me?.id}`);
         }
       } catch (error) {
         console.log(`[BAILEYS] ⚠️ Error reading credentials:`, error.message);
+        // Delete corrupted credentials
+        if (fs.existsSync(authPath)) {
+          console.log(`[BAILEYS] 🗑️ Deleting corrupted credentials...`);
+          fs.rmSync(authPath, { recursive: true, force: true });
+        }
       }
     } else {
-      console.log(`[BAILEYS] 🆕 No credentials file found locally`);
+      if (!fs.existsSync(credsFile)) {
+        console.log(`[BAILEYS] 🆕 No credentials file found locally`);
+      } else if (dbSessionStatus?.status === 'disconnected') {
+        console.log(`[BAILEYS] ⚠️ Local credentials exist but status is 'disconnected' - ignoring local file`);
+      }
       
-      // CRITICAL: Check if session is in conflict/corrupted state before restoring
-      const { data: sessionData } = await supabaseAdmin
-        .from('whatsapp_sessions')
-        .select('status, is_active')
-        .eq('agent_id', agentId)
-        .maybeSingle();
-      
-      // If session is in conflict state, don't restore credentials - force fresh QR
-      if (sessionData && (sessionData.status === 'conflict' || sessionData.status === 'disconnected')) {
-        console.log(`[BAILEYS] ⚠️ Session is in ${sessionData.status} state - clearing and generating fresh QR`);
-        // Clear any corrupted credentials from database
-        await supabaseAdmin
-          .from('whatsapp_sessions')
-          .update({
-            session_data: null,
-            qr_code: null,
-            qr_generated_at: null,
-            is_active: false,
-            status: 'disconnected',
-            updated_at: new Date().toISOString()
-          })
-          .eq('agent_id', agentId);
-        console.log(`[BAILEYS] ✅ Cleared corrupted session data - will generate fresh QR`);
-      } else {
+      // CRITICAL: Only try to restore from database if status is NOT 'disconnected' or 'conflict'
+      if (dbSessionStatus && 
+          dbSessionStatus.status !== 'disconnected' && 
+          dbSessionStatus.status !== 'conflict') {
         // CRITICAL: Try to restore from Supabase before generating new QR
         console.log(`[BAILEYS] 🔍 Checking Supabase for backed-up credentials...`);
         const restored = await restoreCredsFromDatabase(agentId);
@@ -772,6 +963,8 @@ async function initializeWhatsApp(agentId, userId = null) {
         } else {
           console.log(`[BAILEYS] 🆕 No credentials in Supabase either - will generate QR`);
         }
+      } else {
+        console.log(`[BAILEYS] ⚠️ Status is '${dbSessionStatus?.status || 'unknown'}' - skipping database restore, will generate fresh QR`);
       }
     }
 
@@ -1484,6 +1677,191 @@ async function initializeWhatsApp(agentId, userId = null) {
 
           return;
         }
+
+        // CRITICAL: Handle error 404 - Session Not Found (FATAL)
+        if (statusCode === 404) {
+          console.log(`[BAILEYS] ❌ 404 - Session not found - clearing credentials`);
+          console.log(`[BAILEYS] This means the session was deleted from WhatsApp servers`);
+          
+          if (session?.socket) {
+            try {
+              session.socket.ev.removeAllListeners();
+              session.socket.end?.();
+            } catch (err) {
+              console.log('[BAILEYS] Socket cleanup after 404 failed:', err.message);
+            }
+          }
+
+          // Mark session as conflict
+          const failureReason = 'Session not found - likely deleted from WhatsApp servers';
+          if (session) {
+            session.failureReason = failureReason;
+            session.failureAt = Date.now();
+            session.isConnected = false;
+            session.connectionState = 'conflict';
+            session.qrCode = null;
+            session.qrGeneratedAt = null;
+            session.socket = null;
+            session.state = null;
+            session.saveCreds = null;
+          }
+
+          // Stop health check and heartbeat intervals
+          if (session?.healthCheckInterval) {
+            clearInterval(session.healthCheckInterval);
+            session.healthCheckInterval = null;
+            console.log(`[BAILEYS] ✅ Health check interval stopped`);
+          }
+          if (session?.heartbeatInterval) {
+            clearInterval(session.heartbeatInterval);
+            session.heartbeatInterval = null;
+            console.log(`[BAILEYS] ✅ Heartbeat interval stopped`);
+          }
+
+          // Remove from active sessions
+          activeSessions.delete(agentId);
+          console.log(`[BAILEYS] ✅ Session removed from active sessions`);
+
+          connectionLocks.delete(agentId);
+          lastConnectionAttempt.set(agentId, Date.now());
+          
+          // Delete auth directory - credentials are invalid
+          const authDir = path.join(__dirname, '../../auth_sessions', agentId);
+          if (fs.existsSync(authDir)) {
+            fs.rmSync(authDir, { recursive: true, force: true });
+            console.log(`[BAILEYS] 🗑️ Cleared auth directory (session not found)`);
+          }
+          
+          // Update database - mark as conflict and clear session data
+          await supabaseAdmin
+            .from('whatsapp_sessions')
+            .update({
+              session_data: null,
+              qr_code: null,
+              qr_generated_at: null,
+              is_active: false,
+              status: 'conflict',
+              phone_number: null,
+              updated_at: new Date().toISOString()
+            })
+            .eq('agent_id', agentId);
+          
+          console.log(`[BAILEYS] ✅ Session cleared after 404. Failure reason: ${failureReason}`);
+          console.log(`[BAILEYS] 🚫 Auto-retry disabled - manual reconnection required`);
+
+          // Record failure to prevent auto-retry
+          last401Failure.set(agentId, Date.now());
+          return;
+        }
+
+        // CRITICAL: Handle errors 408/500/503 - Recoverable (Retry with Backoff)
+        if ([408, 500, 503].includes(statusCode)) {
+          const errorName = statusCode === 408 ? 'Timeout' : 
+                           statusCode === 500 ? 'Server Error' : 'Service Unavailable';
+          console.log(`[BAILEYS] 🟡 ${statusCode} - ${errorName} - RECOVERABLE (will retry with backoff)`);
+          console.log(`[BAILEYS] Auth state: PRESERVED - credentials still valid`);
+          
+          // Initialize retry counter if not exists
+          if (!session.retryCount) {
+            session.retryCount = 0;
+          }
+          
+          session.retryCount++;
+          const maxRetries = statusCode === 408 ? 20 : 10; // More retries for timeouts
+          
+          if (session.retryCount > maxRetries) {
+            console.error(`[BAILEYS] ❌ Max retries (${maxRetries}) reached for ${statusCode} - giving up`);
+            
+            // Mark as failed in database
+            await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                is_active: false,
+                status: 'error',
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+            
+            // Clean up session but KEEP auth directory (credentials still valid)
+            activeSessions.delete(agentId);
+            console.log(`[BAILEYS] ℹ️  Auth directory preserved - user can retry manually`);
+            return;
+          }
+          
+          // Calculate exponential backoff delay
+          const baseDelay = statusCode === 408 ? 1000 : 5000; // 1s for timeout, 5s for server errors
+          const delay = Math.min(
+            baseDelay * Math.pow(2, session.retryCount - 1),
+            60000 // Cap at 60 seconds
+          );
+          
+          console.log(`[BAILEYS] 🔄 Retry ${session.retryCount}/${maxRetries} scheduled in ${delay}ms (${Math.round(delay/1000)}s)`);
+          console.log(`[BAILEYS] Retry progression: 1s → 2s → 4s → 8s → 16s → 32s → 60s (capped)`);
+          
+          // Update status to retrying
+          await supabaseAdmin
+            .from('whatsapp_sessions')
+            .update({
+              is_active: false,
+              status: 'retrying',
+              updated_at: new Date().toISOString()
+            })
+            .eq('agent_id', agentId);
+          
+          // Schedule retry with exponential backoff
+          setTimeout(async () => {
+            try {
+              console.log(`[BAILEYS] 🔄 Executing retry ${session.retryCount}/${maxRetries} for ${agentId.substring(0, 20)}...`);
+              await initializeWhatsApp(agentId, userId);
+              console.log(`[BAILEYS] ✅ Retry successful`);
+            } catch (error) {
+              console.error(`[BAILEYS] ❌ Retry failed:`, error.message);
+              // Next disconnect will trigger another retry if under max
+            }
+          }, delay);
+          
+          return;
+        }
+
+        // CRITICAL: Handle error 410 - Restart Required (Protocol Update)
+        if (statusCode === 410) {
+          console.log(`[BAILEYS] 🔄 410 - Restart required (protocol update)`);
+          console.log(`[BAILEYS] This usually means WhatsApp protocol was updated`);
+          console.log(`[BAILEYS] Auth state: PRESERVED - credentials still valid`);
+          console.log(`[BAILEYS] Action: Restarting connection with same credentials...`);
+          
+          // Clean up old socket
+          if (session?.socket) {
+            try {
+              session.socket.ev.removeAllListeners();
+              session.socket.end();
+              console.log(`[BAILEYS] ✅ Old socket cleaned up`);
+            } catch (e) {
+              console.log(`[BAILEYS] Socket already ended:`, e.message);
+            }
+          }
+          
+          // Reset retry counter for fresh start
+          if (session) {
+            session.retryCount = 0;
+          }
+          
+          // Clear QR tracker to allow restart
+          qrGenerationTracker.delete(agentId);
+          
+          // Wait 2 seconds then restart with saved credentials
+          setTimeout(async () => {
+            console.log(`[BAILEYS] 🔄 Reconnecting with saved credentials after protocol update...`);
+            try {
+              await initializeWhatsApp(agentId, userId);
+              console.log(`[BAILEYS] ✅ Restart complete after 410 - connection restored`);
+            } catch (error) {
+              console.error(`[BAILEYS] ❌ Restart failed after 410:`, error.message);
+            }
+          }, 2000);
+          
+          return;
+        }
         
         await supabaseAdmin
           .from('whatsapp_sessions')
@@ -1845,11 +2223,18 @@ async function initializeWhatsApp(agentId, userId = null) {
           });
         }
 
+        // Extract sender name from message (pushName, verifiedBisName, or notify)
+        const senderName = msg.pushName || 
+                           msg.verifiedBisName || 
+                           msg.notify || 
+                           null;
+
         const webhookPayload = {
           id: messageId,
           messageId,
           from: sanitizedFromNumber || remoteJid,
           to: sanitizedToNumber,
+          senderName: senderName,
           conversationId: remoteJid,
           messageType,
           type: messageType.toLowerCase(),
@@ -1857,7 +2242,10 @@ async function initializeWhatsApp(agentId, userId = null) {
           mediaUrl,
           mimetype: mediaMimetype || null,
           timestamp: timestampIso,
-          metadata: cleanedMetadata,
+          metadata: {
+            ...cleanedMetadata,
+            senderName: senderName,
+          },
         };
 
         if (typeof webhookPayload.from === 'string' && webhookPayload.from.includes('@')) {
@@ -1915,65 +2303,95 @@ async function safeInitializeWhatsApp(agentId, userId = null) {
     };
   }
 
-  // CRITICAL: Check if there was a recent 401 failure (prevent auto-retry)
-  const last401 = last401Failure.get(agentId);
-  if (last401 && (now - last401) < FAILURE_COOLDOWN_MS) {
-    const waitMs = FAILURE_COOLDOWN_MS - (now - last401);
-    const waitMinutes = Math.ceil(waitMs / 60000);
-    console.log(`[BAILEYS] 🚫 401 error occurred recently for agent ${agentId.substring(0, 40)}`);
-    console.log(`[BAILEYS] 🚫 Auto-retry blocked. Manual reconnection required. (Wait ${waitMinutes} min or reconnect manually)`);
+  // PHASE 2 FIX: Check database status FIRST to differentiate manual disconnect from error
+  // This allows bypassing cooldown for manual disconnects while keeping it for errors
+  console.log(`[BAILEYS] 🔍 Checking database status to determine cooldown eligibility...`);
+  const { data: dbSession, error: dbError } = await supabaseAdmin
+    .from('whatsapp_sessions')
+    .select('status, is_active, disconnected_at')
+    .eq('agent_id', agentId)
+    .maybeSingle();
+
+  if (dbError) {
+    console.warn(`[BAILEYS] ⚠️ Error checking database status:`, dbError);
+    // Continue with cooldown check - be conservative on error
+  }
+
+  // PHASE 2: If status is 'disconnected' (manual disconnect), bypass cooldown
+  if (dbSession?.status === 'disconnected') {
+    console.log(`[BAILEYS] ✅ Status is 'disconnected' (manual disconnect) - bypassing 401 cooldown`);
+    console.log(`[BAILEYS] ✅ User initiated clean disconnect - allowing immediate reconnection`);
     
-    // Check database status
-    const { data: dbSession } = await supabaseAdmin
-      .from('whatsapp_sessions')
-      .select('status')
-      .eq('agent_id', agentId)
-      .maybeSingle();
+    // Clear any existing 401 cooldown (defensive - should already be cleared on disconnect)
+    const hadCooldown = last401Failure.has(agentId);
+    if (hadCooldown) {
+      last401Failure.delete(agentId);
+      console.log(`[BAILEYS] ✅ Cleared existing 401 cooldown (defensive cleanup)`);
+    }
     
-    if (dbSession?.status === 'conflict') {
+    // Allow connection to proceed - no cooldown for manual disconnects
+    // Continue to connection attempt below
+  } else if (dbSession?.status === 'conflict') {
+    // PHASE 2: If status is 'conflict' (error disconnect), apply cooldown
+    console.log(`[BAILEYS] 🚫 Session has conflict status (error disconnect) - checking cooldown...`);
+    
+    // Check if there was a recent 401 failure (prevent auto-retry after errors)
+    const last401 = last401Failure.get(agentId);
+    if (last401 && (now - last401) < FAILURE_COOLDOWN_MS) {
+      const waitMs = FAILURE_COOLDOWN_MS - (now - last401);
+      const waitMinutes = Math.ceil(waitMs / 60000);
+      console.log(`[BAILEYS] 🚫 401 error occurred recently (${waitMinutes} min ago) - cooldown active`);
+      console.log(`[BAILEYS] 🚫 Auto-retry blocked for error scenarios. Manual reconnection required.`);
+      
       return {
         success: false,
         status: 'conflict',
-        error: 'Session conflict detected. Please disconnect and reconnect manually.',
+        error: `Session conflict detected. Please wait ${waitMinutes} minute(s) or disconnect and reconnect manually.`,
+        retryAfter: waitMs,
         requiresManualAction: true
       };
     }
     
-    return {
-      success: false,
-      status: 'cooldown',
-      error: `Recent 401 error. Please wait ${waitMinutes} minute(s) or reconnect manually.`,
-      retryAfter: waitMs,
-      requiresManualAction: true
-    };
+    // Cooldown expired or no cooldown - but still conflict status
+    console.log(`[BAILEYS] ⚠️ Session has conflict status but cooldown expired - allowing reconnection attempt`);
+    console.log(`[BAILEYS] ⚠️ User will need to disconnect first to clear conflict state`);
+    // Continue to connection attempt - initializeWhatsApp will handle conflict state
+  } else {
+    // PHASE 2: For other statuses (connecting, qr_pending, connected, etc.), check 401 cooldown
+    // This handles edge cases where last401Failure exists but status isn't set yet
+    const last401 = last401Failure.get(agentId);
+    if (last401 && (now - last401) < FAILURE_COOLDOWN_MS) {
+      const waitMs = FAILURE_COOLDOWN_MS - (now - last401);
+      const waitMinutes = Math.ceil(waitMs / 60000);
+      console.log(`[BAILEYS] 🚫 401 error occurred recently for agent ${agentId.substring(0, 40)}`);
+      console.log(`[BAILEYS] 🚫 Status: ${dbSession?.status || 'unknown'}, Cooldown: ${waitMinutes} min remaining`);
+      console.log(`[BAILEYS] 🚫 Auto-retry blocked. Manual reconnection required.`);
+      
+      // If status is not 'disconnected', apply cooldown
+      return {
+        success: false,
+        status: 'cooldown',
+        error: `Recent 401 error. Please wait ${waitMinutes} minute(s) or disconnect and reconnect manually.`,
+        retryAfter: waitMs,
+        requiresManualAction: true
+      };
+    }
   }
 
-  // CRITICAL: Check database for conflict status before attempting connection
-  const { data: dbSession } = await supabaseAdmin
-    .from('whatsapp_sessions')
-    .select('status, is_active')
-    .eq('agent_id', agentId)
-    .maybeSingle();
-
-  if (dbSession?.status === 'conflict') {
-    console.log(`[BAILEYS] 🚫 Session has conflict status for agent ${agentId.substring(0, 40)} - manual reconnection required`);
-    return {
-      success: false,
-      status: 'conflict',
-      error: 'Session conflict detected. Please disconnect and reconnect manually.',
-      requiresManualAction: true
-    };
-  }
-
+  // PHASE 2: Bypass general connection cooldown for manual disconnects
+  // Only apply general cooldown if status is NOT 'disconnected'
   const lastAttempt = lastConnectionAttempt.get(agentId) || 0;
-  if (now - lastAttempt < COOLDOWN_MS) {
+  if (dbSession?.status !== 'disconnected' && (now - lastAttempt) < COOLDOWN_MS) {
     const waitMs = COOLDOWN_MS - (now - lastAttempt);
-    console.log(`[BAILEYS] 🕒 Cooldown active for agent ${agentId.substring(0, 40)}. Retry in ${Math.ceil(waitMs / 1000)}s`);
+    console.log(`[BAILEYS] 🕒 General cooldown active for agent ${agentId.substring(0, 40)}. Retry in ${Math.ceil(waitMs / 1000)}s`);
     return {
       success: false,
       status: 'cooldown',
       retryAfter: waitMs
     };
+  } else if (dbSession?.status === 'disconnected' && (now - lastAttempt) < COOLDOWN_MS) {
+    // Manual disconnect - bypass general cooldown
+    console.log(`[BAILEYS] ✅ Manual disconnect detected - bypassing general connection cooldown`);
   }
 
   connectionLocks.set(agentId, true);
@@ -1988,60 +2406,296 @@ async function safeInitializeWhatsApp(agentId, userId = null) {
 
 // Disconnect
 async function disconnectWhatsApp(agentId) {
+  console.log(`\n[BAILEYS] ==================== DISCONNECT START ====================`);
   console.log(`[BAILEYS] Disconnecting: ${agentId.substring(0, 40)}`);
   
-  const session = activeSessions.get(agentId);
-  if (session?.socket) {
-    // Stop health check and heartbeat if running
-    if (session.healthCheckInterval) {
-      clearInterval(session.healthCheckInterval);
+  const cleanupSteps = {
+    logoutAttempted: false,
+    logoutSucceeded: false,
+    intervalsCleared: false,
+    socketClosed: false,
+    instanceTrackingCleared: false,
+    memoryCleared: false,
+    localFilesDeleted: false,
+    databaseCleared: false
+  };
+  
+  const errors = [];
+  const disconnectedAt = new Date().toISOString();
+  
+  try {
+    const session = activeSessions.get(agentId);
+    
+    // STEP 1: Attempt explicit logout from WhatsApp servers
+    if (session?.socket) {
+      console.log(`[BAILEYS] 🔐 Step 1: Attempting explicit logout from WhatsApp servers...`);
+      cleanupSteps.logoutAttempted = true;
+      
+      try {
+        // Check if socket is still connected before attempting logout
+        if (session.isConnected && session.socket && typeof session.socket.logout === 'function') {
+          await Promise.race([
+            session.socket.logout(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Logout timeout')), 5000))
+          ]);
+          cleanupSteps.logoutSucceeded = true;
+          console.log(`[BAILEYS] ✅ Logout successful - device unregistered from WhatsApp servers`);
+        } else {
+          console.log(`[BAILEYS] ℹ️ Socket not connected or logout not available - skipping logout`);
+          cleanupSteps.logoutSucceeded = true; // Not an error if already disconnected
+        }
+      } catch (logoutError) {
+        // Logout might fail if already disconnected - this is acceptable
+        if (logoutError.message === 'Logout timeout' || logoutError.message.includes('not connected')) {
+          console.log(`[BAILEYS] ℹ️ Logout skipped: ${logoutError.message}`);
+          cleanupSteps.logoutSucceeded = true; // Not an error
+        } else {
+          console.warn(`[BAILEYS] ⚠️ Logout failed (non-critical):`, logoutError.message);
+          errors.push({ step: 'logout', error: logoutError.message });
+          // Continue cleanup even if logout fails
+        }
+      }
+      
+      // STEP 2: Stop health check and heartbeat intervals
+      console.log(`[BAILEYS] 🛑 Step 2: Stopping health check and heartbeat intervals...`);
+      try {
+        if (session.healthCheckInterval) {
+          clearInterval(session.healthCheckInterval);
+          session.healthCheckInterval = null;
+        }
+        if (session.heartbeatInterval) {
+          clearInterval(session.heartbeatInterval);
+          session.heartbeatInterval = null;
+        }
+        cleanupSteps.intervalsCleared = true;
+        console.log(`[BAILEYS] ✅ Intervals cleared`);
+      } catch (intervalError) {
+        console.warn(`[BAILEYS] ⚠️ Error clearing intervals:`, intervalError.message);
+        errors.push({ step: 'intervals', error: intervalError.message });
+      }
+      
+      // STEP 3: Close socket and remove event listeners
+      console.log(`[BAILEYS] 🔌 Step 3: Closing socket and removing event listeners...`);
+      try {
+        session.socket.ev.removeAllListeners();
+        session.socket.end();
+        cleanupSteps.socketClosed = true;
+        console.log(`[BAILEYS] ✅ Socket closed`);
+      } catch (socketError) {
+        console.warn(`[BAILEYS] ⚠️ Error closing socket:`, socketError.message);
+        errors.push({ step: 'socket', error: socketError.message });
+      }
+    } else {
+      console.log(`[BAILEYS] ℹ️ No active session found - skipping socket cleanup`);
+      cleanupSteps.socketClosed = true; // Not an error if no session
     }
-    if (session.heartbeatInterval) {
-      clearInterval(session.heartbeatInterval);
+    
+    // STEP 4: Clear instance tracking in database (with retry)
+    console.log(`[BAILEYS] 🗄️ Step 4: Clearing instance tracking in database...`);
+    const maxRetries = 3;
+    let instanceTrackingSuccess = false;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const { error: instanceError } = await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({
+            instance_id: null,
+            instance_hostname: null,
+            instance_pid: null,
+            last_heartbeat: null,
+            updated_at: disconnectedAt
+          })
+          .eq('agent_id', agentId);
+        
+        if (instanceError) {
+          throw instanceError;
+        }
+        
+        instanceTrackingSuccess = true;
+        cleanupSteps.instanceTrackingCleared = true;
+        console.log(`[BAILEYS] ✅ Instance tracking cleared (attempt ${attempt})`);
+        break;
+      } catch (instanceError) {
+        if (attempt === maxRetries) {
+          console.error(`[BAILEYS] ❌ Failed to clear instance tracking after ${maxRetries} attempts:`, instanceError.message);
+          errors.push({ step: 'instance_tracking', error: instanceError.message });
+        } else {
+          console.warn(`[BAILEYS] ⚠️ Instance tracking clear failed (attempt ${attempt}/${maxRetries}), retrying...`);
+          await new Promise(resolve => setTimeout(resolve, 500 * attempt)); // Exponential backoff
+        }
+      }
     }
-    session.socket.ev.removeAllListeners();
-    session.socket.end();
+    
+    // STEP 5: Clear from memory
+    console.log(`[BAILEYS] 🧠 Step 5: Clearing from memory...`);
+    try {
+      activeSessions.delete(agentId);
+      qrGenerationTracker.delete(agentId);
+      connectionLocks.delete(agentId);
+      lastConnectionAttempt.delete(agentId);
+      cleanupSteps.memoryCleared = true;
+      console.log(`[BAILEYS] ✅ Memory cleared`);
+    } catch (memoryError) {
+      console.warn(`[BAILEYS] ⚠️ Error clearing memory:`, memoryError.message);
+      errors.push({ step: 'memory', error: memoryError.message });
+    }
+    
+    // Clear 401 failure cooldown on manual disconnect (user wants to reconnect)
+    last401Failure.delete(agentId);
+    console.log(`[BAILEYS] ✅ 401 failure cooldown cleared (manual disconnect)`);
+    
+    // STEP 6: Delete local auth directory (with error handling)
+    console.log(`[BAILEYS] 🗑️ Step 6: Deleting local auth directory...`);
+    const authDir = path.join(__dirname, '../../auth_sessions', agentId);
+    if (fs.existsSync(authDir)) {
+      try {
+        fs.rmSync(authDir, { recursive: true, force: true });
+        cleanupSteps.localFilesDeleted = true;
+        console.log(`[BAILEYS] ✅ Local credentials deleted`);
+      } catch (deleteError) {
+        console.error(`[BAILEYS] ❌ Failed to delete local auth directory:`, deleteError.message);
+        console.error(`[BAILEYS] Error details:`, deleteError);
+        errors.push({ step: 'local_files', error: deleteError.message });
+        // Continue - database cleanup is more important
+      }
+    } else {
+      console.log(`[BAILEYS] ℹ️ No local auth directory to delete`);
+      cleanupSteps.localFilesDeleted = true; // Not an error if doesn't exist
+    }
+    
+    // STEP 7: Clear database session data completely (with retry and NULL verification)
+    console.log(`[BAILEYS] 🗄️ Step 7: Clearing database session data...`);
+    let dbClearSuccess = false;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        // CRITICAL: Use explicit NULL (not empty string or object)
+        // Include disconnected_at - if column doesn't exist, database will ignore it
+        // (PostgreSQL/Supabase allows extra fields in updates)
+        const updateData = {
+          session_data: null, // Explicitly set to NULL
+          qr_code: null,
+          qr_generated_at: null,
+          is_active: false,
+          phone_number: null,
+          status: 'disconnected', // Set status to disconnected
+          disconnected_at: disconnectedAt, // Track when disconnect occurred (column may not exist yet)
+          updated_at: disconnectedAt
+        };
+        
+        const { error: dbError, data: dbData } = await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update(updateData)
+          .eq('agent_id', agentId)
+          .select('session_data'); // Verify update succeeded
+        
+        if (dbError) {
+          // Check if error is due to missing disconnected_at column
+          if (dbError.message && dbError.message.includes('disconnected_at')) {
+            console.log(`[BAILEYS] ℹ️ disconnected_at column not found, retrying without it...`);
+            // Retry without disconnected_at column
+            const { error: retryError, data: retryData } = await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                session_data: null,
+                qr_code: null,
+                qr_generated_at: null,
+                is_active: false,
+                phone_number: null,
+                status: 'disconnected',
+                updated_at: disconnectedAt
+              })
+              .eq('agent_id', agentId)
+              .select('session_data');
+            
+            if (retryError) {
+              throw retryError;
+            }
+            
+            // Use retry data for verification
+            if (retryData && retryData.length > 0) {
+              const updatedSession = retryData[0];
+              if (updatedSession.session_data !== null && updatedSession.session_data !== undefined) {
+                console.warn(`[BAILEYS] ⚠️ session_data is not NULL after update:`, typeof updatedSession.session_data);
+                // Try one more explicit NULL update
+                await supabaseAdmin
+                  .from('whatsapp_sessions')
+                  .update({ session_data: null })
+                  .eq('agent_id', agentId)
+                  .is('session_data', null); // Use is() to ensure NULL
+              }
+            }
+          } else {
+            throw dbError;
+          }
+        } else {
+          // Verify session_data is actually NULL (not empty object/string)
+          if (dbData && dbData.length > 0) {
+            const updatedSession = dbData[0];
+            if (updatedSession.session_data !== null && updatedSession.session_data !== undefined) {
+              console.warn(`[BAILEYS] ⚠️ session_data is not NULL after update:`, typeof updatedSession.session_data);
+              // Try one more explicit NULL update
+              await supabaseAdmin
+                .from('whatsapp_sessions')
+                .update({ session_data: null })
+                .eq('agent_id', agentId)
+                .is('session_data', null); // Use is() to ensure NULL
+            }
+          }
+        }
+        
+        dbClearSuccess = true;
+        cleanupSteps.databaseCleared = true;
+        console.log(`[BAILEYS] ✅ Database cleared (attempt ${attempt})`);
+        console.log(`[BAILEYS] ✅ Status set to 'disconnected', disconnected_at: ${disconnectedAt}`);
+        break;
+      } catch (dbError) {
+        if (attempt === maxRetries) {
+          console.error(`[BAILEYS] ❌ Failed to clear database after ${maxRetries} attempts:`, dbError.message);
+          errors.push({ step: 'database', error: dbError.message });
+        } else {
+          console.warn(`[BAILEYS] ⚠️ Database clear failed (attempt ${attempt}/${maxRetries}), retrying...`);
+          await new Promise(resolve => setTimeout(resolve, 500 * attempt)); // Exponential backoff
+        }
+      }
+    }
+    
+    // STEP 8: Verify cleanup succeeded
+    console.log(`[BAILEYS] ✅ Step 8: Verifying cleanup...`);
+    const allCriticalStepsSucceeded = 
+      cleanupSteps.socketClosed &&
+      cleanupSteps.memoryCleared &&
+      cleanupSteps.databaseCleared;
+    
+    if (allCriticalStepsSucceeded) {
+      console.log(`[BAILEYS] ✅ All critical cleanup steps succeeded`);
+    } else {
+      console.warn(`[BAILEYS] ⚠️ Some cleanup steps failed:`, cleanupSteps);
+    }
+    
+    if (errors.length > 0) {
+      console.warn(`[BAILEYS] ⚠️ Cleanup completed with ${errors.length} non-critical error(s):`);
+      errors.forEach(err => {
+        console.warn(`[BAILEYS]   - ${err.step}: ${err.error}`);
+      });
+    }
+    
+    console.log(`[BAILEYS] ==================== DISCONNECT COMPLETE ====================\n`);
+    emitAgentEvent(agentId, 'disconnected', { reason: 'manual', disconnectedAt, cleanupSteps, errors });
+    
+    // Return cleanup status for verification
+    return {
+      success: allCriticalStepsSucceeded,
+      cleanupSteps,
+      errors: errors.length > 0 ? errors : undefined
+    };
+    
+  } catch (error) {
+    console.error(`[BAILEYS] ❌ Critical error during disconnect:`, error);
+    emitAgentEvent(agentId, 'disconnected', { reason: 'error', error: error.message });
+    throw error; // Re-throw critical errors
   }
-  
-  // Clear instance tracking on disconnect
-  await supabaseAdmin
-    .from('whatsapp_sessions')
-    .update({
-      instance_id: null,
-      instance_hostname: null,
-      instance_pid: null,
-      last_heartbeat: null,
-      updated_at: new Date().toISOString()
-    })
-    .eq('agent_id', agentId);
-  
-  activeSessions.delete(agentId);
-  qrGenerationTracker.delete(agentId);
-  
-  // Clear 401 failure cooldown on manual disconnect (user wants to reconnect)
-  last401Failure.delete(agentId);
-  console.log(`[BAILEYS] ✅ 401 failure cooldown cleared (manual disconnect)`);
-  
-  const authDir = path.join(__dirname, '../../auth_sessions', agentId);
-  if (fs.existsSync(authDir)) {
-    fs.rmSync(authDir, { recursive: true, force: true });
-  }
-  
-  await supabaseAdmin
-    .from('whatsapp_sessions')
-    .update({
-      session_data: null,
-      qr_code: null,
-      qr_generated_at: null,
-      is_active: false,
-      phone_number: null,
-      status: 'disconnected', // Set status to disconnected
-      updated_at: new Date().toISOString()
-    })
-    .eq('agent_id', agentId);
-  
-  console.log(`[BAILEYS] ✅ Disconnected`);
-  emitAgentEvent(agentId, 'disconnected', { reason: 'manual' });
 }
 
 // Get QR code for an agent
