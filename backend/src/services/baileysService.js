@@ -49,6 +49,9 @@ const qrGenerationTracker = new Map();
 const connectionLocks = new Map(); // agentId -> boolean
 const lastConnectionAttempt = new Map(); // agentId -> timestamp ms
 const last401Failure = new Map(); // agentId -> timestamp ms (prevents auto-retry after 401)
+// Cache for @lid JID to actual phone number mapping (for linked device messages)
+// Format: "@lid JID" -> "phone@s.whatsapp.net"
+const lidToPhoneCache = new Map();
 const COOLDOWN_MS = 5000; // 5 seconds between connection attempts
 const FAILURE_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes after 401 errors before allowing retry
 const MESSAGE_FORWARD_TIMEOUT_MS = 10000;
@@ -278,49 +281,163 @@ async function saveAudioFile(buffer, agentId, messageId, mimetype = 'audio/ogg')
     contentType: mimetype,
   };
 
-  let uploadError;
+  // Retry configuration for network errors
+  const MAX_RETRIES = 3;
+  const INITIAL_RETRY_DELAY = 1000; // 1 second
+  const MAX_RETRY_DELAY = 10000; // 10 seconds
 
-  try {
-    const { error } = await supabaseAdmin.storage.from(audioBucketName).upload(storagePath, buffer, uploadOptions);
-    uploadError = error;
-  } catch (error) {
-    uploadError = error;
-  }
+  // Helper function to check if error is retryable (network errors)
+  const isRetryableError = (error) => {
+    if (!error) return false;
+    const errorMessage = error.message?.toLowerCase() || '';
+    const errorCode = error.code || error.originalError?.code || '';
+    const errorCause = error.originalError?.cause?.code || '';
+    
+    // Check for network-related errors
+    return errorMessage.includes('fetch failed') ||
+           errorMessage.includes('econnreset') ||
+           errorMessage.includes('network') ||
+           errorMessage.includes('timeout') ||
+           errorCode === 'ECONNRESET' ||
+           errorCode === 'ETIMEDOUT' ||
+           errorCode === 'ENOTFOUND' ||
+           errorCause === 'ECONNRESET' ||
+           errorCause === 'ETIMEDOUT';
+  };
 
-  if (uploadError) {
-    if (uploadError.message?.includes('exists')) {
-      const uniqueSuffix = randomUUID().slice(0, 8);
-      storagePath = `${normalizedAgentId}/${baseFileName}-${uniqueSuffix}.${extension}`;
-      const { error: retryError } = await supabaseAdmin.storage
-        .from(audioBucketName)
-        .upload(storagePath, buffer, uploadOptions);
-      if (retryError) {
-        console.error('[BAILEYS][STORAGE] ❌ Failed to upload audio after retry:', retryError);
+  // Retry logic with exponential backoff
+  let lastError = null;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const { error } = await supabaseAdmin.storage.from(audioBucketName).upload(storagePath, buffer, uploadOptions);
+      
+      if (!error) {
+        // Success!
+        break;
+      }
+
+      // Handle file exists error (not retryable, but needs different path)
+      if (error.message?.includes('exists')) {
+        const uniqueSuffix = randomUUID().slice(0, 8);
+        storagePath = `${normalizedAgentId}/${baseFileName}-${uniqueSuffix}.${extension}`;
+        const { error: retryError } = await supabaseAdmin.storage
+          .from(audioBucketName)
+          .upload(storagePath, buffer, uploadOptions);
+        if (!retryError) {
+          // Success with new path
+          break;
+        }
+        lastError = retryError;
+        // If retry with new path fails due to network, continue retry loop
+        if (isRetryableError(retryError) && attempt < MAX_RETRIES) {
+          lastError = retryError;
+          continue;
+        }
         throw retryError;
       }
-    } else {
-      console.error('[BAILEYS][STORAGE] ❌ Failed to upload audio:', uploadError);
-      throw uploadError;
+
+      // Check if error is retryable
+      if (isRetryableError(error) && attempt < MAX_RETRIES) {
+        lastError = error;
+        const delay = Math.min(INITIAL_RETRY_DELAY * Math.pow(2, attempt), MAX_RETRY_DELAY);
+        console.warn(`[BAILEYS][STORAGE] ⚠️ Network error on attempt ${attempt + 1}/${MAX_RETRIES + 1}, retrying in ${delay}ms:`, error.message || error.code);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      // Non-retryable error or max retries reached
+      lastError = error;
+      break;
+    } catch (error) {
+      lastError = error;
+      
+      // Check if error is retryable
+      if (isRetryableError(error) && attempt < MAX_RETRIES) {
+        const delay = Math.min(INITIAL_RETRY_DELAY * Math.pow(2, attempt), MAX_RETRY_DELAY);
+        console.warn(`[BAILEYS][STORAGE] ⚠️ Network error on attempt ${attempt + 1}/${MAX_RETRIES + 1}, retrying in ${delay}ms:`, error.message || error.code);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      
+      // Non-retryable error or max retries reached
+      break;
     }
   }
 
+  // If we still have an error after all retries
+  if (lastError) {
+    console.error('[BAILEYS][STORAGE] ❌ Failed to upload audio after retries:', {
+      message: lastError.message,
+      code: lastError.code || lastError.originalError?.code,
+      cause: lastError.originalError?.cause?.code,
+      attempts: MAX_RETRIES + 1
+    });
+    throw lastError;
+  }
+
+  // Generate signed URL with retry logic for network errors
   let mediaUrl = null;
+  const URL_MAX_RETRIES = 2;
+  const URL_RETRY_DELAY = 500;
 
-  try {
-    const ttl = Number(process.env.AUDIO_SIGNED_URL_TTL || DEFAULT_AUDIO_SIGNED_URL_TTL);
-    const { data, error } = await supabaseAdmin.storage
-      .from(audioBucketName)
-      .createSignedUrl(storagePath, ttl);
+  for (let attempt = 0; attempt <= URL_MAX_RETRIES; attempt++) {
+    try {
+      const ttl = Number(process.env.AUDIO_SIGNED_URL_TTL || DEFAULT_AUDIO_SIGNED_URL_TTL);
+      const { data, error } = await supabaseAdmin.storage
+        .from(audioBucketName)
+        .createSignedUrl(storagePath, ttl);
 
-    if (error) {
-      console.warn('[BAILEYS][STORAGE] ⚠️ Failed to create signed URL, attempting public URL fallback:', error);
-      const { data: publicData } = await supabaseAdmin.storage.from(audioBucketName).getPublicUrl(storagePath);
-      mediaUrl = publicData?.publicUrl || null;
-    } else {
-      mediaUrl = data?.signedUrl || null;
+      if (!error && data?.signedUrl) {
+        mediaUrl = data.signedUrl;
+        break;
+      }
+
+      // If error is network-related and we have retries left, retry
+      const isUrlNetworkError = error && (
+        error.message?.toLowerCase().includes('fetch failed') ||
+        error.message?.toLowerCase().includes('econnreset') ||
+        error.message?.toLowerCase().includes('network') ||
+        error.message?.toLowerCase().includes('timeout') ||
+        error.code === 'ECONNRESET' ||
+        error.code === 'ETIMEDOUT'
+      );
+      
+      if (isUrlNetworkError && attempt < URL_MAX_RETRIES) {
+        console.warn(`[BAILEYS][STORAGE] ⚠️ Network error creating signed URL (attempt ${attempt + 1}/${URL_MAX_RETRIES + 1}), retrying...`);
+        await new Promise(resolve => setTimeout(resolve, URL_RETRY_DELAY * (attempt + 1)));
+        continue;
+      }
+
+      // Non-retryable error or max retries - try public URL fallback
+      if (error) {
+        console.warn('[BAILEYS][STORAGE] ⚠️ Failed to create signed URL, attempting public URL fallback:', error.message);
+        try {
+          const { data: publicData } = await supabaseAdmin.storage.from(audioBucketName).getPublicUrl(storagePath);
+          mediaUrl = publicData?.publicUrl || null;
+        } catch (publicUrlError) {
+          console.warn('[BAILEYS][STORAGE] ⚠️ Failed to get public URL as fallback:', publicUrlError.message);
+        }
+      }
+      break;
+    } catch (error) {
+      // If error is network-related and we have retries left, retry
+      const isUrlNetworkError = error && (
+        error.message?.toLowerCase().includes('fetch failed') ||
+        error.message?.toLowerCase().includes('econnreset') ||
+        error.message?.toLowerCase().includes('network') ||
+        error.message?.toLowerCase().includes('timeout') ||
+        error.code === 'ECONNRESET' ||
+        error.code === 'ETIMEDOUT'
+      );
+      
+      if (isUrlNetworkError && attempt < URL_MAX_RETRIES) {
+        console.warn(`[BAILEYS][STORAGE] ⚠️ Network error generating URL (attempt ${attempt + 1}/${URL_MAX_RETRIES + 1}), retrying...`);
+        await new Promise(resolve => setTimeout(resolve, URL_RETRY_DELAY * (attempt + 1)));
+        continue;
+      }
+      console.warn('[BAILEYS][STORAGE] ⚠️ Error generating audio URL:', error.message);
+      break;
     }
-  } catch (error) {
-    console.warn('[BAILEYS][STORAGE] ⚠️ Error generating audio URL:', error);
   }
 
   console.log('[BAILEYS][STORAGE] 🎵 Audio stored', {
@@ -1054,6 +1171,82 @@ async function initializeWhatsApp(agentId, userId = null) {
     // CRITICAL: Create socket with proper config
     console.log(`[BAILEYS] 🔌 Creating WebSocket connection...`);
     
+    // CRITICAL: Enhanced logger to intercept raw protocol messages and extract sender_pn for @lid messages
+    // Use trace level to catch ALL logs, and intercept at PARENT logger level (not just child)
+    const customLogger = pino({ level: 'trace' });
+    
+    // Intercept at PARENT logger level (trace, debug, info) to catch protocol messages BEFORE processing
+    const originalTrace = customLogger.trace.bind(customLogger);
+    const originalDebug = customLogger.debug.bind(customLogger);
+    const originalInfo = customLogger.info.bind(customLogger);
+    
+    customLogger.trace = function(obj, msg) {
+      interceptSenderPn(obj);
+      return originalTrace(obj, msg);
+    };
+    
+    customLogger.debug = function(obj, msg) {
+      interceptSenderPn(obj);
+      return originalDebug(obj, msg);
+    };
+    
+    customLogger.info = function(obj, msg) {
+      interceptSenderPn(obj);
+      return originalInfo(obj, msg);
+    };
+    
+    // Helper function to extract and cache sender_pn AND peer_recipient_pn from protocol messages
+    function interceptSenderPn(obj) {
+      if (obj && typeof obj === 'object') {
+        // Check for recv.attrs (message receive) - this is where sender_pn and peer_recipient_pn appear in protocol logs
+        if (obj.recv && obj.recv.attrs) {
+          const attrs = obj.recv.attrs;
+          
+          // INCOMING MESSAGE: Extract sender_pn from @lid messages
+          if (attrs.from && attrs.from.endsWith('@lid') && attrs.sender_pn) {
+            const lidJid = attrs.from;
+            const senderPn = attrs.sender_pn;
+            // Extract just the phone number (remove @s.whatsapp.net if present)
+            const phoneNumber = senderPn.includes('@') 
+              ? senderPn.split('@')[0] 
+              : senderPn;
+            const senderJid = `${phoneNumber}@s.whatsapp.net`;
+            lidToPhoneCache.set(lidJid, senderJid);
+            console.log(`[BAILEYS] 🔍 LOGGER INTERCEPT: Cached sender_pn ${lidJid} -> ${phoneNumber}`);
+          }
+          
+          // OUTGOING MESSAGE: Extract peer_recipient_pn from @lid messages
+          if (attrs.recipient && attrs.recipient.endsWith('@lid') && attrs.peer_recipient_pn) {
+            const recipientLidJid = attrs.recipient;
+            const peerRecipientPn = attrs.peer_recipient_pn;
+            const phoneNumber = peerRecipientPn.includes('@')
+              ? peerRecipientPn.split('@')[0]
+              : peerRecipientPn;
+            const recipientJid = `${phoneNumber}@s.whatsapp.net`;
+            lidToPhoneCache.set(recipientLidJid, recipientJid);
+            console.log(`[BAILEYS] 🔍 LOGGER INTERCEPT: Cached peer_recipient_pn ${recipientLidJid} -> ${phoneNumber}`);
+          }
+        }
+      }
+    }
+    
+    // Also intercept child loggers (for completeness)
+    const originalChild = customLogger.child.bind(customLogger);
+    customLogger.child = function(bindings) {
+      const child = originalChild(bindings);
+      // Intercept all log methods to catch protocol messages
+      ['info', 'debug', 'trace'].forEach(method => {
+        const originalMethod = child[method];
+        if (originalMethod && typeof originalMethod === 'function') {
+          child[method] = function(obj, msg) {
+            interceptSenderPn(obj);
+            return originalMethod.call(this, obj, msg);
+          };
+        }
+      });
+      return child;
+    };
+    
     const sock = makeWASocket({
       // CRITICAL: Use proper auth structure with cacheable signal key store
       auth: {
@@ -1062,7 +1255,7 @@ async function initializeWhatsApp(agentId, userId = null) {
       },
       version, // Use fetched version
       printQRInTerminal: true, // CRITICAL: Enable for debugging!
-      logger: pino({ level: 'debug' }), // Use debug for troubleshooting
+      logger: customLogger, // Use custom logger to intercept sender_pn
       browser: Browsers.ubuntu('Chrome'),
       
       // OPTIMIZED: Balanced timeouts for stability and performance
@@ -1090,8 +1283,40 @@ async function initializeWhatsApp(agentId, userId = null) {
     console.log(`[BAILEYS] 🔍 Socket info:`, {
       socketExists: !!sock,
       hasEventEmitter: !!sock.ev,
+      hasWebSocket: !!sock.ws,
       timestamp: new Date().toISOString()
     });
+    
+    // CRITICAL: Try to intercept raw WebSocket messages BEFORE Baileys processes them
+    // This is APPROACH 2 - intercept raw socket messages if accessible
+    if (sock.ws && typeof sock.ws.on === 'function') {
+      try {
+        // Intercept raw WebSocket messages to extract sender_pn
+        sock.ws.on('message', (data) => {
+          try {
+            // Baileys uses binary protocol, but we can try to parse JSON if it's text
+            if (typeof data === 'string') {
+              const parsed = JSON.parse(data);
+              if (parsed.attrs?.from?.endsWith('@lid') && parsed.attrs?.sender_pn) {
+                const lidJid = parsed.attrs.from;
+                const senderPn = parsed.attrs.sender_pn;
+                const phoneNumber = senderPn.includes('@') ? senderPn.split('@')[0] : senderPn;
+                const senderJid = `${phoneNumber}@s.whatsapp.net`;
+                lidToPhoneCache.set(lidJid, senderJid);
+                console.log(`[BAILEYS] 🔍 RAW SOCKET: Cached sender_pn ${lidJid} -> ${phoneNumber}`);
+              }
+            }
+          } catch (e) {
+            // Ignore parse errors - Baileys uses binary protocol, not JSON
+          }
+        });
+        console.log(`[BAILEYS] ✅ Raw WebSocket message interceptor attached`);
+      } catch (wsError) {
+        console.log(`[BAILEYS] ⚠️ Could not attach raw WebSocket interceptor: ${wsError.message}`);
+      }
+    } else {
+      console.log(`[BAILEYS] ℹ️ Raw WebSocket not accessible (this is normal - Baileys may not expose it)`);
+    }
 
     // CRITICAL: Register creds.update handler
     sock.ev.on('creds.update', async () => {
@@ -2081,16 +2306,241 @@ async function initializeWhatsApp(agentId, userId = null) {
 
         // CRITICAL: Skip messages from WhatsApp system (status@broadcast, etc.)
         // These are typically status updates, system notifications, etc.
+        // NOTE: @lid messages are VALID user messages from linked devices/business accounts - don't skip them
         if (remoteJid.includes('status') || 
             remoteJid.includes('broadcast') || 
             remoteJid.includes('@g.us') ||
-            remoteJid.includes('newsletter') ||
-            remoteJid.includes('@lid') && !remoteJid.includes('@s.whatsapp.net')) {
+            remoteJid.includes('newsletter')) {
           console.log(`[BAILEYS] 🚫 Skipping system/status message from: ${remoteJid}`);
           continue;
         }
+        
+        // For @lid messages, extract actual sender from sender_pn attribute (incoming) or peer_recipient_pn (outgoing)
+        // @lid messages are from linked devices/business accounts and are valid user messages
+        let actualSenderJid = remoteJid;
+        let actualRecipientJid = remoteJid; // NEW: Track actual recipient for outgoing messages
+        if (remoteJid.endsWith('@lid')) {
+          // CRITICAL: Check cache FIRST (fastest method - populated by custom logger intercepting protocol)
+          let senderPn = null;
+          if (lidToPhoneCache.has(remoteJid)) {
+            senderPn = lidToPhoneCache.get(remoteJid);
+            console.log(`[BAILEYS] ✅ Found sender_pn in cache for ${remoteJid}: ${senderPn}`);
+          }
+          
+          // Method 1: Check msg.key.attrs (if not in cache)
+          if (!senderPn && msg?.key?.attrs && typeof msg.key.attrs === 'object') {
+            senderPn = msg.key.attrs.sender_pn || null;
+            if (senderPn) {
+              console.log(`[BAILEYS] ✅ Found sender_pn in msg.key.attrs: ${senderPn}`);
+            }
+          }
+          
+          // Method 2: Check msg.attrs (alternative location)
+          if (!senderPn && msg?.attrs && typeof msg.attrs === 'object') {
+            senderPn = msg.attrs.sender_pn || null;
+            if (senderPn) {
+              console.log(`[BAILEYS] ✅ Found sender_pn in msg.attrs: ${senderPn}`);
+            }
+          }
+          
+          // Method 3: Check if it's directly on msg.key
+          if (!senderPn && msg?.key && typeof msg.key === 'object') {
+            senderPn = msg.key.sender_pn || null;
+            if (senderPn) {
+              console.log(`[BAILEYS] ✅ Found sender_pn on msg.key: ${senderPn}`);
+            }
+          }
+          
+          // Method 5: Try to get from socket's contact store using pushName
+          if (!senderPn && msg?.pushName && sock?.store?.contacts) {
+            try {
+              // Search contacts by pushName to find matching phone number
+              const contacts = await sock.store.contacts.all();
+              const matchingContact = contacts.find(c => c.name === msg.pushName);
+              if (matchingContact && matchingContact.id) {
+                const contactJid = matchingContact.id;
+                if (contactJid.endsWith('@s.whatsapp.net')) {
+                  senderPn = contactJid;
+                  // Cache it for future use
+                  lidToPhoneCache.set(remoteJid, contactJid);
+                  console.log(`[BAILEYS] ✅ Found sender via contact store (pushName: ${msg.pushName}): ${senderPn}`);
+                }
+              }
+            } catch (contactError) {
+              // Ignore contact store errors
+            }
+          }
+          
+          // Method 6: Try to get from socket's message store (Baileys might store it there)
+          if (!senderPn && sock?.store?.messages) {
+            try {
+              const storedMessages = await sock.store.messages.get(remoteJid);
+              if (storedMessages && storedMessages[messageId]) {
+                const storedMsg = storedMessages[messageId];
+                // Check various locations in stored message
+                const storedSenderPn = storedMsg?.key?.attrs?.sender_pn ||
+                                     storedMsg?.attrs?.sender_pn ||
+                                     storedMsg?.sender_pn ||
+                                     null;
+                if (storedSenderPn) {
+                  senderPn = storedSenderPn;
+                  lidToPhoneCache.set(remoteJid, storedSenderPn);
+                  console.log(`[BAILEYS] ✅ Found sender_pn in message store: ${senderPn}`);
+                }
+              }
+            } catch (storeError) {
+              // Ignore store errors
+            }
+          }
+          
+          if (senderPn) {
+            // Convert sender_pn to proper JID format if needed
+            actualSenderJid = senderPn.includes('@') ? senderPn : `${senderPn}@s.whatsapp.net`;
+            console.log(`[BAILEYS] ℹ️ @lid message detected, using sender_pn: ${actualSenderJid} (original remoteJid: ${remoteJid})`);
+          }
+          
+          // OUTGOING MESSAGE: Extract peer_recipient_pn for recipient identification
+          if (fromMe) {
+            let peerRecipientPn = null;
+            
+            // Method 1: Check msg.key.attrs (most reliable)
+            if (msg?.key?.attrs && typeof msg.key.attrs === 'object') {
+              peerRecipientPn = msg.key.attrs.peer_recipient_pn || null;
+              if (peerRecipientPn) {
+                console.log(`[BAILEYS] ✅ Found peer_recipient_pn in msg.key.attrs: ${peerRecipientPn}`);
+              }
+            }
+            
+            // Method 2: Check msg.attrs
+            if (!peerRecipientPn && msg?.attrs && typeof msg.attrs === 'object') {
+              peerRecipientPn = msg.attrs.peer_recipient_pn || null;
+              if (peerRecipientPn) {
+                console.log(`[BAILEYS] ✅ Found peer_recipient_pn in msg.attrs: ${peerRecipientPn}`);
+              }
+            }
+            
+            // Method 3: Check if it's directly on msg.key
+            if (!peerRecipientPn && msg?.key && typeof msg.key === 'object') {
+              peerRecipientPn = msg.key.peer_recipient_pn || null;
+              if (peerRecipientPn) {
+                console.log(`[BAILEYS] ✅ Found peer_recipient_pn on msg.key: ${peerRecipientPn}`);
+              }
+            }
+            
+            // Method 4: Check cache (populated by logger interceptor)
+            if (!peerRecipientPn && lidToPhoneCache.has(remoteJid)) {
+              actualRecipientJid = lidToPhoneCache.get(remoteJid);
+              console.log(`[BAILEYS] ✅ Found peer_recipient_pn in cache for ${remoteJid}: ${actualRecipientJid}`);
+            } else if (peerRecipientPn) {
+              // Convert peer_recipient_pn to proper JID format
+              actualRecipientJid = peerRecipientPn.includes('@') ? peerRecipientPn : `${peerRecipientPn}@s.whatsapp.net`;
+              // Cache it for future use
+              lidToPhoneCache.set(remoteJid, actualRecipientJid);
+              console.log(`[BAILEYS] 💾 Cached peer_recipient_pn mapping: ${remoteJid} -> ${actualRecipientJid}`);
+            }
+          }
+          
+          if (!senderPn && !fromMe) {
+            // CRITICAL: Log COMPLETE message structure for @lid messages to find sender_pn
+            // This is APPROACH 1 - comprehensive debug logging to find where sender_pn is stored
+            console.log(`[BAILEYS] ⚠️ @lid message detected but sender_pn not found. COMPLETE message structure:`, JSON.stringify({
+              // Check ALL possible locations for sender_pn
+              key: msg?.key ? {
+                id: msg.key.id,
+                remoteJid: msg.key.remoteJid,
+                fromMe: msg.key.fromMe,
+                attrs: msg.key.attrs,
+                participant: msg.key.participant,
+                // Check if sender_pn is directly on key
+                sender_pn: msg.key.sender_pn,
+                // Check all key properties
+                allKeys: Object.keys(msg.key),
+              } : null,
+              // Check top-level attrs
+              attrs: msg?.attrs,
+              // Check message.attrs
+              messageAttrs: msg?.message?.attrs,
+              // Check extendedTextMessage contextInfo
+              extendedTextContext: msg?.message?.extendedTextMessage?.contextInfo,
+              // Check all message properties
+              messageKeys: msg?.message ? Object.keys(msg.message) : [],
+              // Other properties
+              pushName: msg?.pushName,
+              notify: msg?.notify,
+              verifiedBisName: msg?.verifiedBisName,
+              // Check if sender_pn is at top level
+              sender_pn: msg?.sender_pn,
+              // Show ALL top-level keys
+              allTopLevelKeys: msg ? Object.keys(msg) : [],
+            }, null, 2));
+            
+            // Also try to find sender_pn by deep searching the entire message object
+            const deepSearchForSenderPn = (obj, path = 'root', depth = 0) => {
+              if (depth > 5) return null; // Limit depth
+              if (!obj || typeof obj !== 'object') return null;
+              
+              if ('sender_pn' in obj) {
+                console.log(`[BAILEYS] 🔍 Found sender_pn at path: ${path}.sender_pn = ${obj.sender_pn}`);
+                return obj.sender_pn;
+              }
+              
+              for (const key in obj) {
+                if (obj.hasOwnProperty(key)) {
+                  const result = deepSearchForSenderPn(obj[key], `${path}.${key}`, depth + 1);
+                  if (result) return result;
+                }
+              }
+              return null;
+            };
+            
+            const foundSenderPn = deepSearchForSenderPn(msg);
+            if (foundSenderPn) {
+              const phoneNumber = foundSenderPn.includes('@') ? foundSenderPn.split('@')[0] : foundSenderPn;
+              const senderJid = `${phoneNumber}@s.whatsapp.net`;
+              actualSenderJid = senderJid;
+              lidToPhoneCache.set(remoteJid, senderJid);
+              console.log(`[BAILEYS] ✅ Found sender_pn via deep search: ${remoteJid} -> ${phoneNumber}`);
+            }
+            
+            // Last resort: Try to extract from the raw message if it's available
+            // Sometimes Baileys stores raw protocol data in a different format
+            if (msg && typeof msg === 'object') {
+              // Deep search for sender_pn in the entire message object
+              const deepSearch = (obj, depth = 0) => {
+                if (depth > 3) return null; // Limit depth to avoid infinite recursion
+                if (!obj || typeof obj !== 'object') return null;
+                
+                if ('sender_pn' in obj) {
+                  return obj.sender_pn;
+                }
+                
+                for (const key in obj) {
+                  if (obj.hasOwnProperty(key)) {
+                    const result = deepSearch(obj[key], depth + 1);
+                    if (result) return result;
+                  }
+                }
+                return null;
+              };
+              
+              const foundSenderPn = deepSearch(msg);
+              if (foundSenderPn) {
+                actualSenderJid = foundSenderPn.includes('@') ? foundSenderPn : `${foundSenderPn}@s.whatsapp.net`;
+                // Cache it for future use
+                lidToPhoneCache.set(remoteJid, actualSenderJid);
+                console.log(`[BAILEYS] ✅ Found sender_pn via deep search: ${actualSenderJid}`);
+              }
+            }
+          }
+          
+          // If we found sender_pn, cache it for future messages from this @lid
+          if (actualSenderJid !== remoteJid && actualSenderJid) {
+            lidToPhoneCache.set(remoteJid, actualSenderJid);
+            console.log(`[BAILEYS] 💾 Cached @lid mapping: ${remoteJid} -> ${actualSenderJid}`);
+          }
+        }
 
-        console.log(`[BAILEYS] ✅ Processing individual message ${participant} ${remoteJid}`);
+        console.log(`[BAILEYS] ✅ Processing individual message ${participant} ${remoteJid}${actualSenderJid !== remoteJid ? ` (actual sender: ${actualSenderJid})` : ''}`);
         console.log(`[BAILEYS] Message: ${messageText}`);
         console.log(`[BAILEYS] Message ID: ${messageId}`);
         if (msg.messageTimestamp) {
@@ -2119,15 +2569,44 @@ async function initializeWhatsApp(agentId, userId = null) {
         const timestampIso = new Date(timestampRaw * 1000).toISOString();
 
         let messageType = 'TEXT';
-        let content = textContent;
+        // Use messageText (already extracted and validated) as primary source, fallback to textContent
+        // messageText is more comprehensive and handles more message types
+        let content = messageText && messageText !== '[No message content]' && !messageText.startsWith('[Unknown message type:') 
+          ? messageText 
+          : (textContent || null);
         let mediaUrl = null;
         let mediaMimetype = null;
         let mediaSize = null;
+        
+        // Update contact extraction for @lid messages - use actualRecipientJid for outgoing, actualSenderJid for incoming
+        let finalContactCandidateJid = contactCandidateJid;
+        let finalFromNumber = fromNumber;
+        let finalToNumber = toNumber;
+        if (actualSenderJid !== remoteJid || (fromMe && actualRecipientJid !== remoteJid)) {
+          if (fromMe) {
+            // OUTGOING: Use actualRecipientJid (from peer_recipient_pn)
+            finalContactCandidateJid = participantJid || actualRecipientJid;
+          } else {
+            // INCOMING: Use actualSenderJid (from sender_pn)
+            finalContactCandidateJid = actualSenderJid;
+          }
+          
+          const updatedContactNumber = sanitizeNumberFromJid(finalContactCandidateJid);
+          finalFromNumber = fromMe ? agentNumber : updatedContactNumber;
+          finalToNumber = fromMe ? updatedContactNumber : agentNumber;
+          
+          if (fromMe) {
+            console.log(`[BAILEYS] 🔄 Updated contact info for OUTGOING @lid: fromNumber=${finalFromNumber}, toNumber=${finalToNumber}, actualRecipientJid=${actualRecipientJid}`);
+          } else {
+            console.log(`[BAILEYS] 🔄 Updated contact info for INCOMING @lid: fromNumber=${finalFromNumber}, toNumber=${finalToNumber}, actualSenderJid=${actualSenderJid}`);
+          }
+        }
+        
         const messageMetadata = {
           platform: 'whatsapp',
           phoneNumber: agentNumber,
             direction: fromMe ? 'outgoing' : 'incoming',
-          remoteJid,
+          remoteJid: actualSenderJid, // Use actual sender JID for @lid messages
           messageId,
         };
 
@@ -2163,28 +2642,62 @@ async function initializeWhatsApp(agentId, userId = null) {
             if (audioBuffer) {
               mediaSize = audioBuffer.length;
               messageMetadata.mediaSize = mediaSize;
-              const { url, path: storagePath } = await saveAudioFile(audioBuffer, agentId, messageId, mediaMimetype);
-              mediaUrl = url;
-              messageMetadata.storagePath = storagePath;
-              console.log('[BAILEYS] 🎵 Audio message processed', { messageId, mediaUrl });
-        } else {
+              try {
+                const { url, path: storagePath } = await saveAudioFile(audioBuffer, agentId, messageId, mediaMimetype);
+                mediaUrl = url;
+                messageMetadata.storagePath = storagePath;
+                console.log('[BAILEYS] 🎵 Audio message processed', { messageId, mediaUrl });
+              } catch (uploadError) {
+                // Log error but don't break message processing - webhook will still be sent without mediaUrl
+                console.error('[BAILEYS] ❌ Failed to upload audio file (message will continue without mediaUrl):', {
+                  messageId,
+                  error: uploadError.message,
+                  code: uploadError.code || uploadError.originalError?.code,
+                });
+                // Set mediaUrl to null so webhook knows there's no media available
+                mediaUrl = null;
+                messageMetadata.storagePath = null;
+              }
+            } else {
               console.warn('[BAILEYS] ⚠️ Audio buffer empty after download', { messageId });
             }
           } catch (error) {
             console.error('[BAILEYS] ❌ Failed to process audio message', { messageId, error: error.message });
+            // Continue processing - don't break the entire message flow
+            mediaUrl = null;
+            messageMetadata.storagePath = null;
           }
 
           content = null;
         }
 
-        const sanitizedFromNumber =
-          typeof fromNumber === 'string' && fromNumber.length > 0
-            ? fromNumber
-            : sanitizeNumberFromJid(remoteJid) || remoteJid;
-        const sanitizedToNumber =
-          typeof toNumber === 'string' && toNumber.length > 0
-            ? toNumber
-            : sanitizeNumberFromJid(fromMe ? remoteJid : agentNumber) || (fromMe ? remoteJid : agentNumber);
+        // For @lid messages, always use actualSenderJid to get the correct phone number
+        // CRITICAL: For @lid messages, use finalFromNumber/finalToNumber that were already calculated correctly
+        // These values account for message direction (fromMe) and use agentNumber for outgoing, contact for incoming
+        let sanitizedFromNumber;
+        let sanitizedToNumber;
+
+        if (remoteJid.endsWith('@lid')) {
+          // For @lid messages, use the finalFromNumber/finalToNumber that were calculated earlier
+          // These already account for message direction (fromMe flag)
+          sanitizedFromNumber = finalFromNumber || sanitizeNumberFromJid(agentNumber) || agentNumber;
+          sanitizedToNumber = finalToNumber || sanitizeNumberFromJid(actualSenderJid) || actualSenderJid;
+          
+          if (fromMe) {
+            console.log(`[BAILEYS] ✅ @lid OUTGOING: from=${sanitizedFromNumber} (bot), to=${sanitizedToNumber} (contact)`);
+          } else {
+            console.log(`[BAILEYS] ✅ @lid INCOMING: from=${sanitizedFromNumber} (contact), to=${sanitizedToNumber} (bot)`);
+          }
+        } else {
+          // Regular message (not @lid) - use standard extraction
+          sanitizedFromNumber = typeof finalFromNumber === 'string' && finalFromNumber.length > 0
+            ? finalFromNumber
+            : sanitizeNumberFromJid(actualSenderJid) || actualSenderJid;
+          
+          sanitizedToNumber = typeof finalToNumber === 'string' && finalToNumber.length > 0
+            ? finalToNumber
+            : sanitizeNumberFromJid(fromMe ? actualSenderJid : agentNumber) || (fromMe ? actualSenderJid : agentNumber);
+        }
 
         const cleanedMetadata = Object.fromEntries(
           Object.entries(messageMetadata).filter(([, value]) => value !== undefined && value !== null)
@@ -2229,13 +2742,34 @@ async function initializeWhatsApp(agentId, userId = null) {
                            msg.notify || 
                            null;
 
+        // CRITICAL: For @lid messages, check cache ONE MORE TIME right before webhook
+        // The logger intercepts protocol messages and populates cache, but it might happen
+        // slightly after message processing starts. Add a small delay to let logger intercept first.
+        let webhookFromNumber = sanitizedFromNumber;
+        if (remoteJid.endsWith('@lid')) {
+          // Give logger a moment to intercept the protocol message and populate cache
+          await new Promise(resolve => setTimeout(resolve, 50)); // 50ms delay
+          
+          // Check cache now (logger should have populated it by now)
+          if (lidToPhoneCache.has(remoteJid)) {
+            const cachedSenderJid = lidToPhoneCache.get(remoteJid);
+            const cachedPhoneNumber = sanitizeNumberFromJid(cachedSenderJid);
+            if (cachedPhoneNumber) {
+              webhookFromNumber = cachedPhoneNumber;
+              console.log(`[BAILEYS] ✅ Using cached sender_pn for webhook: ${remoteJid} -> ${webhookFromNumber}`);
+            }
+          } else {
+            console.log(`[BAILEYS] ⚠️ Cache not populated yet for ${remoteJid}, using fallback: ${webhookFromNumber}`);
+          }
+        }
+
         const webhookPayload = {
           id: messageId,
           messageId,
-          from: sanitizedFromNumber || remoteJid,
+          from: webhookFromNumber || sanitizedFromNumber || actualSenderJid,
           to: sanitizedToNumber,
           senderName: senderName,
-          conversationId: remoteJid,
+          conversationId: actualSenderJid, // Use actual sender JID for @lid messages
           messageType,
           type: messageType.toLowerCase(),
           content: content || null,
@@ -2256,14 +2790,38 @@ async function initializeWhatsApp(agentId, userId = null) {
           webhookPayload.to = sanitizeNumberFromJid(webhookPayload.to) || webhookPayload.to;
         }
 
+        // Forward message if:
+        // 1. TEXT message with content (even if it's a placeholder like [Image], [Video], etc.)
+        // 2. AUDIO message with mediaUrl
+        // Note: We forward TEXT messages even with placeholder content so webhook can handle all message types
         const shouldForward =
-          (messageType === 'TEXT' && Boolean(content)) ||
+          (messageType === 'TEXT' && content && content.trim().length > 0) ||
           (messageType === 'AUDIO' && Boolean(mediaUrl));
 
         if (shouldForward) {
+          console.log(`[BAILEYS][WEBHOOK] 📤 Forwarding ${messageType} message to webhook:`, {
+            messageId,
+            from: sanitizedFromNumber,
+            to: sanitizedToNumber,
+            senderName: senderName,
+            hasContent: Boolean(content),
+            contentLength: content?.length || 0,
+            hasMediaUrl: Boolean(mediaUrl),
+            contentPreview: content ? content.substring(0, 50) : null,
+            remoteJid: actualSenderJid,
+          });
           await forwardMessageToWebhook(agentId, webhookPayload);
         } else {
-          console.log('[BAILEYS] ℹ️ Skipping webhook forwarding (no content or media)');
+          console.log(`[BAILEYS] ⚠️ Skipping webhook forwarding:`, {
+            messageId,
+            messageType,
+            hasContent: Boolean(content),
+            contentLength: content ? content.length : 0,
+            hasMediaUrl: Boolean(mediaUrl),
+            reason: messageType === 'TEXT' 
+              ? (content ? 'content is empty' : 'no content extracted')
+              : (mediaUrl ? 'unknown' : 'no mediaUrl')
+          });
         }
       }
 
