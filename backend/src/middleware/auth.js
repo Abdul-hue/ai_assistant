@@ -1,69 +1,54 @@
-const { supabaseAdmin } = require('../config/supabase');
+const { supabaseAnon } = require('../config/supabase');
 
 /**
  * Authentication middleware
  * SECURITY: Reads Supabase tokens from HttpOnly cookies
  * Priority: Cookie > Authorization header for enhanced security
+ * 
+ * FIXED: Uses supabaseAnon (configured with proper headers) for token verification
  */
 const authMiddleware = async (req, res, next) => {
   try {
-    let token = null;
-
-    // Priority 1: Read from HttpOnly cookie (secure)
-    if (req.cookies?.sb_access_token) {
-      token = req.cookies.sb_access_token;
-      console.log('🔐 Supabase token from cookie (secure)');
-    }
-    // Priority 2: Fallback to Authorization header (for API clients)
-    else if (req.headers.authorization) {
-      const authHeader = req.headers.authorization;
-      if (authHeader.startsWith('Bearer ')) {
-        token = authHeader.replace('Bearer ', '');
-        console.log('🔓 Supabase token from header (fallback)');
-      }
-    }
+    // Get token from cookie (priority) or Authorization header
+    const token = req.cookies?.sb_access_token || 
+                  (req.headers.authorization?.startsWith('Bearer ') 
+                    ? req.headers.authorization.replace('Bearer ', '') 
+                    : null);
 
     if (!token) {
-      console.warn('⚠️  No Supabase token found');
-      return res.status(401).json({ 
-        error: 'Authentication required',
-        message: 'No access token found in cookies or headers'
-      });
+      return res.status(401).json({ error: "No token" });
     }
 
-    // Verify token with Supabase
-    const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
+    // Verify token with Supabase (using anon client with proper headers)
+    const { data, error } = await supabaseAnon.auth.getUser(token);
 
-    if (error || !user) {
-      console.error('❌ Token validation failed:', error?.message);
-      
+    if (error) {
+      console.error('❌ Token validation failed:', error.message);
       // Clear invalid cookies
       res.clearCookie('sb_access_token');
       res.clearCookie('sb_refresh_token');
-      
-      return res.status(401).json({ 
-        error: 'Invalid or expired token',
-        message: error?.message || 'Authentication failed'
-      });
+      return res.status(401).json({ error: "Invalid token" });
+    }
+
+    if (!data?.user) {
+      console.error('❌ Token validation failed: No user found');
+      return res.status(401).json({ error: "Invalid token" });
     }
 
     // Attach user to request
     req.user = {
-      id: user.id,
-      email: user.email,
-      role: user.user_metadata?.role || 'user',
-      fullName: user.user_metadata?.full_name,
-      avatarUrl: user.user_metadata?.avatar_url,
+      id: data.user.id,
+      email: data.user.email,
+      role: data.user.user_metadata?.role || 'user',
+      fullName: data.user.user_metadata?.full_name,
+      avatarUrl: data.user.user_metadata?.avatar_url,
     };
 
-    console.log('✅ Supabase user authenticated:', user.email);
+    console.log('✅ Supabase user authenticated:', data.user.email);
     next();
   } catch (error) {
-    console.error('❌ Auth middleware error:', error);
-    return res.status(500).json({ 
-      error: 'Authentication error',
-      message: 'Internal server error'
-    });
+    console.error('❌ Auth middleware error:', error.message || error);
+    return res.status(500).json({ error: "Auth failure" });
   }
 };
 

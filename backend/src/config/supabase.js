@@ -3,38 +3,108 @@ const { createClient } = require('@supabase/supabase-js');
 // Supabase configuration
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY; // Fallback to service key if anon not set
 const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+if (!SUPABASE_URL) {
   console.error('❌ Missing Supabase environment variables:');
   console.error('   SUPABASE_URL:', SUPABASE_URL ? '✅ Set' : '❌ Missing');
-  console.error('   SUPABASE_SERVICE_ROLE_KEY:', SUPABASE_SERVICE_ROLE_KEY ? '✅ Set' : '❌ Missing');
-  console.error('   SUPABASE_JWT_SECRET:', SUPABASE_JWT_SECRET ? '✅ Set' : '❌ Missing');
-  throw new Error('Supabase configuration is incomplete');
+  throw new Error('Supabase URL is required');
 }
 
-// Debug environment variables
-console.log('🔍 Supabase Configuration Debug:');
-console.log('   Supabase URL:', SUPABASE_URL);
-console.log('   Using Service Role Key:', SUPABASE_SERVICE_ROLE_KEY?.substring(0, 20) + '...');
-console.log('   Key type:', SUPABASE_SERVICE_ROLE_KEY?.startsWith('eyJ') ? 'JWT (service_role)' : 'ANON KEY (wrong!)');
-console.log('   Key length:', SUPABASE_SERVICE_ROLE_KEY?.length);
-console.log('   Key has leading/trailing spaces:', SUPABASE_SERVICE_ROLE_KEY?.trim() !== SUPABASE_SERVICE_ROLE_KEY);
-console.log('   Key ends with newline:', SUPABASE_SERVICE_ROLE_KEY?.endsWith('\n') || SUPABASE_SERVICE_ROLE_KEY?.endsWith('\r'));
-
-// ✅ FIX: Trim the service role key to remove any whitespace
+// ✅ FIX: Trim keys to remove any whitespace
 const trimmedServiceKey = SUPABASE_SERVICE_ROLE_KEY?.trim();
+const trimmedAnonKey = SUPABASE_ANON_KEY?.trim();
+
+// Custom fetch wrapper with timeout and retry logic
+// Node.js 18+ has AbortController built-in
+const createFetchWithTimeout = (timeoutMs = 30000) => {
+  return async (url, options = {}) => {
+    // Check if AbortController is available (Node.js 15+)
+    if (typeof AbortController === 'undefined') {
+      console.warn('⚠️  AbortController not available, using basic fetch');
+      return fetch(url, options);
+    }
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, timeoutMs);
+    
+    try {
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      return response;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      
+      // Retry once on timeout or connection errors
+      const isTimeoutError = error.name === 'AbortError' || 
+                             error.code === 'UND_ERR_CONNECT_TIMEOUT' || 
+                             error.message?.includes('timeout') ||
+                             error.message?.includes('fetch failed');
+      
+      if (isTimeoutError) {
+        console.warn(`⚠️  Supabase request timed out or failed (${timeoutMs}ms), retrying once...`);
+        console.warn(`   URL: ${url}`);
+        console.warn(`   Error: ${error.message || error.code || 'Unknown error'}`);
+        
+        const retryController = new AbortController();
+        const retryTimeoutId = setTimeout(() => retryController.abort(), timeoutMs);
+        try {
+          const retryResponse = await fetch(url, {
+            ...options,
+            signal: retryController.signal,
+          });
+          clearTimeout(retryTimeoutId);
+          console.log('✅ Supabase retry succeeded');
+          return retryResponse;
+        } catch (retryError) {
+          clearTimeout(retryTimeoutId);
+          console.error('❌ Supabase retry also failed:', retryError.message || retryError.code);
+          console.error('   This indicates a network connectivity issue with Supabase');
+          throw retryError;
+        }
+      }
+      throw error;
+    }
+  };
+};
 
 // Create Supabase admin client (with service role key for server-side operations)
+// Add timeout and retry configuration
 const supabaseAdmin = createClient(SUPABASE_URL, trimmedServiceKey, {
   auth: {
     autoRefreshToken: false,
     persistSession: false
+  },
+  global: {
+    fetch: createFetchWithTimeout(30000), // 30 second timeout
+    headers: {
+      apikey: trimmedServiceKey,
+      Authorization: `Bearer ${trimmedServiceKey}`
+    }
   }
 });
 
-// Create Supabase client for JWT verification (with service role key for server-side)
-const supabaseAnon = createClient(SUPABASE_URL, trimmedServiceKey);
+// Create Supabase client for JWT verification (with anon key for token verification)
+// This is the client used by auth middleware to verify user tokens
+const supabaseAnon = createClient(SUPABASE_URL, trimmedAnonKey, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false
+  },
+  global: {
+    fetch: createFetchWithTimeout(30000), // 30 second timeout
+    headers: {
+      apikey: trimmedAnonKey,
+      Authorization: `Bearer ${trimmedAnonKey}`
+    }
+  }
+});
 
 /**
  * Verify Supabase JWT token
@@ -47,8 +117,22 @@ async function verifySupabaseToken(token) {
       throw new Error('No token provided');
     }
 
-    // Use Supabase client to verify the token
-    const { data: { user }, error } = await supabaseAnon.auth.getUser(token);
+    // Use Supabase client to verify the token (with timeout)
+    let result;
+    try {
+      result = await Promise.race([
+        supabaseAnon.auth.getUser(token),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Supabase connection timeout')), 25000)
+        )
+      ]);
+    } catch (timeoutError) {
+      console.error('⚠️  Supabase connection timeout during token verification');
+      console.error('   This might be a network connectivity issue');
+      throw new Error('Unable to verify token: Supabase connection timeout. Please check your network connection.');
+    }
+    
+    const { data: { user }, error } = result;
     
     if (error) {
       throw new Error(`Token verification failed: ${error.message}`);

@@ -28,6 +28,7 @@ const FALLBACK_AUDIO_BUCKET = process.env.AUDIO_FALLBACK_BUCKET || 'agent-files'
 let audioBucketName = process.env.AUDIO_BUCKET || DEFAULT_AUDIO_BUCKET;
 const DEFAULT_AUDIO_SIGNED_URL_TTL = 60 * 60 * 24 * 7; // 7 days
 let audioBucketChecked = false;
+const QR_EXPIRY_MS = 3 * 60 * 1000; // 3 minutes - WhatsApp QR code validity
 
 // SECURITY: Generate unique instance ID for multi-instance prevention
 const os = require('os');
@@ -1385,7 +1386,7 @@ async function initializeWhatsApp(agentId, userId = null) {
     sessionData.heartbeatInterval = heartbeatInterval;
     
     // CRITICAL: Add socket health check to detect premature disconnects
-    const healthCheckInterval = setInterval(() => {
+    const healthCheckInterval = setInterval(async () => {
       const session = activeSessions.get(agentId);
       if (!session) {
         console.log(`[BAILEYS] Health check: Session removed, clearing interval`);
@@ -1403,11 +1404,50 @@ async function initializeWhatsApp(agentId, userId = null) {
       const now = Date.now();
       const socketAge = now - session.socketCreatedAt;
       const timeSinceLastPing = now - session.lastPingAt;
+      const qrAge = session.qrGeneratedAt ? now - session.qrGeneratedAt : null;
       
-      // If socket is alive but not connected for > 90s, log warning
+      // Enhanced diagnostic logging
       if (!session.isConnected && socketAge > 90000) {
-        console.warn(`[BAILEYS] ⚠️ Socket alive for ${Math.round(socketAge/1000)}s but not connected yet`);
-        console.warn(`[BAILEYS] ⚠️ Has QR: ${!!session.qrCode}, QR attempts: ${session.qrAttempts}`);
+        const socketAgeSeconds = Math.round(socketAge/1000);
+        const hasQR = !!session.qrCode;
+        const qrAgeSeconds = qrAge ? Math.round(qrAge/1000) : null;
+        const isQRExpired = qrAge && qrAge > QR_EXPIRY_MS;
+        
+        console.warn(`[BAILEYS] ⚠️ Socket alive for ${socketAgeSeconds}s but not connected yet`);
+        console.warn(`[BAILEYS] ⚠️ Connection State: ${session.connectionState || 'unknown'}`);
+        console.warn(`[BAILEYS] ⚠️ Has QR: ${hasQR}, QR attempts: ${session.qrAttempts || 0}`);
+        
+        if (hasQR && qrAgeSeconds !== null) {
+          if (isQRExpired) {
+            console.warn(`[BAILEYS] ⚠️ QR Code EXPIRED (${qrAgeSeconds}s old, >180s limit)`);
+            console.warn(`[BAILEYS] 💡 Action: QR expired - waiting for new QR from WhatsApp servers...`);
+            console.warn(`[BAILEYS] 💡 If no new QR appears, try disconnecting and reconnecting`);
+          } else {
+            const timeLeft = Math.round((QR_EXPIRY_MS - qrAge) / 1000);
+            console.warn(`[BAILEYS] ⚠️ QR Code age: ${qrAgeSeconds}s (${timeLeft}s remaining before expiry)`);
+            console.warn(`[BAILEYS] 💡 Action: Please scan the QR code within ${timeLeft} seconds`);
+          }
+        } else if (!hasQR) {
+          console.warn(`[BAILEYS] ⚠️ No QR code available`);
+          console.warn(`[BAILEYS] 💡 Action: Waiting for QR code from WhatsApp servers...`);
+          console.warn(`[BAILEYS] 💡 Check network connectivity if QR doesn't appear soon`);
+        }
+        
+        // Check network connectivity if socket is very old
+        if (socketAge > 180000) { // 3 minutes
+          console.warn(`[BAILEYS] ⚠️ Socket has been waiting for ${socketAgeSeconds}s - checking network...`);
+          try {
+            const networkOk = await checkNetworkRequirements();
+            if (!networkOk) {
+              console.error(`[BAILEYS] ❌ Network check failed - cannot reach WhatsApp servers`);
+              console.error(`[BAILEYS] 💡 Please check: 1) Internet connection 2) Firewall 3) Proxy settings`);
+            } else {
+              console.log(`[BAILEYS] ✅ Network connectivity OK`);
+            }
+          } catch (networkError) {
+            console.error(`[BAILEYS] ❌ Network check error:`, networkError.message);
+          }
+        }
       }
       
       session.lastPingAt = now;
@@ -1416,6 +1456,7 @@ async function initializeWhatsApp(agentId, userId = null) {
       // Stop health check after 5 minutes (socket should be connected or closed by then)
       if (socketAge > 300000) {
         console.log(`[BAILEYS] Health check: Socket > 5min old, stopping health checks`);
+        console.log(`[BAILEYS] 💡 Consider disconnecting and reconnecting if connection is still pending`);
         clearInterval(healthCheckInterval);
       }
     }, 30000); // Check every 30 seconds
@@ -1455,10 +1496,18 @@ async function initializeWhatsApp(agentId, userId = null) {
         console.log(`[BAILEYS] 🎯 Socket age: ${session ? Math.round((Date.now() - session.socketCreatedAt)/1000) : 0}s`);
         
         const existingQR = qrGenerationTracker.get(agentId);
+        const QR_COOLDOWN_MS = 120000; // 2 minutes - prevent too frequent QR generation
         
-        if (existingQR && (Date.now() - existingQR) < 120000) {
-          console.log(`[BAILEYS] ⏭️ Ignoring new QR - existing valid (${Math.round((Date.now() - existingQR)/1000)}s old)`);
+        if (existingQR && (Date.now() - existingQR) < QR_COOLDOWN_MS) {
+          const qrAge = Math.round((Date.now() - existingQR)/1000);
+          console.log(`[BAILEYS] ⏭️ Ignoring new QR - existing valid (${qrAge}s old, cooldown: ${Math.round(QR_COOLDOWN_MS/1000)}s)`);
           return;
+        }
+        
+        // If existing QR is expired (>3 minutes), allow new QR generation
+        if (existingQR && (Date.now() - existingQR) > QR_EXPIRY_MS) {
+          console.log(`[BAILEYS] 🔄 Existing QR expired (${Math.round((Date.now() - existingQR)/1000)}s old), generating new QR...`);
+          qrGenerationTracker.delete(agentId); // Clear expired QR tracker
         }
         
         console.log(`[BAILEYS] ✅ NEW QR CODE - Saving to database and memory (generated at ${new Date().toISOString()})`);

@@ -31,8 +31,29 @@ router.post('/session', async (req, res) => {
       });
     }
 
-    // Verify token with Supabase
-    const { data: { user }, error } = await supabaseAdmin.auth.getUser(access_token);
+    // Verify token with Supabase (with timeout handling)
+    let user, error;
+    try {
+      const result = await Promise.race([
+        supabaseAdmin.auth.getUser(access_token),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Supabase connection timeout')), 25000)
+        )
+      ]);
+      user = result.data?.user;
+      error = result.error;
+    } catch (timeoutError) {
+      console.error('❌ Supabase connection timeout:', timeoutError.message);
+      console.error('⚠️  This might be a network connectivity issue. Check:');
+      console.error('   1. Internet connection');
+      console.error('   2. Firewall settings');
+      console.error('   3. Supabase URL is correct:', process.env.SUPABASE_URL);
+      return res.status(503).json({ 
+        error: 'Service unavailable',
+        message: 'Unable to connect to Supabase. Please check your network connection.',
+        retryable: true
+      });
+    }
 
     if (error || !user) {
       console.error('❌ Token verification failed:', error?.message);

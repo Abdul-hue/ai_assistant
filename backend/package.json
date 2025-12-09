@@ -31,9 +31,18 @@
     "express": "^4.21.2",
     "express-rate-limit": "^8.1.0",
     "googleapis": "^166.0.0",
+<<<<<<< HEAD
     "jsonwebtoken": "^9.0.0",
     "mammoth": "^1.6.0",
     "multer": "^1.4.5-lts.1",
+=======
+    "imap-simple": "^5.1.0",
+    "jsonwebtoken": "^9.0.0",
+    "mailparser": "^3.9.0",
+    "mammoth": "^1.6.0",
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^7.0.11",
+>>>>>>> 71f3b5e (push latest changes)
     "pdf-parse": "^1.1.1",
     "pg": "^8.16.3",
     "pino": "^8.21.0",

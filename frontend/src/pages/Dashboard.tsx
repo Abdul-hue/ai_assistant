@@ -1,10 +1,14 @@
 import { useEffect, useState } from "react";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useNavigate, useLocation, useSearchParams } from "react-router-dom";
 import { formatDistanceToNow } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+<<<<<<< HEAD
 import { Plus, Bot, MessageSquare, Loader2, Calendar as CalendarIcon, Eye, Users, Trash2, LayoutDashboard, Settings, Home, RefreshCw, AlertCircle, Globe, Clock, User, Mail, Menu, X } from "lucide-react";
+=======
+import { Plus, Bot, MessageSquare, Loader2, Calendar as CalendarIcon, Eye, Users, Trash2, LayoutDashboard, Settings, Home, RefreshCw, AlertCircle, Globe, Clock, User, Mail, Key } from "lucide-react";
+>>>>>>> 71f3b5e (push latest changes)
 import { useToast } from "@/hooks/use-toast";
 import AgentDetailsModal from "@/components/AgentDetailsModal";
 import ContactsManagementDialog from "@/components/agents/ContactsManagementDialog";
@@ -44,6 +48,8 @@ const ContactCountBadge = ({ agentId }: { agentId: string }) => {
 
 const Dashboard = () => {
   const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
   const { toast } = useToast();
   const { user } = useAuth();
   const { data: dashboardStats, isLoading: statsLoading, error: statsError, refetch: refetchStats } = useDashboardStats();
@@ -91,9 +97,40 @@ const Dashboard = () => {
     }
   }, [agents, refetchStats]);
 
+<<<<<<< HEAD
   // Show error toast if agents fail to load
   useEffect(() => {
     if (agentsError) {
+=======
+  // Gmail functionality removed - using IMAP/SMTP only
+
+  const checkAuth = async () => {
+    try {
+      setIsLoading(true);
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) {
+        navigate("/auth");
+        return;
+      }
+      setUser(session.user);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const fetchAgents = async () => {
+    try {
+      const { data, error } = await supabase
+        .from("agents")
+        .select("*")
+        .order("created_at", { ascending: false });
+
+      if (error) throw error;
+      setAgents(data || []);
+      // Refetch dashboard stats after agents are loaded to ensure counts are up to date
+      refetchStats();
+    } catch (error: any) {
+>>>>>>> 71f3b5e (push latest changes)
       toast({
         variant: "destructive",
         title: "Error loading agents",
@@ -102,8 +139,7 @@ const Dashboard = () => {
     }
   }, [agentsError, toast]);
 
-  const location = useLocation();
-  const isActive = (path: string) => location.pathname === path;
+  const isActive = (path: string) => location?.pathname === path;
 
   return (
     <div className="min-h-screen bg-black flex">
@@ -165,6 +201,7 @@ const Dashboard = () => {
           <Button
             variant="ghost"
             className={`w-full justify-start gap-3 hover:bg-white/10 transition-all duration-300 ${
+<<<<<<< HEAD
               gmailModalOpen ? "bg-primary/20 text-primary border-l-2 border-primary" : "text-gray-400"
             }`}
             onClick={() => setGmailModalOpen(true)}
@@ -181,6 +218,14 @@ const Dashboard = () => {
           >
             <Mail className="h-5 w-5" />
             Outlook
+=======
+              isActive("/email-integration") ? "bg-primary/20 text-primary border-l-2 border-primary" : "text-gray-400"
+            }`}
+            onClick={() => navigate("/email-integration")}
+          >
+            <Key className="h-5 w-5" />
+            Email Account Integration
+>>>>>>> 71f3b5e (push latest changes)
           </Button>
           <Button
             variant="ghost"
@@ -509,11 +554,14 @@ const Dashboard = () => {
         agentId={selectedAgentId}
       />
       
+<<<<<<< HEAD
       {/* Gmail Modal */}
       <GmailModal
         open={gmailModalOpen}
         onOpenChange={setGmailModalOpen}
       />
+=======
+>>>>>>> 71f3b5e (push latest changes)
     </div>
   );
 };
