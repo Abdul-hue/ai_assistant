@@ -11,6 +11,12 @@ const { connectToImap: connectToImapUtil } = require('../utils/connectToImap');
 const imaps = require('imap-simple');
 const { simpleParser } = require('mailparser');
 const { callEmailWebhook } = require('../utils/emailWebhook');
+const { retryWithBackoff, isThrottlingError, sleep } = require('../utils/imapRetry');
+const connectionPool = require('../utils/imapConnectionPool');
+
+// Batch processing configuration
+const BATCH_SIZE = 50; // Process 50 emails at a time
+const BATCH_DELAY = 1000; // 1 second delay between batches
 
 // ============================================
 // SYNC STATE MANAGEMENT
@@ -111,19 +117,51 @@ async function connectToImap(account) {
  */
 async function parseEmailFromImap(mail, uid, folder) {
   try {
-    let from = mail.headers.get('from') || '';
-    let to = mail.headers.get('to') || '';
-    let subject = mail.headers.get('subject') || '[No Subject]';
-    let date = mail.headers.get('date') || new Date().toISOString();
+    // mailparser returns from/to as objects with text and value properties
+    const fromObj = mail.from || mail.headers.get('from') || {};
+    const toObj = mail.to || mail.headers.get('to') || {};
+    const subject = mail.subject || mail.headers.get('subject') || '[No Subject]';
+    const date = mail.date || mail.headers.get('date') || new Date().toISOString();
 
-    // Parse sender name and email
-    const fromMatch = from.match(/"?([^"<]*)"?\s*<([^>]+)>/);
-    const senderName = fromMatch ? fromMatch[1].trim() : from.split('@')[0];
-    const senderEmail = fromMatch ? fromMatch[2] : from;
+    // Get from text (string representation) or use value array
+    // Ensure fromText is always a string
+    let fromText = '';
+    let fromValue = [];
+    
+    if (typeof fromObj === 'string') {
+      fromText = fromObj;
+    } else if (fromObj && typeof fromObj === 'object') {
+      fromText = fromObj.text || '';
+      fromValue = fromObj.value || [];
+    } else {
+      fromText = String(fromObj || '');
+    }
 
-    // Parse recipient
-    const toMatch = to.match(/"?([^"<]*)"?\s*<([^>]+)>/);
-    const recipientEmail = toMatch ? toMatch[2] : to.split(',')[0];
+    // Parse sender name and email - ensure fromText is string before calling match
+    const fromMatch = fromText && typeof fromText === 'string' ? fromText.match(/"?([^"<]*)"?\s*<([^>]+)>/) : null;
+    const senderName = fromMatch ? fromMatch[1].trim() : 
+                      (fromValue?.[0]?.name || (fromText ? String(fromText).split('@')[0] : '') || 'Unknown');
+    const senderEmail = fromMatch ? fromMatch[2] : 
+                        (fromValue?.[0]?.address || fromText || '');
+
+    // Get to text (string representation) or use value array
+    // Ensure toText is always a string
+    let toText = '';
+    let toValue = [];
+    
+    if (typeof toObj === 'string') {
+      toText = toObj;
+    } else if (toObj && typeof toObj === 'object') {
+      toText = toObj.text || '';
+      toValue = toObj.value || [];
+    } else {
+      toText = String(toObj || '');
+    }
+
+    // Parse recipient - ensure toText is string before calling match
+    const toMatch = toText && typeof toText === 'string' ? toText.match(/"?([^"<]*)"?\s*<([^>]+)>/) : null;
+    const recipientEmail = toMatch ? toMatch[2] : 
+                          (toValue?.[0]?.address || (toText ? String(toText).split(',')[0] : '') || '');
 
     // Handle plain text and HTML bodies
     let bodyText = '';
@@ -170,49 +208,85 @@ async function parseEmailFromImap(mail, uid, folder) {
 async function saveOrUpdateEmail(accountId, emailData, mailFlags) {
   try {
     const providerId = `${accountId}_${emailData.uid}_${emailData.folder_name}`;
-
-    // Check if email already exists
-    const { data: existing } = await supabaseAdmin
-      .from('emails')
-      .select('id, is_read, is_starred')
-      .eq('email_account_id', accountId)
-      .eq('uid', emailData.uid)
-      .eq('folder_name', emailData.folder_name)
-      .single();
-
     const isRead = mailFlags?.includes('\\Seen') || false;
     const isStarred = mailFlags?.includes('\\Flagged') || false;
 
-    if (existing) {
-      // Update existing email
-      const { error } = await supabaseAdmin
-        .from('emails')
-        .update({
-          is_read: isRead,
-          is_starred: isStarred,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', existing.id);
-      if (error) throw error;
-      return { action: 'updated', id: existing.id };
-    } else {
-      // Insert new email
-      const { data: newEmail, error } = await supabaseAdmin
-        .from('emails')
-        .insert({
-          email_account_id: accountId,
-          provider_message_id: providerId,
-          ...emailData,
-          is_read: isRead,
-          is_starred: isStarred,
-          is_deleted: false,
-        })
-        .select()
-        .single();
-      if (error) throw error;
-      return { action: 'inserted', id: newEmail.id };
+    // ✅ USE UPSERT with correct constraint (prevents duplicates from competing syncs)
+    const { data: savedEmail, error: upsertError } = await supabaseAdmin
+      .from('emails')
+      .upsert({
+        email_account_id: accountId,
+        provider_message_id: providerId,
+        uid: emailData.uid,
+        sender_email: emailData.sender_email || emailData.from || '',
+        sender_name: emailData.sender_name || emailData.fromName || '',
+        recipient_email: emailData.recipient_email || emailData.to || '',
+        subject: emailData.subject || '[No Subject]',
+        body_text: emailData.body_text || emailData.body || '',
+        body_html: emailData.body_html || emailData.bodyHtml || '',
+        received_at: emailData.received_at || emailData.date || new Date().toISOString(),
+        folder_name: emailData.folder_name || 'INBOX',
+        is_read: isRead,
+        is_starred: isStarred,
+        is_deleted: false,
+        attachments_count: emailData.attachments_count || emailData.attachments?.length || 0,
+        attachments_meta: emailData.attachments_meta || emailData.attachments || [],
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'email_account_id,provider_message_id', // ✅ Correct constraint
+        ignoreDuplicates: false // Update if exists
+      })
+      .select()
+      .single();
+
+    // ✅ Only throw on real errors (not duplicate key errors)
+    if (upsertError) {
+      // Suppress duplicate key errors (code 23505) - they're expected when multiple syncs run
+      if (upsertError.code === '23505' || upsertError.message?.includes('duplicate key')) {
+        // Email already exists, try to get it and return updated
+        const { data: existing } = await supabaseAdmin
+          .from('emails')
+          .select('id')
+          .eq('email_account_id', accountId)
+          .eq('provider_message_id', providerId)
+          .single();
+        
+        if (existing) {
+          // Update flags
+          await supabaseAdmin
+            .from('emails')
+            .update({
+              is_read: isRead,
+              is_starred: isStarred,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', existing.id);
+          
+          return { action: 'updated', id: existing.id };
+        }
+        // If we can't find it, treat as inserted (race condition resolved)
+        return { action: 'inserted', id: null };
+      }
+      // Real error - throw it
+      throw upsertError;
     }
+
+    // Check if this was an insert or update by checking if email was just created
+    // (We can't easily tell from upsert, so we'll assume it was an update if we got here)
+    // Actually, let's check if the email existed before by looking at created_at vs updated_at
+    const wasInserted = savedEmail?.created_at === savedEmail?.updated_at || 
+                        (savedEmail?.created_at && new Date(savedEmail.created_at).getTime() > Date.now() - 1000);
+    
+    return { 
+      action: wasInserted ? 'inserted' : 'updated', 
+      id: savedEmail?.id 
+    };
   } catch (error) {
+    // ✅ Suppress duplicate key errors in logs
+    if (error.code === '23505' || error.message?.includes('duplicate key')) {
+      // Silently handle duplicates - they're expected
+      return { action: 'updated', id: null };
+    }
     console.error('Error saving email:', error);
     throw error;
   }
@@ -238,28 +312,58 @@ async function syncFolder(connection, accountId, folderName) {
     const syncState = await getSyncState(accountId, folderName);
     const lastSyncUid = syncState.last_uid_synced || 0;
 
-    // Open the folder
-    const box = await connection.openBox(folderName, false);
+    // Open the folder with retry
+    const box = await retryWithBackoff(
+      async () => {
+        try {
+          return await connection.openBox(folderName, false);
+        } catch (error) {
+          // Handle folder not found errors gracefully
+          if (error.textCode === 'NONEXISTENT' || error.message?.includes('Unknown Mailbox')) {
+            console.warn(`[SYNC] Folder ${folderName} does not exist, skipping`);
+            throw new Error(`Folder ${folderName} does not exist`);
+          }
+          throw error;
+        }
+      },
+      {
+        maxRetries: 3,
+        baseDelay: 2000,
+        maxDelay: 30000,
+        operationName: `Opening folder ${folderName}`
+      }
+    );
+    
     console.log(`[SYNC] Opened folder ${folderName}, total messages: ${box.messages.total}`);
 
-    // Build search range for only new messages
-    let searchCriteria;
-    if (lastSyncUid > 0) {
-      // Incremental sync: fetch only new UIDs
-      searchCriteria = ['UID', `${lastSyncUid + 1}:*`];
-    } else {
-      // First sync: fetch all
-      searchCriteria = ['ALL'];
-    }
-
-    // Search for messages with fetch options - imap-simple combines search + fetch
+    // imap-simple doesn't support UID range searches, so we fetch all and filter client-side
+    // This is less efficient but works reliably
     const fetchOptions = {
       bodies: '',
       struct: true,
       markSeen: false
     };
 
-    const messages = await connection.search(searchCriteria, fetchOptions);
+    // Search for all messages with retry for throttling
+    const allMessages = await retryWithBackoff(
+      async () => {
+        return await connection.search(['ALL'], fetchOptions);
+      },
+      {
+        maxRetries: 5,
+        baseDelay: 3000,
+        maxDelay: 60000,
+        operationName: `Searching messages in ${folderName}`
+      }
+    );
+
+    // Filter to only new messages (UID > lastSyncUid)
+    const messages = lastSyncUid > 0
+      ? allMessages.filter(msg => {
+          const uid = parseInt(msg.attributes.uid);
+          return uid > lastSyncUid;
+        })
+      : allMessages;
 
     if (messages.length === 0) {
       console.log(`[SYNC] No new messages in ${folderName}`);
@@ -269,8 +373,28 @@ async function syncFolder(connection, accountId, folderName) {
 
     console.log(`[SYNC] Found ${messages.length} new messages in ${folderName}`);
 
-    // Process each message
-    for (const msg of messages) {
+    // Process messages in batches to avoid overwhelming Gmail
+    const batches = [];
+    for (let i = 0; i < messages.length; i += BATCH_SIZE) {
+      batches.push(messages.slice(i, i + BATCH_SIZE));
+    }
+
+    console.log(`[SYNC] Processing ${messages.length} messages in ${batches.length} batches of ${BATCH_SIZE}`);
+
+    // Process each batch with delay between batches
+    for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+      const batch = batches[batchIndex];
+      
+      // Add delay between batches (except first batch)
+      if (batchIndex > 0) {
+        console.log(`[SYNC] Waiting ${BATCH_DELAY}ms before processing batch ${batchIndex + 1}/${batches.length}...`);
+        await sleep(BATCH_DELAY);
+      }
+
+      console.log(`[SYNC] Processing batch ${batchIndex + 1}/${batches.length} (${batch.length} messages)`);
+
+      // Process messages in current batch
+      for (const msg of batch) {
       try {
         emailsFetched++;
 
@@ -323,8 +447,17 @@ async function syncFolder(connection, accountId, folderName) {
           syncState.last_uid_synced = numericUid;
         }
       } catch (error) {
-        console.error(`Error processing message UID ${numericUid}:`, error.message);
+          // Handle throttling in batch processing
+          if (isThrottlingError(error)) {
+            console.warn(`[SYNC] Throttling detected in batch ${batchIndex + 1}, waiting before continuing...`);
+            await sleep(5000); // Wait 5 seconds on throttling
+            errorsCount++;
+            continue;
+          }
+          
+          console.error(`[SYNC] Error processing message UID ${numericUid}:`, error.message);
         errorsCount++;
+        }
       }
     }
 
@@ -336,8 +469,35 @@ async function syncFolder(connection, accountId, folderName) {
     console.log(`[SYNC] Completed ${folderName}: Fetched: ${emailsFetched}, Saved: ${emailsSaved}, Updated: ${emailsUpdated}, Errors: ${errorsCount}, Duration: ${duration}ms`);
     return { emailsFetched, emailsSaved, emailsUpdated, errorsCount, duration };
   } catch (error) {
-    console.error(`Error syncing folder ${folderName}:`, error);
-    throw error;
+    // Handle throttling errors gracefully - don't crash the process
+    if (isThrottlingError(error)) {
+      console.error(`[SYNC] Throttling error syncing folder ${folderName}:`, error.message);
+      // Return partial results instead of throwing
+      return { 
+        emailsFetched, 
+        emailsSaved, 
+        emailsUpdated, 
+        errorsCount: errorsCount + 1,
+        throttled: true 
+      };
+    }
+    
+    // Handle folder not found errors gracefully
+    if (error.message?.includes('does not exist') || 
+        error.textCode === 'NONEXISTENT') {
+      console.warn(`[SYNC] Folder ${folderName} not found, skipping`);
+      return { emailsFetched: 0, emailsSaved: 0, emailsUpdated: 0, errorsCount: 0 };
+    }
+    
+    console.error(`[SYNC] Error syncing folder ${folderName}:`, error);
+    // Don't throw - return error state instead to prevent process crash
+    return { 
+      emailsFetched, 
+      emailsSaved, 
+      emailsUpdated, 
+      errorsCount: errorsCount + 1,
+      error: error.message 
+    };
   }
 }
 
@@ -443,7 +603,7 @@ async function syncAllImapAccounts() {
   try {
     console.log('[SYNC] Starting global sync of all IMAP accounts');
 
-    // Get all active IMAP/SMTP accounts
+    // ✅ CRITICAL: Get all active IMAP/SMTP accounts with validation
     const { data: accounts, error } = await supabaseAdmin
       .from('email_accounts')
       .select('*')
@@ -452,7 +612,10 @@ async function syncAllImapAccounts() {
       .not('imap_host', 'is', null)
       .not('imap_username', 'is', null);
 
-    if (error) throw error;
+    if (error) {
+      console.error('[SYNC] ❌ Error fetching accounts:', error.message);
+      throw error;
+    }
 
     if (!accounts || accounts.length === 0) {
       console.log('[SYNC] No active IMAP/SMTP accounts found');
@@ -461,46 +624,198 @@ async function syncAllImapAccounts() {
 
     console.log(`[SYNC] Found ${accounts.length} active accounts`);
 
-    for (const account of accounts) {
+    // ✅ Validate each account before processing
+    const validAccounts = accounts.filter(account => {
+      if (!account.id) {
+        console.warn(`[SYNC] ⚠️  Skipping account with missing ID: ${account.email || 'unknown'}`);
+        return false;
+      }
+      if (!account.imap_host || !account.imap_username) {
+        console.warn(`[SYNC] ⚠️  Skipping account ${account.email || account.id} - missing IMAP settings`);
+        return false;
+      }
+      // ✅ CRITICAL: Skip accounts that need reconnection (prevents rate limiting)
+      if (account.needs_reconnection) {
+        console.log(`[SYNC] ⏭️  Skipping account ${account.email || account.id} - needs reconnection`);
+        return false;
+      }
+      return true;
+    });
+
+    if (validAccounts.length === 0) {
+      console.log('[SYNC] No valid accounts to sync');
+      return;
+    }
+
+    console.log(`[SYNC] Processing ${validAccounts.length} valid accounts (${accounts.length - validAccounts.length} skipped)`);
+
+    for (const account of validAccounts) {
       const accountSyncStart = Date.now();
+      
+      // ✅ CRITICAL: Re-validate account exists before processing (prevent race conditions)
+      const { data: revalidatedAccount, error: revalidateError } = await supabaseAdmin
+        .from('email_accounts')
+        .select('*')
+        .eq('id', account.id)
+        .eq('is_active', true)
+        .single();
+
+      if (revalidateError || !revalidatedAccount) {
+        console.warn(`[SYNC] ⚠️  Account ${account.id} (${account.email || 'unknown'}) was deleted or deactivated during sync. Skipping.`);
+        continue;
+      }
+
+      // Use revalidated account data
+      const activeAccount = revalidatedAccount;
+      
+      // Check if this is the first sync for this account
+      const isInitialSync = !activeAccount.initial_sync_completed;
+      if (isInitialSync) {
+        console.log(`[SYNC] 🔄 Starting initial sync for account ${activeAccount.id} (${activeAccount.email})`);
+      }
+      
       try {
         // Update account sync status
         await supabaseAdmin
           .from('email_accounts')
           .update({ sync_status: 'syncing' })
-          .eq('id', account.id);
+          .eq('id', activeAccount.id);
 
-        // Connect to IMAP
-        const connection = await connectToImap(account);
+        // ✅ CRITICAL: Double-check needs_reconnection before connecting (prevent rate limiting)
+        if (activeAccount.needs_reconnection) {
+          console.log(`[SYNC] ⏭️  Skipping sync for ${activeAccount.email} - account needs reconnection`);
+          continue;
+        }
+
+        // Connect to IMAP using connection pool (limits concurrent connections)
+        let connection;
+        try {
+          connection = await connectionPool.getConnection(
+            activeAccount.id,
+            async () => {
+              console.log(`[SYNC] Creating new IMAP connection for account ${activeAccount.email}`);
+              return await connectToImap(activeAccount);
+            }
+          );
+        } catch (connectError) {
+          // ✅ Handle "Connection ended unexpectedly" - likely rate limiting
+          if (connectError.message?.includes('Connection ended unexpectedly') || 
+              connectError.message?.includes('ended unexpectedly')) {
+            console.error(`[SYNC] ❌ Connection ended unexpectedly for ${activeAccount.email}. Likely rate limiting. Marking as needs_reconnection.`);
+            await supabaseAdmin
+              .from('email_accounts')
+              .update({
+                needs_reconnection: true,
+                last_error: `Connection ended unexpectedly - possible rate limiting. Please wait and reconnect.`,
+                last_connection_attempt: new Date().toISOString()
+              })
+              .eq('id', activeAccount.id);
+            continue; // Skip this account
+          }
+          throw connectError; // Re-throw other errors
+        }
 
         // Sync all folders
-        const syncResults = await syncAccountFolders(connection, account);
+        const syncResults = await syncAccountFolders(connection, activeAccount);
 
         // Update account after successful sync
-        await supabaseAdmin
-          .from('email_accounts')
-          .update({
-            sync_status: 'idle',
-            last_successful_sync_at: new Date().toISOString(),
-            sync_error_details: null,
-          })
-          .eq('id', account.id);
+        const updateData = {
+          sync_status: 'idle',
+          last_successful_sync_at: new Date().toISOString(),
+          sync_error_details: null,
+        };
 
-        // Close connection
-        connection.end();
+        // CRITICAL: Mark initial sync as completed after first successful sync
+        // Use conditional update to prevent race conditions (only update if still FALSE)
+        if (isInitialSync) {
+          updateData.initial_sync_completed = true;
+          updateData.webhook_enabled_at = new Date().toISOString();
+        }
+
+        try {
+          let updateQuery = supabaseAdmin
+            .from('email_accounts')
+            .update(updateData)
+            .eq('id', activeAccount.id);
+
+          // For initial sync, use conditional update to prevent race conditions
+          if (isInitialSync) {
+            updateQuery = updateQuery.eq('initial_sync_completed', false); // Only update if still FALSE (atomic check-and-set)
+          }
+
+          const { error: updateError } = await updateQuery;
+
+          if (updateError) {
+            console.error(`[SYNC] ❌ Error updating account sync status for account ${activeAccount.id}:`, updateError.message);
+          } else {
+            if (isInitialSync) {
+              console.log(`[SYNC] ✅ Initial sync completed for account ${activeAccount.id} (${activeAccount.email})`);
+              console.log(`[SYNC] ✅ Webhooks enabled - future emails will trigger webhooks`);
+            }
+          }
+        } catch (updateError) {
+          console.error(`[SYNC] ❌ Error updating account sync status:`, updateError.message);
+          // Continue - don't fail the whole sync
+        }
+
+        // Release connection back to pool (don't close, allow reuse)
+        connectionPool.releaseConnection(activeAccount.id, connection, false);
 
         const accountDuration = Date.now() - accountSyncStart;
-        console.log(`[SYNC] Account ${account.email} sync completed in ${accountDuration}ms:`, syncResults);
+        console.log(`[SYNC] Account ${activeAccount.email} sync completed in ${accountDuration}ms:`, syncResults);
       } catch (accountError) {
-        console.error(`[SYNC] Error syncing account ${account.email}:`, accountError.message);
-        // Update account error status
+        console.error(`[SYNC] Error syncing account ${activeAccount.email || activeAccount.id}:`, accountError.message);
+        
+        // ✅ Handle "Connection ended unexpectedly" - likely rate limiting
+        if (accountError.message?.includes('Connection ended unexpectedly') || 
+            accountError.message?.includes('ended unexpectedly')) {
+          console.error(`[SYNC] ❌ Connection ended unexpectedly for ${activeAccount.email}. Likely rate limiting. Marking as needs_reconnection.`);
+          await supabaseAdmin
+            .from('email_accounts')
+            .update({
+              needs_reconnection: true,
+              sync_status: 'error',
+              sync_error_details: 'Connection ended unexpectedly - possible rate limiting. Please wait and reconnect.',
+              last_error: `Connection ended unexpectedly - possible rate limiting`,
+              last_connection_attempt: new Date().toISOString(),
+            })
+            .eq('id', activeAccount.id);
+          continue; // Skip to next account
+        }
+        
+        // Handle throttling errors gracefully
+        if (isThrottlingError(accountError)) {
+          console.warn(`[SYNC] Account ${activeAccount.email || activeAccount.id} throttled, will retry on next sync cycle`);
+          // Don't mark as error for throttling - it's temporary
+          await supabaseAdmin
+            .from('email_accounts')
+            .update({
+              sync_status: 'throttled',
+              sync_error_details: 'Gmail rate limit exceeded. Will retry automatically.',
+              last_sync_attempt_at: new Date().toISOString(),
+            })
+            .eq('id', activeAccount.id);
+        } else {
+          // Update account error status for non-throttling errors
         await supabaseAdmin
           .from('email_accounts')
           .update({
             sync_status: 'error',
             sync_error_details: accountError.message.substring(0, 500),
+              last_sync_attempt_at: new Date().toISOString(),
           })
-          .eq('id', account.id);
+          .eq('id', activeAccount.id);
+        }
+        
+        // Ensure connection is released even on error
+        try {
+          const connection = await connectionPool.connections.get(activeAccount.id);
+          if (connection && connection.length > 0) {
+            connectionPool.releaseConnection(activeAccount.id, connection[0], true);
+          }
+        } catch (e) {
+          // Ignore cleanup errors
+        }
       }
     }
 

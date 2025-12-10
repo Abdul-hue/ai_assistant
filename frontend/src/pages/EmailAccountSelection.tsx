@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/hooks/use-toast";
 import {
   Mail,
@@ -11,6 +12,7 @@ import {
   Key,
   Settings,
   Trash2,
+  AlertCircle,
 } from "lucide-react";
 import {
   getImapSmtpAccounts,
@@ -35,6 +37,8 @@ interface EmailAccount {
   provider: string;
   type: 'imap';
   isActive: boolean;
+  needsReconnection?: boolean;
+  lastError?: string | null;
 }
 
 const EmailAccountSelection = () => {
@@ -67,8 +71,17 @@ const EmailAccountSelection = () => {
               provider: acc.provider || 'custom',
               type: 'imap',
               isActive: acc.is_active,
+              needsReconnection: acc.needs_reconnection || false,
+              lastError: acc.last_error || null,
             });
           });
+        
+        // ✅ Sort accounts: working ones first, broken ones last
+        allAccounts.sort((a, b) => {
+          if (a.needsReconnection && !b.needsReconnection) return 1;
+          if (!a.needsReconnection && b.needsReconnection) return -1;
+          return 0;
+        });
       } catch (error) {
         console.error("Error loading IMAP accounts:", error);
       }
@@ -203,13 +216,17 @@ const EmailAccountSelection = () => {
         {accounts.map((account) => (
           <Card
             key={account.id}
-            className="cursor-pointer transition-all hover:shadow-lg hover:scale-[1.02] h-full flex flex-col border-green-500/20 hover:border-green-500"
+            className={`cursor-pointer transition-all hover:shadow-lg hover:scale-[1.02] h-full flex flex-col ${
+              account.needsReconnection 
+                ? 'border-red-500/20 hover:border-red-500' 
+                : 'border-green-500/20 hover:border-green-500'
+            }`}
             onClick={() => handleAccountClick(account)}
           >
             <CardHeader className="flex-shrink-0">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <div className="p-2 rounded-lg bg-green-500/10">
+                  <div className={`p-2 rounded-lg ${account.needsReconnection ? 'bg-red-500/10' : 'bg-green-500/10'}`}>
                     {getProviderIcon(account.provider)}
                   </div>
                   <div>
@@ -221,10 +238,27 @@ const EmailAccountSelection = () => {
                     </CardDescription>
                   </div>
                 </div>
-                <CheckCircle2 className="h-5 w-5 text-green-500 flex-shrink-0" />
+                <div className="flex items-center gap-2">
+                  {account.needsReconnection ? (
+                    <Badge variant="destructive" className="text-xs">
+                      <AlertCircle className="h-3 w-3 mr-1" />
+                      Auth Failed
+                    </Badge>
+                  ) : (
+                    <CheckCircle2 className="h-5 w-5 text-green-500 flex-shrink-0" />
+                  )}
+                </div>
               </div>
             </CardHeader>
             <CardContent className="flex-1 flex flex-col justify-between">
+              {account.needsReconnection && (
+                <div className="mb-3 p-2 bg-red-50 dark:bg-red-950/20 rounded border border-red-200 dark:border-red-800">
+                  <p className="text-xs text-red-600 dark:text-red-400">
+                    <AlertCircle className="h-3 w-3 inline mr-1" />
+                    Authentication failed. Please reconnect this account.
+                  </p>
+                </div>
+              )}
               <div className="space-y-2">
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-muted-foreground">Type:</span>
@@ -234,7 +268,9 @@ const EmailAccountSelection = () => {
                 </div>
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-muted-foreground">Status:</span>
-                  <span className="text-green-500 font-medium">Connected</span>
+                  <span className={account.needsReconnection ? "text-red-500 font-medium" : "text-green-500 font-medium"}>
+                    {account.needsReconnection ? "Auth Failed" : "Connected"}
+                  </span>
                 </div>
               </div>
               <div className="flex gap-2 mt-4">

@@ -40,15 +40,10 @@ const agentFileRoutes = require('./src/routes/agentFileRoutes');
 const contactsRoutes = require('./src/routes/contacts');
 const profileRoutes = require('./src/routes/profile');
 const dashboardRoutes = require('./src/routes/dashboard');
-<<<<<<< HEAD
-const gmailRoutes = require('./src/routes/gmail');
-const emailActionsRoutes = require('./src/routes/emailActions');
-=======
 const imapSmtpRoutes = require('./src/routes/imapSmtp');
 const folderManagementRoutes = require('./src/routes/folderManagement');
 const fetchNewMailRoutes = require('./src/routes/fetchNewMail');
 const { fetchNewUnreadEmailsForAllAccounts } = require('./src/routes/fetchNewMail');
->>>>>>> 71f3b5e (push latest changes)
 
 // ============================================================================
 // ENVIRONMENT VALIDATION
@@ -338,11 +333,7 @@ app.get('/api/health/n8n', async (req, res) => {
 // Auth routes (rate limiting disabled)
 app.use('/api/auth', authRoutes);
 
-<<<<<<< HEAD
-// Gmail routes
-app.use('/api/gmail', gmailRoutes);
-app.use('/api/emails', emailActionsRoutes);
-=======
+
 // IMAP/SMTP routes
 app.use('/api/imap-smtp', imapSmtpRoutes);
 // Folder management routes
@@ -423,7 +414,6 @@ app.get('/api/status/websocket', (req, res) => {
     data: wsManager ? wsManager.getStatus() : {},
   });
 });
->>>>>>> 71f3b5e (push latest changes)
 
 // Other routes
 app.use('/api/migrate', migrateRoutes);
@@ -447,6 +437,179 @@ app.use('/api/webhooks/send-message', webhookSendMessageRoute);
 
 // Document extraction endpoint (used by frontend after file upload)
 app.use('/extract-pdf', extractPdfRoute);
+
+// ============================================================================
+// DEBUG ENDPOINTS
+// ============================================================================
+
+// Debug endpoint: Check startup query results
+app.get('/api/debug/startup-query', async (req, res) => {
+  try {
+    const { data: accounts, error } = await supabaseAdmin
+      .from('email_accounts')
+      .select('*')
+      .eq('is_active', true);
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    const imapAccounts = accounts.filter(account => {
+      return account.imap_host && account.imap_username && !account.needs_reconnection;
+    });
+
+    res.json({
+      success: true,
+      totalFound: accounts?.length || 0,
+      imapAccounts: imapAccounts.length,
+      accounts: accounts.map(a => ({
+        id: a.id,
+        email: a.email,
+        is_active: a.is_active,
+        provider_type: a.provider_type,
+        imap_host: a.imap_host,
+        imap_username: a.imap_username,
+        needs_reconnection: a.needs_reconnection,
+        initial_sync_completed: a.initial_sync_completed
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint: Check database state
+app.get('/api/debug/database-check', async (req, res) => {
+  try {
+    const { data: accounts } = await supabaseAdmin
+      .from('email_accounts')
+      .select('*')
+      .eq('is_active', true);
+
+    const { data: emails } = await supabaseAdmin
+      .from('emails')
+      .select('id, email_account_id, subject, sender_email, received_at, created_at')
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    const { data: syncStates } = await supabaseAdmin
+      .from('email_sync_state')
+      .select('*');
+
+    res.json({
+      success: true,
+      accounts: {
+        count: accounts?.length || 0,
+        data: accounts || []
+      },
+      emails: {
+        count: emails?.length || 0,
+        latest: emails || []
+      },
+      syncStates: {
+        count: syncStates?.length || 0,
+        data: syncStates || []
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint: Force sync an account
+app.post('/api/debug/force-sync/:accountId', async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    const { syncNewEmailsOnly } = require('./src/services/backgroundSyncService');
+    
+    console.log(`🔧 Manual sync triggered for account: ${accountId}`);
+    const count = await syncNewEmailsOnly(accountId, 'INBOX');
+    
+    res.json({
+      success: true,
+      message: `Synced ${count} new emails`,
+      count
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint: Clear needs_reconnection flag
+app.post('/api/debug/clear-reconnection/:accountId', async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    
+    const { error } = await supabaseAdmin
+      .from('email_accounts')
+      .update({
+        needs_reconnection: false,
+        last_error: null,
+        last_successful_sync_at: new Date().toISOString()
+      })
+      .eq('id', accountId);
+    
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    
+    res.json({
+      success: true,
+      message: `Cleared needs_reconnection flag for account ${accountId}`
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Debug endpoint: Test IMAP connection
+app.post('/api/debug/test-connection/:accountId', async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    const { testImapConnection } = require('./src/services/imapSmtpService');
+    const { decryptPassword } = require('./src/utils/encryption');
+    
+    const { data: account, error: accountError } = await supabaseAdmin
+      .from('email_accounts')
+      .select('*')
+      .eq('id', accountId)
+      .single();
+    
+    if (accountError || !account) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+    
+    const password = decryptPassword(account.imap_password);
+    const result = await testImapConnection({
+      username: account.imap_username,
+      password: password,
+      host: account.imap_host,
+      port: account.imap_port || 993,
+      useTls: account.use_ssl !== false
+    });
+    
+    // If connection succeeds, clear needs_reconnection flag
+    if (result.success) {
+      await supabaseAdmin
+        .from('email_accounts')
+        .update({
+          needs_reconnection: false,
+          last_error: null,
+          last_successful_sync_at: new Date().toISOString()
+        })
+        .eq('id', accountId);
+    }
+    
+    res.json({
+      success: result.success,
+      message: result.success ? 'Connection test successful' : result.error,
+      error: result.error,
+      needs_reconnection_cleared: result.success
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // ============================================================================
 // ERROR HANDLERS
@@ -542,8 +705,9 @@ io.on('connection', (socket) => {
     socket.join(requestUserId);
   });
 
-<<<<<<< HEAD
-  // Request initial emails
+  // Gmail socket handlers removed - using IMAP/SMTP only
+  // Request initial emails handler removed
+  /*
   socket.on('get_initial_emails', async (data) => {
     try {
       const requestUserId = data?.userId || userId;
@@ -707,8 +871,10 @@ io.on('connection', (socket) => {
       });
     }
   });
+  */
 
-  // Refresh emails - fetch from Gmail API directly (no cache)
+  // Refresh emails handler removed - using IMAP/SMTP only
+  /*
   socket.on('refresh_emails', async (data) => {
     try {
       const requestUserId = data?.userId || userId;
@@ -835,9 +1001,7 @@ io.on('connection', (socket) => {
       });
     }
   });
-=======
-  // Gmail socket handlers removed - using IMAP/SMTP only
->>>>>>> 71f3b5e (push latest changes)
+  */
 
   socket.on('disconnect', () => {
     console.log(`\n👋 User disconnected: ${socket.id} (${userId || 'unknown'})`);
@@ -869,7 +1033,6 @@ server.listen(PORT, '0.0.0.0', async () => {
       console.log('⚠️  WhatsApp session initialization failed, but server is running');
     }
   }, 3000); // Wait 3 seconds for database to be ready
-<<<<<<< HEAD
   
   // Also call reconnectAllAgents as a backup (handles edge cases)
   setTimeout(async () => {
@@ -893,32 +1056,6 @@ server.listen(PORT, '0.0.0.0', async () => {
     }
   }, 10000); // Start monitoring after 10 seconds
 
-  // Start scheduled email check job (every 15 minutes)
-  const { checkForNewEmailsForAllAccounts } = require('./src/services/gmailWatchService');
-  
-  // Run immediately after 10 seconds (give server time to fully start)
-  setTimeout(async () => {
-    console.log('📧 Starting initial email check...');
-    try {
-      await checkForNewEmailsForAllAccounts();
-    } catch (error) {
-      console.error('Error in initial email check:', error.message);
-    }
-  }, 10000);
-
-  // Then run every 15 minutes (900,000 ms)
-  const EMAIL_CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes
-  setInterval(async () => {
-    try {
-      await checkForNewEmailsForAllAccounts();
-    } catch (error) {
-      console.error('Error in scheduled email check:', error.message);
-    }
-  }, EMAIL_CHECK_INTERVAL);
-
-  console.log(`📧 Scheduled email check: Every 15 minutes`);
-=======
-
   // Import IMAP sync service
   const { syncAllImapAccounts } = require('./src/services/imapEmailSyncService');
 
@@ -929,46 +1066,81 @@ server.listen(PORT, '0.0.0.0', async () => {
   // Initialize IDLE Manager
   idleManager = new ImapIdleManager(wsManager);
   console.log('🔄 ✅ IDLE Manager initialized');
+  
+  // Update exports so other modules can access managers
+  module.exports.idleManager = idleManager;
+  module.exports.wsManager = wsManager;
 
   // Start IDLE monitoring for all active accounts
   setTimeout(async () => {
     try {
-      const { data: accounts } = await supabaseAdmin
+      console.log('[IDLE] 🔍 Fetching accounts for IDLE monitoring...');
+      
+      // ✅ SIMPLIFIED QUERY - fetch all active accounts
+      const { data: accounts, error } = await supabaseAdmin
         .from('email_accounts')
         .select('*')
-        .eq('is_active', true)
-        .or('provider_type.eq.imap_smtp,provider_type.is.null')
-        .not('imap_host', 'is', null);
+        .eq('is_active', true);
+
+      if (error) {
+        console.error('[IDLE] ❌ Error fetching accounts:', error.message);
+        return;
+      }
+
+      console.log(`[IDLE] 📊 Found ${accounts?.length || 0} active accounts`);
 
       if (accounts && accounts.length > 0) {
-        console.log(`[IDLE] Starting IDLE monitoring for ${accounts.length} accounts`);
-        for (const account of accounts) {
+        // Filter for IMAP accounts (more lenient than before)
+        const imapAccounts = accounts.filter(account => {
+          // Must have IMAP credentials
+          if (!account.imap_host || !account.imap_username) {
+            console.log(`[IDLE] ⏭️  Skipping ${account.email || account.id} - no IMAP credentials`);
+            return false;
+          }
+          
+          // Skip if needs reconnection
+          if (account.needs_reconnection) {
+            console.log(`[IDLE] ⏭️  Skipping ${account.email || account.id} - needs reconnection`);
+            return false;
+          }
+          
+          return true;
+        });
+
+        console.log(`[IDLE] ✅ Starting IDLE for ${imapAccounts.length} accounts`);
+        
+        for (const account of imapAccounts) {
           try {
+            console.log(`[IDLE] 🔄 Starting IDLE for ${account.email}...`);
             await idleManager.startIdleMonitoring(account);
+            console.log(`[IDLE] ✅ IDLE started for ${account.email}`);
           } catch (error) {
-            console.error(`[IDLE] Error starting IDLE for account ${account.email}:`, error.message);
+            console.error(`[IDLE] ❌ Failed to start IDLE for ${account.email}:`, error.message);
           }
         }
+      } else {
+        console.log('[IDLE] ⚠️  No active accounts found for IDLE monitoring');
       }
     } catch (error) {
-      console.error('[IDLE] Error initializing IDLE monitoring:', error);
+      console.error('[IDLE] ❌ Error initializing IDLE monitoring:', error);
     }
   }, 5000);
 
-  // Start scheduled email check job (every 10 minutes for faster updates)
+  // Gmail scheduled jobs removed - using IMAP/SMTP only
+  
   // Run immediately after 10 seconds (give server time to fully start)
   setTimeout(async () => {
-      console.log('📧 Starting initial email check (will save new emails instantly to Supabase)...');
-      try {
-        // Check IMAP/SMTP accounts (enhanced UID-based sync)
-        await syncAllImapAccounts();
-        console.log('✅ Initial email check completed');
-      } catch (error) {
-        console.error('❌ Error in initial email check:', error.message);
-      }
+    console.log('📧 Starting initial email check (IMAP/SMTP - will save new emails instantly to Supabase)...');
+    try {
+      // Check IMAP/SMTP accounts (enhanced UID-based sync)
+      await syncAllImapAccounts();
+      console.log('✅ Initial IMAP email check completed');
+    } catch (error) {
+      console.error('❌ Error in initial IMAP email check:', error.message);
+    }
   }, 10000);
 
-  // Then run every 10 minutes (600,000 ms) - faster than before
+  // IMAP/SMTP check - every 10 minutes (600,000 ms) - faster than Gmail
   const EMAIL_CHECK_INTERVAL = 10 * 60 * 1000; // 10 minutes
   const emailCheckInterval = setInterval(async () => {
     try {
@@ -986,16 +1158,22 @@ server.listen(PORT, '0.0.0.0', async () => {
   // Store interval ID for graceful shutdown
   process.emailCheckInterval = emailCheckInterval;
 
-  console.log(`📧 ✅ Scheduled email check configured: Every 10 minutes`);
+  console.log(`📧 ✅ Scheduled email check configured: IMAP/SMTP (every 10 minutes)`);
   console.log(`   📝 New emails will be saved INSTANTLY to Supabase`);
   console.log(`   📡 New emails will be pushed to frontend via WebSocket`);
   console.log(`   🔄 IDLE monitoring enabled for real-time updates`);
 
-  // Start scheduled new unread email fetch job (every 5 seconds)
-  const NEW_MAIL_CHECK_INTERVAL = 60 * 1000; // 1 minute
+  // Start scheduled new unread email fetch job (every 15 minutes)
+  const NEW_MAIL_CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes
   const newMailCheckInterval = setInterval(async () => {
     try {
-      await fetchNewUnreadEmailsForAllAccounts();
+      console.log('\n📬 [SCHEDULED] Starting new unread email check...');
+      const result = await fetchNewUnreadEmailsForAllAccounts();
+      if (result.success) {
+        console.log(`📬 [SCHEDULED] Check completed: ${result.emailsFound} new emails found, ${result.accountsProcessed} accounts processed`);
+      } else {
+        console.error(`📬 [SCHEDULED] Check failed:`, result.error);
+      }
     } catch (error) {
       console.error('❌ Error in scheduled new unread email check:', error.message);
     }
@@ -1004,9 +1182,8 @@ server.listen(PORT, '0.0.0.0', async () => {
   // Store interval ID for graceful shutdown
   process.newMailCheckInterval = newMailCheckInterval;
 
-  console.log(`📬 ✅ Scheduled new unread email check configured: Every 5 seconds`);
-  console.log(`   🔔 New unseen emails will be sent to webhook automatically`);
->>>>>>> 71f3b5e (push latest changes)
+  console.log(`📬 ✅ Scheduled new unread email check configured: Every 15 minutes`);
+  console.log(`   🔔 New unseen emails will be saved to Supabase and sent to webhook automatically`);
 });
 
 // Graceful shutdown
@@ -1060,6 +1237,8 @@ process.on('SIGINT', async () => {
 
 // Export both app and rate limiters
 module.exports = app;
+module.exports.idleManager = idleManager;
+module.exports.wsManager = wsManager;
 module.exports.rateLimiters = {
   whatsappInitLimiter,
   messageSendLimiter

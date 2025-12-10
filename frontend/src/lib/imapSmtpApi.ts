@@ -10,6 +10,9 @@ export interface ImapSmtpAccount {
   auth_method: string;
   is_active: boolean;
   created_at: string;
+  needs_reconnection?: boolean;
+  last_error?: string | null;
+  last_connection_attempt?: string | null;
 }
 
 export interface ImapSmtpEmail {
@@ -17,18 +20,23 @@ export interface ImapSmtpEmail {
   uid: number;
   from: string;
   fromEmail: string;
+  fromName?: string;
   to: string;
+  toEmail?: string;
   subject: string;
   body: string;
-  bodyHtml: string;
+  bodyHtml?: string;
   date: string;
+  timestamp?: number;
   isRead: boolean;
-  attachments: Array<{
+  isStarred?: boolean;
+  attachments?: Array<{
     filename: string;
     contentType: string;
     size: number;
   }>;
-  folder: string;
+  folder?: string;
+  accountId?: string;
 }
 
 export interface ImapSmtpFolder {
@@ -145,25 +153,37 @@ export const getImapSmtpAccounts = async (): Promise<ImapSmtpAccount[]> => {
 
 /**
  * Fetch emails from an IMAP account
+ * ⚡ OPTIMIZED: Uses fast database-first endpoint
  */
 export const fetchImapSmtpEmails = async (
   accountId: string,
   folder: string = 'INBOX',
-  limit: number = 50
+  limit: number = 20
 ): Promise<ImapSmtpEmail[]> => {
   try {
+    console.log(`📧 [API] Fetching emails for account ${accountId}, folder ${folder}, limit ${limit}`);
+    
     const params = new URLSearchParams({
       folder,
       limit: limit.toString(),
     });
 
-    const response = await fetch(`${API_URL}/api/imap-smtp/emails/${accountId}?${params}`, {
+    // ✅ CHANGED: Use /emails-quick endpoint for fast database-first loading
+    const response = await fetch(`${API_URL}/api/imap-smtp/emails-quick/${accountId}?${params}`, {
       credentials: 'include',
     });
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      const errorMessage = errorData.error || errorData.message || 'Failed to fetch emails';
+      const errorText = await response.text();
+      let errorData: any = {};
+      try {
+        errorData = JSON.parse(errorText);
+      } catch {
+        errorData = { error: errorText };
+      }
+      
+      console.error(`❌ [API] HTTP ${response.status}:`, errorData);
+      const errorMessage = errorData.error || errorData.message || `HTTP ${response.status}: ${response.statusText}`;
       const error: any = new Error(errorMessage);
       error.response = response;
       error.isAuthError = errorData.isAuthError || response.status === 401;
@@ -171,9 +191,38 @@ export const fetchImapSmtpEmails = async (
     }
 
     const data = await response.json();
-    return data.emails || [];
+    console.log(`✅ [API] Received ${data.emails?.length || 0} emails from ${data.source || 'unknown'} source`);
+    
+    if (!data.success) {
+      throw new Error(data.error || 'Failed to fetch emails');
+    }
+
+    // Validate response structure
+    if (!Array.isArray(data.emails)) {
+      console.error('❌ [API] Response emails is not an array:', typeof data.emails);
+      console.error('[API] Full response:', data);
+      throw new Error('Invalid response format: emails is not an array');
+    }
+
+    // Validate each email has required fields
+    const validEmails = data.emails.filter((email: any) => {
+      const isValid = email.id && email.uid !== undefined && email.subject !== undefined;
+      if (!isValid) {
+        console.warn('⚠️ [API] Invalid email object:', email);
+      }
+      return isValid;
+    });
+
+    console.log(`✅ [API] Validated ${validEmails.length}/${data.emails.length} emails`);
+    
+    if (data.emails.length > 0 && validEmails.length === 0) {
+      console.error('❌ [API] All emails failed validation');
+      throw new Error('All emails failed validation');
+    }
+
+    return validEmails;
   } catch (error: any) {
-    console.error('Error fetching emails:', error);
+    console.error('❌ [API] Error fetching emails:', error);
     throw error; // Re-throw to allow caller to handle
   }
 };
@@ -357,6 +406,38 @@ export const disconnectImapSmtpAccount = async (
     return {
       success: false,
       error: error.message || 'Failed to disconnect account',
+    };
+  }
+};
+
+/**
+ * Debug endpoint to check database state
+ */
+export const debugAccountState = async (
+  accountId: string
+): Promise<{
+  success: boolean;
+  account?: any;
+  database?: any;
+  syncState?: any[];
+  diagnosis?: string;
+  error?: string;
+}> => {
+  try {
+    const response = await fetch(`${API_URL}/api/imap-smtp/debug/${accountId}`, {
+      credentials: 'include',
+    });
+
+    if (!response.ok) {
+      throw new Error('Failed to fetch debug info');
+    }
+
+    const data = await response.json();
+    return data;
+  } catch (error: any) {
+    return {
+      success: false,
+      error: error.message || 'Failed to fetch debug info',
     };
   }
 };

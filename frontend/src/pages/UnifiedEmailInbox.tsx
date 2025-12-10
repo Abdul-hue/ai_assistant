@@ -39,11 +39,14 @@ import {
   moveImapSmtpEmail,
   getImapSmtpFolders,
   getImapSmtpAccounts,
+  debugAccountState,
   type ImapSmtpEmail,
   type ImapSmtpFolder,
 } from "@/lib/imapSmtpApi";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
+// @ts-ignore - config.js doesn't have type definitions
+import { API_URL } from "../config";
 
 const UnifiedEmailInbox = () => {
   const { accountId } = useParams<{ accountId: string }>();
@@ -64,8 +67,10 @@ const UnifiedEmailInbox = () => {
   const [composeBody, setComposeBody] = useState("");
   const [sending, setSending] = useState(false);
   const [authError, setAuthError] = useState(false);
+  const [showReconnectPrompt, setShowReconnectPrompt] = useState(false);
   const [accountInfo, setAccountInfo] = useState<{ email: string; provider: string } | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
+  const [loadingMessage, setLoadingMessage] = useState<string>('');
 
   useEffect(() => {
     if (!accountId) {
@@ -105,32 +110,192 @@ const UnifiedEmailInbox = () => {
     return () => clearInterval(refreshInterval);
   }, [accountId, currentFolder]);
 
-  const loadImapEmails = async () => {
-    if (!accountId) return;
-
+  // Sync from IMAP and refresh UI
+  const triggerInitialSync = async () => {
+    if (!accountId) {
+      toast({
+        variant: "destructive",
+        title: "Error",
+        description: "No account selected",
+      });
+      return;
+    }
+    
+    setLoading(true);
+    setLoadingMessage('🔄 Syncing emails from IMAP...');
+    
     try {
-      setLoading(true);
-      setAuthError(false);
+      console.log('[UI] 🔄 Starting IMAP sync for:', accountId);
+      console.log(`[UI] Folder: ${currentFolder || 'INBOX'}`);
       
-      // Map the current folder name to actual IMAP folder name
-      // If folders haven't loaded yet, use currentFolder as-is
+      // Map folder name
       const actualFolder = folders.length > 0 
         ? mapFolderNameToImap(currentFolder, folders)
         : currentFolder;
       
-      console.log(`📂 Loading emails from folder: ${actualFolder} (displayed as: ${currentFolder})`);
+      // Trigger IMAP sync - fetch emails and save to database
+      // ✅ Use forceRefresh=true to fetch most recent emails regardless of sync state
+      const response = await fetch(
+        `${API_URL}/api/imap-smtp/emails/${accountId}?folder=${actualFolder || 'INBOX'}&limit=20&headersOnly=false&forceRefresh=true`,
+        {
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const data = await response.json();
       
-      const imapEmails = await fetchImapSmtpEmails(accountId, actualFolder, 50);
+      console.log(`[UI] ✅ Sync completed: ${data.count || data.savedCount || 0} emails synced`);
+      console.log('[UI] Sync mode:', data.mode || 'unknown');
       
-      // Sort emails by date (newest first) - ensure accurate sorting
-      const sortedEmails = [...imapEmails].sort((a, b) => {
-        const dateA = a.date ? new Date(a.date).getTime() : 0;
-        const dateB = b.date ? new Date(b.date).getTime() : 0;
-        return dateB - dateA; // Descending order (newest first)
+      const emailCount = data.savedCount || data.count || data.emails?.length || 0;
+      
+      // Success toast
+      toast({
+        title: "Sync Complete!",
+        description: `Successfully synced ${emailCount} ${emailCount === 1 ? 'email' : 'emails'}!`,
+        duration: 3000,
       });
       
-      setEmails(sortedEmails);
+      // 🎯 CRITICAL: Reload emails from database after sync
+      await loadImapEmails();
+      
     } catch (error: any) {
+      console.error('[UI] ❌ Sync error:', error);
+      
+      toast({
+        variant: "destructive",
+        title: "Sync Failed",
+        description: `Failed to sync emails: ${error.message || 'Unknown error'}`,
+      });
+    } finally {
+      setLoading(false);
+      setLoadingMessage('');
+    }
+  };
+
+  // Load emails from DATABASE (with proper sorting)
+  const loadImapEmails = async () => {
+    if (!accountId) {
+      console.warn('⚠️ [INBOX] No accountId provided');
+      return;
+    }
+
+    try {
+      console.log('[UI] 📖 Loading emails from database for:', accountId);
+      setLoading(true);
+      setAuthError(false);
+      
+      // Map the current folder name to actual IMAP folder name
+      const actualFolder = folders.length > 0 
+        ? mapFolderNameToImap(currentFolder, folders)
+        : currentFolder;
+      
+      console.log(`[UI] 📂 Folder: ${actualFolder} (displayed as: ${currentFolder})`);
+      
+      // Fetch from database (not IMAP) - this is fast!
+      const response = await fetch(
+        `${API_URL}/api/imap-smtp/emails-quick/${accountId}?folder=${actualFolder || 'INBOX'}&limit=50`,
+        {
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error('Failed to load emails');
+      }
+
+      const data = await response.json();
+      
+      if (data.success && data.emails) {
+        // 🎯 CRITICAL: Sort by date descending (newest first)
+        const emailsArray = data.emails as ImapSmtpEmail[];
+        const sortedEmails = emailsArray.sort((a, b) => {
+          const dateA = new Date(a.date || 0).getTime();
+          const dateB = new Date(b.date || 0).getTime();
+          return dateB - dateA; // Newest first
+        });
+        
+        console.log(`[UI] ✅ Loaded ${sortedEmails.length} emails (sorted by date)`);
+        if (sortedEmails.length > 0) {
+          console.log('[UI] 📅 Newest email:', sortedEmails[0]?.subject, sortedEmails[0]?.date);
+        }
+        
+        setEmails(sortedEmails);
+        
+        // Auto-select first email if none selected
+        if (sortedEmails.length > 0 && !selectedEmail) {
+          setSelectedEmail(sortedEmails[0]);
+        }
+        
+        // ✅ IF NO EMAILS, CHECK IF IT'S AN AUTH ERROR BEFORE TRIGGERING SYNC
+        if (sortedEmails.length === 0) {
+          console.warn('⚠️ [INBOX] No emails in database, checking account status...');
+          
+          // Call debug endpoint to check if auth is failing
+          try {
+            const debugResponse = await fetch(`${API_URL}/api/imap-smtp/debug/${accountId}`, {
+              credentials: 'include',
+            });
+            const debugData = await debugResponse.json();
+            
+            // Check if account has auth issues
+            const account = debugData.account;
+            const hasAuthError = account?.last_error?.includes('authentication') ||
+                                account?.last_error?.includes('Not authenticated') ||
+                                account?.last_error?.includes('credentials') ||
+                                account?.last_error?.includes('AUTHENTICATIONFAILED') ||
+                                account?.needs_reconnection === true;
+            
+            if (hasAuthError) {
+              console.error('❌ [INBOX] Authentication error detected!');
+              setAuthError(true);
+              setShowReconnectPrompt(true);
+              
+              toast({
+                variant: "destructive",
+                title: "Authentication Failed",
+                description: "Your email password is incorrect or expired. Please reconnect your account.",
+                duration: 10000,
+              });
+              
+              return; // Don't trigger sync if auth is failing
+            }
+            
+            // Only trigger initial sync if NO auth errors
+            console.log('⚠️ [INBOX] No auth errors detected, triggering initial sync...');
+            
+            toast({
+              title: "First Time Setup",
+              description: "Syncing your emails for the first time. This may take a moment...",
+            });
+            
+            // Trigger initial sync in background
+            setTimeout(() => triggerInitialSync(), 1000);
+            
+          } catch (debugError) {
+            console.error('[INBOX] Error checking account status:', debugError);
+            // If debug check fails, still try initial sync
+            toast({
+              title: "First Time Setup",
+              description: "Syncing your emails for the first time. This may take a moment...",
+            });
+            setTimeout(() => triggerInitialSync(), 1000);
+          }
+        }
+        
+      } else {
+        throw new Error('Invalid response from server');
+      }
+      
+    } catch (error: any) {
+      console.error('❌ [INBOX] Error loading emails:', error);
       const errorMessage = error.message || "Failed to load emails";
       
       // Check for authentication errors
@@ -153,6 +318,7 @@ const UnifiedEmailInbox = () => {
       });
     } finally {
       setLoading(false);
+      console.log('🏁 [INBOX] Email load complete');
     }
   };
 
@@ -534,23 +700,39 @@ const UnifiedEmailInbox = () => {
             >
               <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                console.log('🔄 Manual sync from IMAP triggered');
+                triggerInitialSync();
+              }}
+              disabled={loading}
+              title="Sync emails from IMAP server"
+            >
+              <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
+              Sync from IMAP
+            </Button>
           </div>
 
           {/* Authentication Error Alert */}
-          {authError && (
-            <Alert variant="destructive">
+          {(authError || showReconnectPrompt) && (
+            <Alert variant="destructive" className="mb-4">
               <AlertCircle className="h-4 w-4" />
               <AlertTitle>Authentication Failed</AlertTitle>
               <AlertDescription className="space-y-3">
                 <p>
-                  Invalid credentials detected. Your password may have changed or expired. 
-                  Please reconnect your account with the correct password.
+                  Your email password for <strong>{accountInfo?.email || 'this account'}</strong> is incorrect or has expired.
+                  This usually happens when you change your Gmail password or revoke app access.
                 </p>
                 <div className="flex gap-2">
                   <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => navigate("/email-integration/imap-smtp/connect")}
+                    onClick={() => {
+                      // Navigate to email integration page
+                      navigate("/email-integration");
+                    }}
                   >
                     <Key className="mr-2 h-4 w-4" />
                     Reconnect Account

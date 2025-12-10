@@ -10,6 +10,8 @@ const { decryptPassword } = require('../utils/encryption');
 const imaps = require('imap-simple');
 const { simpleParser } = require('mailparser');
 const axios = require('axios');
+const { retryWithBackoff, isThrottlingError } = require('../utils/imapRetry');
+const connectionPool = require('../utils/imapConnectionPool');
 
 const router = express.Router();
 
@@ -86,10 +88,10 @@ async function saveOrUpdateEmail(accountId, emailData, mailFlags) {
       if (error) throw error;
       return { action: 'updated', id: existing.id };
     } else {
-      // Insert new email
+      // ✅ USE UPSERT with correct constraint (prevents duplicates from competing syncs)
       const { data: newEmail, error } = await supabaseAdmin
         .from('emails')
-        .insert({
+        .upsert({
           email_account_id: accountId,
           provider_message_id: providerId,
           uid: emailData.uid,
@@ -106,10 +108,28 @@ async function saveOrUpdateEmail(accountId, emailData, mailFlags) {
           is_deleted: false,
           attachments_count: emailData.attachments?.length || 0,
           attachments_meta: emailData.attachments || [],
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'email_account_id,provider_message_id', // ✅ Correct constraint
+          ignoreDuplicates: false // Update if exists
         })
         .select()
         .single();
-      if (error) throw error;
+      
+      // ✅ Suppress duplicate key errors (code 23505)
+      if (error) {
+        if (error.code === '23505' || error.message?.includes('duplicate key')) {
+          // Email already exists, return updated
+          const { data: existing } = await supabaseAdmin
+            .from('emails')
+            .select('id')
+            .eq('email_account_id', accountId)
+            .eq('provider_message_id', providerId)
+            .single();
+          return { action: 'updated', id: existing?.id };
+        }
+        throw error;
+      }
       return { action: 'inserted', id: newEmail.id };
     }
   } catch (error) {
@@ -120,9 +140,62 @@ async function saveOrUpdateEmail(accountId, emailData, mailFlags) {
 
 /**
  * Send new unseen email to webhook
+ * Only sends if initial sync is completed and email is newer than webhook_enabled_at
  */
 async function sendEmailToWebhook(emailData, accountId, userId) {
   try {
+    // CRITICAL: Check if initial sync is completed and webhook is enabled
+    const { data: account, error: accountError } = await supabaseAdmin
+      .from('email_accounts')
+      .select('initial_sync_completed, webhook_enabled_at')
+      .eq('id', accountId)
+      .single();
+
+    if (accountError) {
+      console.error(`[WEBHOOK] ❌ Error fetching account sync status:`, accountError.message);
+      // Don't send webhook if we can't verify sync status (fail-safe)
+      return { success: false, reason: 'database_error', error: accountError.message };
+    }
+
+    if (!account) {
+      console.error(`[WEBHOOK] ❌ Account ${accountId} not found`);
+      return { success: false, reason: 'account_not_found' };
+    }
+
+    // Check 1: Initial sync must be completed
+    if (!account.initial_sync_completed) {
+      console.log(`[WEBHOOK] ⏭️  Skipping webhook for UID ${emailData.uid} - Initial sync not completed`);
+      return { success: false, reason: 'initial_sync_not_completed' };
+    }
+
+    // Check 2: Email must be received after webhook was enabled
+    // If webhook_enabled_at is NULL but initial_sync_completed is TRUE, skip webhook (data inconsistency)
+    if (!account.webhook_enabled_at) {
+      console.warn(`[WEBHOOK] ⚠️  Account ${accountId} has initial_sync_completed=TRUE but webhook_enabled_at is NULL. Skipping webhook for safety.`);
+      return { success: false, reason: 'webhook_enabled_at_missing' };
+    }
+
+    // Validate email date exists
+    const emailReceivedAtStr = emailData.date || emailData.received_at;
+    if (!emailReceivedAtStr) {
+      console.warn(`[WEBHOOK] ⚠️  Email UID ${emailData.uid} has no date, skipping webhook`);
+      return { success: false, reason: 'missing_email_date' };
+    }
+
+    const webhookEnabledAt = new Date(account.webhook_enabled_at).getTime();
+    const emailReceivedAt = new Date(emailReceivedAtStr).getTime();
+    
+    // Validate dates are valid
+    if (isNaN(webhookEnabledAt) || isNaN(emailReceivedAt)) {
+      console.error(`[WEBHOOK] ❌ Invalid date format - webhook_enabled_at: ${account.webhook_enabled_at}, email date: ${emailReceivedAtStr}`);
+      return { success: false, reason: 'invalid_date_format' };
+    }
+    
+    if (emailReceivedAt < webhookEnabledAt) {
+      console.log(`[WEBHOOK] ⏭️  Skipping webhook for UID ${emailData.uid} - Email older than webhook enable time (email: ${new Date(emailReceivedAt).toISOString()}, enabled: ${account.webhook_enabled_at})`);
+      return { success: false, reason: 'email_older_than_webhook_enable' };
+    }
+
     const payload = {
       event: 'new_unseen_email',
       timestamp: new Date().toISOString(),
@@ -178,19 +251,34 @@ router.get('/:accountId', authMiddleware, async (req, res) => {
     const { accountId } = req.params;
     const { folder = 'INBOX', limit = 50 } = req.query;
 
-    // Verify account belongs to user
+    // ✅ CRITICAL: Validate account exists and belongs to user
     const { data: account, error: accountError } = await supabaseAdmin
       .from('email_accounts')
       .select('*')
       .eq('id', accountId)
       .eq('user_id', req.user.id)
+      .eq('is_active', true)
       .single();
 
     if (accountError || !account) {
+      console.error(`[FETCH NEW MAIL] ❌ Account ${accountId} not found, inactive, or doesn't belong to user ${req.user.id}`);
       return res.status(404).json({ 
         success: false,
-        error: 'Email account not found' 
+        error: `Email account ${accountId} not found or inactive. Please reconnect your account.`
       });
+    }
+
+    if (!account.imap_host || !account.imap_username) {
+      return res.status(400).json({
+        success: false,
+        error: `IMAP settings not configured for account ${account.email || accountId}. Please check your account configuration.`
+      });
+    }
+
+    // Check if this is the first sync for this account
+    const isInitialSync = !account.initial_sync_completed;
+    if (isInitialSync) {
+      console.log(`[SYNC] 🔄 Starting initial sync for account ${accountId} (${account.email})`);
     }
 
     if (!account.imap_host || !account.imap_username) {
@@ -206,27 +294,62 @@ router.get('/:accountId', authMiddleware, async (req, res) => {
     // Decrypt password
     const password = decryptPassword(account.imap_password);
 
-    // Connect to IMAP
-    connection = await imaps.connect({
-      imap: {
-        user: account.imap_username,
-        password: password,
-        host: account.imap_host,
-        port: account.imap_port || 993,
-        tls: account.use_ssl !== false,
-        tlsOptions: { rejectUnauthorized: false },
-        authTimeout: 10000,
+    // Connect to IMAP using connection pool with retry
+    connection = await connectionPool.getConnection(
+      account.id,
+      async () => {
+        return await retryWithBackoff(
+          async () => {
+            return await imaps.connect({
+              imap: {
+                user: account.imap_username,
+                password: password,
+                host: account.imap_host,
+                port: account.imap_port || 993,
+                tls: account.use_ssl !== false,
+                tlsOptions: { rejectUnauthorized: false },
+                authTimeout: 10000,
+              }
+            });
+          },
+          {
+            maxRetries: 3,
+            baseDelay: 2000,
+            maxDelay: 30000,
+            operationName: `Connecting to IMAP for ${account.email}`
+          }
+        );
       }
-    });
+    );
 
-    // Open mailbox
-    await connection.openBox(folder);
+    // Open mailbox with retry
+    await retryWithBackoff(
+      async () => {
+        return await connection.openBox(folder);
+      },
+      {
+        maxRetries: 3,
+        baseDelay: 2000,
+        maxDelay: 30000,
+        operationName: `Opening folder ${folder}`
+      }
+    );
 
-    // Search for all UNSEEN (unread) messages
-    const allUnseenMessages = await connection.search(['UNSEEN'], { 
-      bodies: '', 
-      struct: true 
-    });
+    // Search for all UNSEEN (unread) messages with retry
+    const allUnseenMessages = await retryWithBackoff(
+      async () => {
+        return await connection.search(['UNSEEN'], { 
+          bodies: '', 
+          struct: true 
+        });
+      },
+      {
+        maxRetries: 5,
+        baseDelay: 3000,
+        maxDelay: 60000,
+        operationName: `Searching UNSEEN messages in ${folder}`
+      }
+    );
 
     // Filter to only get new unseen emails (UID > last fetched)
     const newUnseenMessages = lastUnreadUidFetched > 0
@@ -337,9 +460,34 @@ router.get('/:accountId', authMiddleware, async (req, res) => {
       return timeB - timeA; // Descending order (newest first)
     });
 
-    // Close connection
+    // CRITICAL: Mark initial sync as completed after first successful fetch
+    // Use conditional update to prevent race conditions (only update if still FALSE)
+    if (isInitialSync) {
+      try {
+        const { error: updateError } = await supabaseAdmin
+          .from('email_accounts')
+          .update({
+            initial_sync_completed: true,
+            webhook_enabled_at: new Date().toISOString()
+          })
+          .eq('id', accountId)
+          .eq('initial_sync_completed', false); // Only update if still FALSE (atomic check-and-set)
+
+        if (updateError) {
+          console.error(`[SYNC] ❌ Error marking initial sync complete for account ${accountId}:`, updateError.message);
+        } else {
+          console.log(`[SYNC] ✅ Initial sync completed for account ${accountId} (${account.email})`);
+          console.log(`[SYNC] ✅ Webhooks enabled - future emails will trigger webhooks`);
+        }
+      } catch (updateError) {
+        console.error(`[SYNC] ❌ Error updating sync status:`, updateError.message);
+        // Don't throw - continue processing
+      }
+    }
+
+    // Release connection back to pool
     if (connection) {
-      connection.end();
+      connectionPool.releaseConnection(account.id, connection, false);
     }
 
     res.json({
@@ -354,13 +502,23 @@ router.get('/:accountId', authMiddleware, async (req, res) => {
       },
     });
   } catch (error) {
-    // Close connection on error
+    // Release connection on error
     if (connection) {
       try {
-        connection.end();
+        connectionPool.releaseConnection(account.id, connection, true);
       } catch (endError) {
         // Ignore errors when closing connection
       }
+    }
+
+    // Handle throttling errors gracefully
+    if (isThrottlingError(error)) {
+      console.error('Error fetching new unread emails (throttled):', error.message);
+      return res.status(429).json({
+        success: false,
+        error: 'Gmail rate limit exceeded. Please try again in a few minutes.',
+        throttled: true
+      });
     }
 
     console.error('Error fetching new unread emails from IMAP:', error);
@@ -424,31 +582,66 @@ router.get('/', authMiddleware, async (req, res) => {
         // Decrypt password
         const password = decryptPassword(account.imap_password);
 
-        // Connect to IMAP
-        const connection = await imaps.connect({
-          imap: {
-            user: account.imap_username,
-            password: password,
-            host: account.imap_host,
-            port: account.imap_port || 993,
-            tls: account.use_ssl !== false,
-            tlsOptions: { rejectUnauthorized: false },
-            authTimeout: 10000,
+        // Connect to IMAP using connection pool with retry
+        const connection = await connectionPool.getConnection(
+          account.id,
+          async () => {
+            return await retryWithBackoff(
+              async () => {
+                return await imaps.connect({
+                  imap: {
+                    user: account.imap_username,
+                    password: password,
+                    host: account.imap_host,
+                    port: account.imap_port || 993,
+                    tls: account.use_ssl !== false,
+                    tlsOptions: { rejectUnauthorized: false },
+                    authTimeout: 10000,
+                  }
+                });
+              },
+              {
+                maxRetries: 3,
+                baseDelay: 2000,
+                maxDelay: 30000,
+                operationName: `Connecting to IMAP for ${account.email}`
+              }
+            );
           }
-        });
+        );
 
         try {
           // Get last fetched unread UID for this account/folder
           const { lastUnreadUidFetched } = await getUnreadFetchState(account.id, folder);
 
-          // Open mailbox
-          await connection.openBox(folder);
+          // Open mailbox with retry
+          await retryWithBackoff(
+            async () => {
+              return await connection.openBox(folder);
+            },
+            {
+              maxRetries: 3,
+              baseDelay: 2000,
+              maxDelay: 30000,
+              operationName: `Opening folder ${folder}`
+            }
+          );
 
-          // Search for all UNSEEN (unread) messages
-          const allUnseenMessages = await connection.search(['UNSEEN'], { 
-            bodies: '', 
-            struct: true 
-          });
+          // Search for all UNSEEN (unread) messages with retry
+          const allUnseenMessages = await retryWithBackoff(
+            async () => {
+              return await connection.search(['UNSEEN'], { 
+                bodies: '', 
+                struct: true 
+              });
+            },
+            {
+              maxRetries: 5,
+              baseDelay: 3000,
+              maxDelay: 60000,
+              operationName: `Searching UNSEEN messages in ${folder}`
+            }
+          );
 
           // Filter to only get new unseen emails (UID > last fetched)
           const newUnseenMessages = lastUnreadUidFetched > 0
@@ -548,7 +741,8 @@ router.get('/', authMiddleware, async (req, res) => {
             }
           }
         } finally {
-          connection.end();
+          // Release connection back to pool
+          connectionPool.releaseConnection(account.id, connection, false);
         }
       } catch (accountError) {
         console.error(`Error fetching emails from account ${account.email}:`, accountError.message);
@@ -614,6 +808,12 @@ async function fetchNewUnreadEmailsForAllAccounts() {
 
     // Fetch unread emails from each account
     for (const account of accounts) {
+      // ✅ CRITICAL: Skip accounts that need reconnection (prevents endless retry loops)
+      if (account.needs_reconnection) {
+        console.log(`[FETCH_NEW_MAIL] ⏭️  Skipping account ${account.email || account.id} - needs reconnection`);
+        continue; // Skip this account
+      }
+      
       let connection = null;
       try {
         // Get last fetched unread UID for this account/folder
@@ -622,27 +822,62 @@ async function fetchNewUnreadEmailsForAllAccounts() {
         // Decrypt password
         const password = decryptPassword(account.imap_password);
 
-        // Connect to IMAP
-        connection = await imaps.connect({
-          imap: {
-            user: account.imap_username,
-            password: password,
-            host: account.imap_host,
-            port: account.imap_port || 993,
-            tls: account.use_ssl !== false,
-            tlsOptions: { rejectUnauthorized: false },
-            authTimeout: 10000,
+        // Connect to IMAP using connection pool with retry
+        connection = await connectionPool.getConnection(
+          account.id,
+          async () => {
+            return await retryWithBackoff(
+              async () => {
+                return await imaps.connect({
+                  imap: {
+                    user: account.imap_username,
+                    password: password,
+                    host: account.imap_host,
+                    port: account.imap_port || 993,
+                    tls: account.use_ssl !== false,
+                    tlsOptions: { rejectUnauthorized: false },
+                    authTimeout: 10000,
+                  }
+                });
+              },
+              {
+                maxRetries: 3,
+                baseDelay: 2000,
+                maxDelay: 30000,
+                operationName: `Connecting to IMAP for ${account.email}`
+              }
+            );
           }
-        });
+        );
 
-        // Open mailbox
-        await connection.openBox(folder);
+        // Open mailbox with retry
+        await retryWithBackoff(
+          async () => {
+            return await connection.openBox(folder);
+          },
+          {
+            maxRetries: 3,
+            baseDelay: 2000,
+            maxDelay: 30000,
+            operationName: `Opening folder ${folder}`
+          }
+        );
 
-        // Search for all UNSEEN (unread) messages
-        const allUnseenMessages = await connection.search(['UNSEEN'], { 
-          bodies: '', 
-          struct: true 
-        });
+        // Search for all UNSEEN (unread) messages with retry
+        const allUnseenMessages = await retryWithBackoff(
+          async () => {
+            return await connection.search(['UNSEEN'], { 
+              bodies: '', 
+              struct: true 
+            });
+          },
+          {
+            maxRetries: 5,
+            baseDelay: 3000,
+            maxDelay: 60000,
+            operationName: `Searching UNSEEN messages in ${folder}`
+          }
+        );
 
         // Filter to only get new unseen emails (UID > last fetched)
         const newUnseenMessages = lastUnreadUidFetched > 0
@@ -651,6 +886,12 @@ async function fetchNewUnreadEmailsForAllAccounts() {
               return uid > lastUnreadUidFetched;
             })
           : allUnseenMessages;
+
+        // CRITICAL: Check if this is the first sync for this account
+        const isInitialSync = !account.initial_sync_completed;
+        if (isInitialSync) {
+          console.log(`[SYNC] 🔄 Starting initial sync for account ${account.id} (${account.email})`);
+        }
 
         if (newUnseenMessages.length > 0) {
           // Parse and send emails to webhook
@@ -744,14 +985,71 @@ async function fetchNewUnreadEmailsForAllAccounts() {
           }
         }
 
+        // CRITICAL: Mark initial sync as completed after first successful fetch
+        // Use conditional update to prevent race conditions (only update if still FALSE)
+        if (isInitialSync) {
+          try {
+            const { error: updateError } = await supabaseAdmin
+              .from('email_accounts')
+              .update({
+                initial_sync_completed: true,
+                webhook_enabled_at: new Date().toISOString()
+              })
+              .eq('id', account.id)
+              .eq('initial_sync_completed', false); // Only update if still FALSE (atomic check-and-set)
+
+            if (updateError) {
+              console.error(`[SYNC] ❌ Error marking initial sync complete for account ${account.id}:`, updateError.message);
+            } else {
+              console.log(`[SYNC] ✅ Initial sync completed for account ${account.id} (${account.email})`);
+              console.log(`[SYNC] ✅ Webhooks enabled - future emails will trigger webhooks`);
+            }
+          } catch (updateError) {
+            console.error(`[SYNC] ❌ Error updating sync status:`, updateError.message);
+            // Don't throw - continue processing
+          }
+        }
+
         accountsProcessed++;
       } catch (accountError) {
-        console.error(`[FETCH_NEW_MAIL] Error fetching emails from account ${account.email}:`, accountError.message);
+        // ✅ Detect and mark authentication errors
+        const isAuthError = accountError.message?.includes('Not authenticated') || 
+                           accountError.message?.includes('AUTHENTICATIONFAILED') ||
+                           accountError.message?.includes('Invalid credentials') ||
+                           accountError.message?.includes('authentication') ||
+                           accountError.message?.includes('credentials') ||
+                           accountError.message?.includes('LOGIN');
+
+        if (isAuthError) {
+          console.error(`[FETCH_NEW_MAIL] ❌ Authentication failed for account ${account.id} (${account.email}):`, accountError.message);
+          
+          // Mark account as needing reconnection
+          try {
+            await supabaseAdmin
+              .from('email_accounts')
+              .update({ 
+                needs_reconnection: true,
+                last_error: `Authentication failed: ${accountError.message}`,
+                last_connection_attempt: new Date().toISOString()
+              })
+              .eq('id', account.id);
+            
+            console.log(`[FETCH_NEW_MAIL] ✅ Marked account ${account.id} as needing reconnection`);
+          } catch (updateErr) {
+            console.error('[FETCH_NEW_MAIL] Failed to update account status:', updateErr);
+          }
+        } else if (isThrottlingError(accountError)) {
+          // Handle throttling errors gracefully
+          console.error(`[FETCH_NEW_MAIL] Error fetching emails from account ${account.email} (throttled):`, accountError.message);
+        } else {
+          console.error(`[FETCH_NEW_MAIL] Error fetching emails from account ${account.email}:`, accountError.message);
+        }
         // Continue with next account
       } finally {
         if (connection) {
           try {
-            connection.end();
+            // Release connection back to pool
+            connectionPool.releaseConnection(account.id, connection, false);
           } catch (endError) {
             // Ignore errors when closing connection
           }

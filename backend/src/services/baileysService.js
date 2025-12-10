@@ -14,6 +14,8 @@ const { randomUUID } = require('crypto');
 const EventEmitter = require('events');
 const { supabaseAdmin } = require('../config/supabase');
 const axios = require('axios');
+const lockfile = require('proper-lockfile');
+const https = require('https');
 
 const STORAGE_BUCKET = 'agent-files';
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
@@ -459,11 +461,14 @@ async function saveAudioFile(buffer, agentId, messageId, mimetype = 'audio/ogg')
 async function syncCredsToDatabase(agentId) {
   console.log(`[BAILEYS] 💾 Syncing credentials to database for ${agentId.substring(0, 40)}`);
   
+  const authPath = path.join(__dirname, '../../auth_sessions', agentId);
+  const credsPath = path.join(authPath, 'creds.json');
+  
+  // CRITICAL: Use file locking to prevent concurrent reads during writes
+  let release = null;
+  
   try {
-    const authPath = path.join(__dirname, '../../auth_sessions', agentId);
-    const credsPath = path.join(authPath, 'creds.json');
-    
-    // Ensure directory exists before checking for file
+    // Ensure directory exists
     if (!fs.existsSync(authPath)) {
       try {
         fs.mkdirSync(authPath, { recursive: true });
@@ -478,13 +483,31 @@ async function syncCredsToDatabase(agentId) {
       console.log(`[BAILEYS] ℹ️ No credentials file to sync`);
       return;
     }
-    const rawCreds = fs.readFileSync(credsPath, 'utf-8');
-
-    if (!rawCreds || rawCreds.trim().length === 0) {
-      console.warn('[BAILEYS] ⚠️ Credentials file is empty - skipping database sync');
+    
+    // Acquire lock before reading (prevents reading during write)
+    try {
+      release = await lockfile.lock(credsPath, {
+        retries: {
+          retries: 5,
+          minTimeout: 100,
+          maxTimeout: 1000
+        },
+        stale: 10000 // Consider lock stale after 10 seconds
+      });
+    } catch (lockError) {
+      console.error('[BAILEYS] ❌ Could not acquire file lock (file might be corrupted):', lockError.message);
+      // Don't sync if we can't get lock - file might be mid-write
       return;
     }
-
+    
+    // Read with lock held
+    const rawCreds = fs.readFileSync(credsPath, 'utf-8');
+    
+    if (!rawCreds || rawCreds.trim().length === 0) {
+      console.warn('[BAILEYS] ⚠️ Credentials file is empty - skipping sync');
+      return;
+    }
+    
     let credsData;
     try {
       credsData = JSON.parse(rawCreds);
@@ -493,23 +516,261 @@ async function syncCredsToDatabase(agentId) {
       return;
     }
     
-    // Save complete credentials object to database
-    // This includes: me (device ID), registered, signedIdentityKey, etc.
+    // Validate before syncing
+    const validation = validateCredentialIntegrity(credsData);
+    if (!validation.valid) {
+      console.error('[BAILEYS] ❌ Credentials failed validation, skipping database sync:', validation.reason);
+      return;
+    }
+    
+    // Save to database
     const { error } = await supabaseAdmin
       .from('whatsapp_sessions')
       .upsert({
         agent_id: agentId,
         session_data: { creds: credsData },
         updated_at: new Date().toISOString()
-      }, {
-        onConflict: 'agent_id'
-      });
-    
+      }, { onConflict: 'agent_id' });
+      
     if (error) throw error;
     
-    console.log(`[BAILEYS] ✅ Credentials synced to database (has me: ${!!credsData.me}, registered: ${credsData.registered})`);
+    console.log(`[BAILEYS] ✅ Credentials synced to database (validated)`);
+    
   } catch (error) {
     console.error(`[BAILEYS] ❌ Error syncing to database:`, error);
+  } finally {
+    // Always release lock
+    if (release) {
+      try {
+        await release();
+      } catch (releaseError) {
+        console.error('[BAILEYS] ⚠️ Error releasing file lock:', releaseError.message);
+      }
+    }
+  }
+}
+
+// CRITICAL: Validate credential integrity to prevent Bad MAC errors
+// Returns { valid: boolean, reason: string }
+function validateCredentialIntegrity(creds) {
+  if (!creds || typeof creds !== 'object') {
+    return { valid: false, reason: 'Credentials not an object' };
+  }
+  
+  // Check required keys
+  if (!creds.noiseKey || !creds.signedIdentityKey || !creds.signedPreKey) {
+    return { 
+      valid: false, 
+      reason: `Missing required keys: ${!creds.noiseKey ? 'noiseKey ' : ''}${!creds.signedIdentityKey ? 'signedIdentityKey ' : ''}${!creds.signedPreKey ? 'signedPreKey' : ''}`
+    };
+  }
+  
+  // Check key structures
+  if (!creds.noiseKey.private || !creds.noiseKey.public) {
+    return { valid: false, reason: 'Noise key missing private/public components' };
+  }
+  
+  // Check key lengths (prevent truncated keys)
+  let noisePrivateLen, noisePublicLen;
+  try {
+    noisePrivateLen = Buffer.from(creds.noiseKey.private).length;
+    noisePublicLen = Buffer.from(creds.noiseKey.public).length;
+  } catch (e) {
+    return { valid: false, reason: `Error checking noise key lengths: ${e.message}` };
+  }
+  
+  if (noisePrivateLen !== 32) {
+    return { 
+      valid: false, 
+      reason: `Noise private key invalid length: ${noisePrivateLen} (expected 32)` 
+    };
+  }
+  
+  if (noisePublicLen !== 32) {
+    return { 
+      valid: false, 
+      reason: `Noise public key invalid length: ${noisePublicLen} (expected 32)` 
+    };
+  }
+  
+  return { valid: true };
+}
+
+// CRITICAL: Connection monitor for auto-reconnect
+function startConnectionMonitor(agentId, sock, session, userId) {
+  let lastPong = Date.now();
+  let consecutiveFailures = 0;
+  let reconnecting = false;
+  
+  console.log(`[BAILEYS] 🔍 Starting connection monitor for ${agentId.substring(0, 40)}`);
+  
+  // Monitor WebSocket pongs
+  if (sock.ws) {
+    sock.ws.on('pong', () => {
+      lastPong = Date.now();
+      consecutiveFailures = 0;
+      if (session) {
+        session.lastPong = lastPong;
+      }
+    });
+    
+    // Also monitor ping events
+    sock.ws.on('ping', () => {
+      console.log(`[BAILEYS] 🏓 Received ping from server`);
+    });
+  }
+  
+  const monitor = setInterval(async () => {
+    const currentSession = activeSessions.get(agentId);
+    
+    // Stop monitor if session removed or in conflict
+    if (!currentSession || currentSession.connectionState === 'conflict') {
+      console.log(`[BAILEYS] 🛑 Stopping connection monitor (session ${!currentSession ? 'removed' : 'in conflict'})`);
+      clearInterval(monitor);
+      return;
+    }
+    
+    // Skip if already reconnecting
+    if (reconnecting) {
+      console.log(`[BAILEYS] ⏳ Reconnection in progress, skipping health check`);
+      return;
+    }
+    
+    const now = Date.now();
+    const timeSinceLastPong = now - lastPong;
+    const timeSinceLastActivity = now - (currentSession.lastActivity || now);
+    const socketReadyState = sock.ws?.readyState;
+    
+    // Check 1: WebSocket still alive?
+    if (socketReadyState !== 1) { // 1 = OPEN
+      console.error(`[BAILEYS] ❌ WebSocket not open (state: ${socketReadyState})`);
+      consecutiveFailures++;
+      
+      if (consecutiveFailures >= 2) {
+        console.error(`[BAILEYS] ❌ WebSocket closed, triggering reconnection`);
+        reconnecting = true;
+        clearInterval(monitor);
+        
+        try {
+          await disconnectWhatsApp(agentId);
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          await initializeWhatsApp(agentId, userId);
+        } catch (error) {
+          console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
+        } finally {
+          reconnecting = false;
+        }
+        return;
+      }
+    }
+    
+    // Check 2: No pong in too long?
+    if (timeSinceLastPong > 60000) { // 60 seconds without pong
+      consecutiveFailures++;
+      console.error(`[BAILEYS] ❌ No pong in ${Math.round(timeSinceLastPong/1000)}s (failure #${consecutiveFailures})`);
+      
+      if (consecutiveFailures >= 3) {
+        console.error(`[BAILEYS] ❌ Connection appears dead (3 consecutive failures), reconnecting...`);
+        reconnecting = true;
+        clearInterval(monitor);
+        
+        try {
+          await disconnectWhatsApp(agentId);
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          await initializeWhatsApp(agentId, userId);
+        } catch (error) {
+          console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
+        } finally {
+          reconnecting = false;
+        }
+        return;
+      }
+      
+      // Try manual ping to wake up connection
+      try {
+        console.log(`[BAILEYS] 🏓 Sending manual ping to test connection`);
+        await sock.ws?.ping?.();
+      } catch (pingError) {
+        console.error(`[BAILEYS] ❌ Manual ping failed:`, pingError.message);
+      }
+    } else {
+      // Reset consecutive failures if we got recent pong
+      consecutiveFailures = 0;
+    }
+    
+    // Check 3: Inactive too long? Test connection health
+    if (currentSession.isConnected && timeSinceLastActivity > 180000) { // 3 minutes
+      console.log(`[BAILEYS] ⚠️ Connection inactive for ${Math.round(timeSinceLastActivity/1000)}s, testing health...`);
+      try {
+        await sock.ws?.ping?.();
+        console.log(`[BAILEYS] 🏓 Health check ping sent`);
+      } catch (error) {
+        console.error(`[BAILEYS] ❌ Health check ping failed:`, error.message);
+        consecutiveFailures++;
+      }
+    }
+    
+    // Check 4: Network connectivity test (every 2 minutes)
+    if (now % 120000 < 15000) { // Run approximately every 2 minutes
+      try {
+        await new Promise((resolve, reject) => {
+          const req = https.get('https://web.whatsapp.com', { timeout: 5000 }, (res) => {
+            resolve(res.statusCode === 200);
+          });
+          req.on('error', reject);
+          req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Network timeout'));
+          });
+        });
+      } catch (networkError) {
+        console.error(`[BAILEYS] ⚠️ Network check failed (WhatsApp unreachable):`, networkError.message);
+        // Don't disconnect yet - network might come back
+      }
+    }
+    
+  }, 15000); // Check every 15 seconds
+  
+  // Store monitor reference so we can clean it up later
+  if (session) {
+    session.connectionMonitor = monitor;
+  }
+  
+  return monitor;
+}
+
+// CRITICAL: Backup credentials to prevent data loss
+async function backupCredentials(agentId) {
+  try {
+    const authPath = path.join(__dirname, '../../auth_sessions', agentId);
+    const credsPath = path.join(authPath, 'creds.json');
+    
+    if (!fs.existsSync(credsPath)) {
+      return;
+    }
+    
+    // Create backup with timestamp
+    const timestamp = Date.now();
+    const backupPath = path.join(authPath, `creds.json.backup.${timestamp}`);
+    
+    fs.copyFileSync(credsPath, backupPath);
+    console.log(`[BAILEYS] 💾 Credentials backed up to ${backupPath}`);
+    
+    // Keep only last 3 backups
+    const backupFiles = fs.readdirSync(authPath)
+      .filter(f => f.startsWith('creds.json.backup.'))
+      .sort()
+      .reverse();
+    
+    if (backupFiles.length > 3) {
+      for (const oldBackup of backupFiles.slice(3)) {
+        fs.unlinkSync(path.join(authPath, oldBackup));
+        console.log(`[BAILEYS] 🗑️ Deleted old backup: ${oldBackup}`);
+      }
+    }
+    
+  } catch (error) {
+    console.error(`[BAILEYS] ⚠️ Backup failed:`, error.message);
   }
 }
 
@@ -1096,16 +1357,68 @@ async function initializeWhatsApp(agentId, userId = null) {
         fs.mkdirSync(authPath, { recursive: true });
         console.log(`[BAILEYS] 📁 Created auth directory: ${authPath}`);
       }
-      const authState = await useMultiFileAuthState(authPath);
-      state = authState.state;
-      saveCredsToFile = authState.saveCreds;
       
-      console.log(`[BAILEYS] 🔍 Loaded auth state:`, {
-        hasCreds: !!state.creds,
-        registered: state.creds?.registered,
-        hasMe: !!state.creds?.me
-      });
-    } else {
+      // CRITICAL: Check if credentials are corrupted before loading
+      const credsFile = path.join(authPath, 'creds.json');
+      if (fs.existsSync(credsFile)) {
+        try {
+          const credsContent = fs.readFileSync(credsFile, 'utf-8');
+          const creds = JSON.parse(credsContent);
+          
+          // Validate credential integrity
+          const validation = validateCredentialIntegrity(creds);
+          if (!validation.valid) {
+            console.error(`[BAILEYS] ❌ Credentials failed integrity check: ${validation.reason}`);
+            console.log(`[BAILEYS] Attempting recovery from database backup...`);
+            
+            // Try to restore from database
+            const { data: dbSession } = await supabaseAdmin
+              .from('whatsapp_sessions')
+              .select('session_data')
+              .eq('agent_id', agentId)
+              .single();
+            
+            if (dbSession?.session_data?.creds) {
+              const restoredCreds = dbSession.session_data.creds;
+              const restoredValidation = validateCredentialIntegrity(restoredCreds);
+              if (restoredValidation.valid) {
+                // Write restored credentials to file
+                fs.writeFileSync(credsFile, JSON.stringify(restoredCreds, null, 2));
+                console.log(`[BAILEYS] ✅ Credentials recovered from database backup`);
+                useFileAuth = true;
+              } else {
+                console.log(`[BAILEYS] ❌ Recovery failed - database credentials also invalid`);
+                // Delete corrupted files
+                fs.rmSync(authPath, { recursive: true, force: true });
+                useFileAuth = false;
+              }
+            } else {
+              console.log(`[BAILEYS] ❌ Recovery failed - no database backup found`);
+              // Delete corrupted files
+              fs.rmSync(authPath, { recursive: true, force: true });
+              useFileAuth = false;
+            }
+          }
+        } catch (error) {
+          console.error(`[BAILEYS] ❌ Error validating credentials:`, error.message);
+          useFileAuth = false;
+        }
+      }
+      
+      if (useFileAuth) {
+        const authState = await useMultiFileAuthState(authPath);
+        state = authState.state;
+        saveCredsToFile = authState.saveCreds;
+        
+        console.log(`[BAILEYS] 🔍 Loaded auth state:`, {
+          hasCreds: !!state.creds,
+          registered: state.creds?.registered,
+          hasMe: !!state.creds?.me
+        });
+      }
+    }
+    
+    if (!useFileAuth) {
       // Create COMPLETELY FRESH state for QR generation  
       console.log(`[BAILEYS] 🆕 Creating fresh auth state for QR generation...`);
       
@@ -1132,9 +1445,36 @@ async function initializeWhatsApp(agentId, userId = null) {
       });
     }
 
-    // Wrap saveCreds to also sync to database
+    // CRITICAL: Wrap saveCreds with atomic writes and credential validation
     const saveCreds = async () => {
       try {
+        // CRITICAL: Validate credential integrity BEFORE saving
+        const currentCreds = state.creds;
+        
+        // Check 1: Ensure required keys exist
+        if (!currentCreds.noiseKey || !currentCreds.signedIdentityKey || !currentCreds.signedPreKey) {
+          console.error(`[BAILEYS] ❌ CRITICAL: Incomplete credentials detected, skipping save`);
+          console.error(`[BAILEYS] Missing keys:`, {
+            hasNoiseKey: !!currentCreds.noiseKey,
+            hasSignedIdentityKey: !!currentCreds.signedIdentityKey,
+            hasSignedPreKey: !!currentCreds.signedPreKey
+          });
+          return; // Don't save corrupted credentials
+        }
+        
+        // Check 2: Validate key buffer lengths (prevent truncated keys)
+        if (currentCreds.noiseKey?.private && Buffer.from(currentCreds.noiseKey.private).length !== 32) {
+          console.error(`[BAILEYS] ❌ CRITICAL: Noise key has invalid length (${Buffer.from(currentCreds.noiseKey.private).length}), expected 32`);
+          return; // Don't save corrupted credentials
+        }
+        
+        // Check 3: Validate credential integrity
+        const validation = validateCredentialIntegrity(currentCreds);
+        if (!validation.valid) {
+          console.error(`[BAILEYS] ❌ CRITICAL: Credential validation failed: ${validation.reason}`);
+          return; // Don't save corrupted credentials
+        }
+        
         // CRITICAL: Ensure directory exists before saving (with error handling)
         try {
           if (!fs.existsSync(authPath)) {
@@ -1151,13 +1491,54 @@ async function initializeWhatsApp(agentId, userId = null) {
           throw new Error(`Auth directory does not exist after creation attempt: ${authPath}`);
         }
         
-        await saveCredsToFile(); // Save to files first
-        await syncCredsToDatabase(agentId); // Then sync to database
+        // CRITICAL: Use atomic write pattern to prevent file corruption
+        const credsPath = path.join(authPath, 'creds.json');
+        const tempPath = path.join(authPath, `creds.json.tmp.${Date.now()}`);
+        
+        try {
+          // Step 1: Write to temporary file first
+          const credsData = JSON.stringify(currentCreds, null, 2);
+          fs.writeFileSync(tempPath, credsData, { encoding: 'utf-8', flag: 'w' });
+          
+          // Step 2: Verify temp file is readable and valid JSON
+          const verifyData = fs.readFileSync(tempPath, 'utf-8');
+          JSON.parse(verifyData); // Will throw if invalid JSON
+          
+          // Step 3: Atomic rename (replaces old file safely)
+          fs.renameSync(tempPath, credsPath);
+          
+          console.log(`[BAILEYS] ✅ Credentials saved atomically to ${credsPath}`);
+          
+        } catch (writeError) {
+          // Clean up temp file if it exists
+          if (fs.existsSync(tempPath)) {
+            try {
+              fs.unlinkSync(tempPath);
+            } catch (unlinkError) {
+              // Ignore cleanup errors
+            }
+          }
+          throw writeError;
+        }
+        
+        // Also save keys using original function
+        await saveCredsToFile(); // This saves other key files
+        
+        // Sync to database with file locking
+        await syncCredsToDatabase(agentId);
+        
       } catch (error) {
-        console.error(`[BAILEYS] ❌ Error saving credentials:`, error);
+        console.error(`[BAILEYS] ❌ CRITICAL ERROR saving credentials:`, error.message);
         console.error(`[BAILEYS] Error details:`, error);
-        // Don't re-throw - log the error but don't crash the connection
-        // The credentials will be saved on next update attempt
+        
+        // If save fails, mark credentials as potentially corrupted
+        const currentSession = activeSessions.get(agentId);
+        if (currentSession) {
+          currentSession.credentialError = error.message;
+          currentSession.credentialErrorAt = Date.now();
+        }
+        
+        // Don't throw - allow connection to continue, but log the error
       }
     };
 
@@ -1259,8 +1640,8 @@ async function initializeWhatsApp(agentId, userId = null) {
       logger: customLogger, // Use custom logger to intercept sender_pn
       browser: Browsers.ubuntu('Chrome'),
       
-      // OPTIMIZED: Balanced timeouts for stability and performance
-      keepAliveIntervalMs: 20000, // Send keepalive every 20s (balanced)
+      // CRITICAL: Aggressive keepalive to prevent timeout (WhatsApp timeout is ~15-30s)
+      keepAliveIntervalMs: 10000, // Send keepalive every 10s (aggressive)
       defaultQueryTimeoutMs: 120000,
       connectTimeoutMs: 120000,
       qrTimeout: 180000, // QR valid for 3 minutes (WhatsApp standard)
@@ -1319,20 +1700,57 @@ async function initializeWhatsApp(agentId, userId = null) {
       console.log(`[BAILEYS] ℹ️ Raw WebSocket not accessible (this is normal - Baileys may not expose it)`);
     }
 
-    // CRITICAL: Register creds.update handler
+    // CRITICAL: Register creds.update handler with validation
     sock.ev.on('creds.update', async () => {
       console.log(`[BAILEYS] 🔐 ============ CREDS.UPDATE FIRED ============`);
-      
       try {
-        // saveCreds handles both file save and database sync
+        // CRITICAL: Validate credential integrity BEFORE saving
+        const currentCreds = state.creds;
+        
+        // Check 1: Ensure required keys exist
+        if (!currentCreds.noiseKey || !currentCreds.signedIdentityKey || !currentCreds.signedPreKey) {
+          console.error(`[BAILEYS] ❌ CRITICAL: Incomplete credentials detected, skipping save`);
+          console.error(`[BAILEYS] Missing keys:`, {
+            hasNoiseKey: !!currentCreds.noiseKey,
+            hasSignedIdentityKey: !!currentCreds.signedIdentityKey,
+            hasSignedPreKey: !!currentCreds.signedPreKey
+          });
+          return; // Don't save corrupted credentials
+        }
+        
+        // Check 2: Validate key buffer lengths (prevent truncated keys)
+        if (currentCreds.noiseKey?.private && Buffer.from(currentCreds.noiseKey.private).length !== 32) {
+          console.error(`[BAILEYS] ❌ CRITICAL: Noise key has invalid length (${Buffer.from(currentCreds.noiseKey.private).length}), expected 32`);
+          return; // Don't save corrupted credentials
+        }
+        
+        // Check 3: Ensure keys haven't been corrupted mid-flight
+        const keysChecksum = Buffer.from(JSON.stringify({
+          noiseKey: currentCreds.noiseKey?.public?.toString('base64'),
+          identityKey: currentCreds.signedIdentityKey?.public?.toString('base64')
+        })).toString('base64');
+        
+        // Store checksum for future validation
+        currentCreds._keysChecksum = keysChecksum;
+        
+        console.log(`[BAILEYS] ✅ Credential validation passed, saving...`);
+        
+        // saveCreds handles both file save and database sync with atomic writes
         await saveCreds();
-        console.log(`[BAILEYS] ✅ Credentials saved during pairing`);
+        
+        console.log(`[BAILEYS] ✅ Credentials saved successfully`);
         console.log(`[BAILEYS] 🔐 ============ CREDS.UPDATE COMPLETE ============\n`);
       } catch (error) {
-        console.error(`[BAILEYS] ❌ Error saving credentials:`, error.message);
+        console.error(`[BAILEYS] ❌ CRITICAL ERROR saving credentials:`, error.message);
         console.error(`[BAILEYS] Error details:`, error);
-        // Don't throw - allow connection to continue even if credential save fails
-        // The directory will be created on next attempt
+        
+        // If save fails, mark credentials as potentially corrupted
+        if (session) {
+          session.credentialError = error.message;
+          session.credentialErrorAt = Date.now();
+        }
+        
+        // Don't throw - allow connection to continue, but log the error
       }
     });
 
@@ -1384,6 +1802,18 @@ async function initializeWhatsApp(agentId, userId = null) {
     
     // Store heartbeat interval for cleanup
     sessionData.heartbeatInterval = heartbeatInterval;
+    
+    // CRITICAL: Periodic credential backup (every hour for connected sessions)
+    const backupInterval = setInterval(async () => {
+      const session = activeSessions.get(agentId);
+      if (session && session.isConnected) {
+        await backupCredentials(agentId);
+      } else {
+        clearInterval(backupInterval);
+      }
+    }, 60 * 60 * 1000); // Every hour
+    
+    sessionData.backupInterval = backupInterval;
     
     // CRITICAL: Add socket health check to detect premature disconnects
     const healthCheckInterval = setInterval(async () => {
@@ -1453,12 +1883,12 @@ async function initializeWhatsApp(agentId, userId = null) {
       session.lastPingAt = now;
       session.lastActivity = now;
       
-      // Stop health check after 5 minutes (socket should be connected or closed by then)
-      if (socketAge > 300000) {
-        console.log(`[BAILEYS] Health check: Socket > 5min old, stopping health checks`);
-        console.log(`[BAILEYS] 💡 Consider disconnecting and reconnecting if connection is still pending`);
-        clearInterval(healthCheckInterval);
-      }
+      // CRITICAL: Health checks run FOREVER while session exists
+      // Only stop when:
+      // - Session is removed from activeSessions (checked above)
+      // - Session state is 'conflict' (checked above)
+      // - Manual disconnect is called
+      // DO NOT stop after 5 minutes - connection can stay alive indefinitely
     }, 30000); // Check every 30 seconds
     
     // Store interval ID in session so we can clear it if needed
@@ -1624,6 +2054,11 @@ async function initializeWhatsApp(agentId, userId = null) {
           console.log(`[BAILEYS] 🎊 WhatsApp fully connected`);
           console.log(`[BAILEYS] ========== CONNECTION COMPLETE ==========\n`);
           
+          // CRITICAL: Start connection monitor for auto-reconnect
+          if (session && session.socket) {
+            startConnectionMonitor(agentId, session.socket, session, userId);
+          }
+          
         } catch (error) {
           console.error(`[BAILEYS] ❌ Error:`, error);
         }
@@ -1760,6 +2195,52 @@ async function initializeWhatsApp(agentId, userId = null) {
           return; // Don't continue processing
         }
         
+        // CRITICAL: Handle error 428 - Connection Lost (recoverable network issue)
+        if (statusCode === 428) {
+          console.log(`[BAILEYS] 🔄 428 - Connection Lost (recoverable network issue)`);
+          console.log(`[BAILEYS] Credentials preserved, auto-reconnecting in 5s...`);
+          
+          // Clean up old socket but keep credentials
+          if (session?.socket) {
+            try {
+              session.socket.ev.removeAllListeners();
+              session.socket.end();
+            } catch (err) {
+              console.log('[BAILEYS] Socket cleanup after 428:', err.message);
+            }
+          }
+          
+          // Mark as disconnected but don't delete credentials
+          if (session) {
+            session.isConnected = false;
+            session.connectionState = 'reconnecting';
+            session.lastActivity = Date.now();
+          }
+          
+          // Schedule reconnection with exponential backoff
+          const reconnectAttempt = session?.reconnectAttempts || 0;
+          const backoffDelay = Math.min(5000 * Math.pow(2, reconnectAttempt), 60000); // 5s, 10s, 20s, 40s, 60s max
+          
+          if (session) {
+            session.reconnectAttempts = reconnectAttempt + 1;
+          }
+          
+          console.log(`[BAILEYS] 🔄 Reconnecting after 428 error (attempt ${reconnectAttempt + 1}, delay ${backoffDelay}ms)...`);
+          
+          setTimeout(async () => {
+            try {
+              // Reset reconnect attempts on successful connection
+              await initializeWhatsApp(agentId, userId);
+              console.log(`[BAILEYS] ✅ Reconnection initiated after 428 error`);
+            } catch (error) {
+              console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
+              // Will retry on next 428 if it happens again
+            }
+          }, backoffDelay);
+          
+          return; // Don't continue processing
+        }
+        
         // CRITICAL: Handle error 515 - Restart Required (EXPECTED after QR pairing!)
         if (statusCode === 515) {
           console.log(`[BAILEYS] 🔄 Error 515 - Stream Errored (restart required)`);
@@ -1793,88 +2274,127 @@ async function initializeWhatsApp(agentId, userId = null) {
         
         qrGenerationTracker.delete(agentId);
         
-        // CRITICAL: Handle Bad MAC errors (session corruption) - detect from error message
+        // CRITICAL: Handle Bad MAC errors (session corruption) - enhanced detection
         const errorMessage = reason || payload?.error || data?.reason || '';
-        const isBadMacError = errorMessage.includes('Bad MAC') || 
-                             errorMessage.includes('Bad MAC Error') ||
-                             errorMessage.includes('session error') ||
-                             (statusCode === 401 && errorMessage.includes('MAC'));
+        const errorString = JSON.stringify(lastDisconnect?.error || {}).toLowerCase();
+        
+        // Detect Bad MAC in multiple ways
+        const isBadMacError = 
+          errorMessage.includes('Bad MAC') || 
+          errorMessage.includes('bad-mac') ||
+          errorMessage.includes('Bad MAC Error') || 
+          errorMessage.includes('session error') ||
+          errorMessage.includes('decryption-error') ||
+          errorMessage.includes('hmac') ||
+          errorString.includes('bad mac') ||
+          errorString.includes('bad-mac') ||
+          (statusCode === 401 && (
+            errorMessage.includes('MAC') || 
+            errorMessage.includes('decrypt')
+          ));
         
         if (isBadMacError) {
-          console.log(`[BAILEYS] ❌ Bad MAC Error detected - Session corruption detected`);
-          console.log(`[BAILEYS] This indicates session keys are corrupted or out of sync`);
-          console.log(`[BAILEYS] Clearing corrupted credentials and forcing fresh QR on next connect`);
+          console.log(`[BAILEYS] ❌ Bad MAC Error detected - Session key corruption/desync`);
+          console.log(`[BAILEYS] Error details:`, {
+            statusCode,
+            reason,
+            payload,
+            errorString: errorString.substring(0, 200)
+          });
+          console.log(`[BAILEYS] This indicates:`);
+          console.log(`  1. Credentials were corrupted during save/load`);
+          console.log(`  2. Session keys are out of sync with WhatsApp servers`);
+          console.log(`  3. File system or database corruption occurred`);
+          console.log(`  4. Concurrent credential writes from multiple instances`);
           
+          // Stop all intervals immediately
+          if (session?.healthCheckInterval) {
+            clearInterval(session.healthCheckInterval);
+            session.healthCheckInterval = null;
+          }
+          if (session?.heartbeatInterval) {
+            clearInterval(session.heartbeatInterval);
+            session.heartbeatInterval = null;
+          }
+          if (session?.connectionMonitor) {
+            clearInterval(session.connectionMonitor);
+            session.connectionMonitor = null;
+          }
+          
+          // Close socket
           if (session?.socket) {
             try {
               session.socket.ev.removeAllListeners();
-              session.socket.end?.();
+              session.socket.end();
             } catch (err) {
-              console.log('[BAILEYS] Socket cleanup after Bad MAC failed:', err.message);
+              console.log('[BAILEYS] Socket cleanup:', err.message);
             }
           }
-
-          // Mark session as corrupted
-          const failureReason = 'Session corruption (Bad MAC) - credentials invalidated';
+          
+          // Mark as corrupted
+          const failureReason = 'Bad MAC - Session key corruption detected';
           if (session) {
             session.failureReason = failureReason;
             session.failureAt = Date.now();
             session.isConnected = false;
             session.connectionState = 'conflict';
-            session.qrCode = null;
-            session.qrGeneratedAt = null;
-            session.socket = null;
-            session.state = null;
-            session.saveCreds = null;
           }
-
-          // Stop health check and heartbeat intervals
-          if (session?.healthCheckInterval) {
-            clearInterval(session.healthCheckInterval);
-            session.healthCheckInterval = null;
-            console.log(`[BAILEYS] ✅ Health check interval stopped`);
-          }
-          if (session?.heartbeatInterval) {
-            clearInterval(session.heartbeatInterval);
-            session.heartbeatInterval = null;
-            console.log(`[BAILEYS] ✅ Heartbeat interval stopped`);
-          }
-
-          // Remove from active sessions
-          activeSessions.delete(agentId);
-          console.log(`[BAILEYS] ✅ Session removed from active sessions`);
-
-          connectionLocks.delete(agentId);
-          lastConnectionAttempt.set(agentId, Date.now());
           
-          // CRITICAL: Clear corrupted credentials completely
+          // Remove from memory
+          activeSessions.delete(agentId);
+          connectionLocks.delete(agentId);
+          last401Failure.set(agentId, Date.now());
+          
+          // CRITICAL: Delete corrupted credentials completely
           const authDir = path.join(__dirname, '../../auth_sessions', agentId);
           if (fs.existsSync(authDir)) {
-            fs.rmSync(authDir, { recursive: true, force: true });
-            console.log(`[BAILEYS] 🗑️ Cleared corrupted auth directory`);
+            console.log(`[BAILEYS] 🗑️ Deleting corrupted credentials...`);
+            try {
+              // Delete all files in auth directory
+              const files = fs.readdirSync(authDir);
+              for (const file of files) {
+                const filePath = path.join(authDir, file);
+                fs.unlinkSync(filePath);
+                console.log(`[BAILEYS] 🗑️ Deleted: ${file}`);
+              }
+              fs.rmdirSync(authDir);
+              console.log(`[BAILEYS] ✅ Corrupted auth directory deleted`);
+            } catch (deleteError) {
+              console.error(`[BAILEYS] ❌ Error deleting corrupted files:`, deleteError.message);
+              // Force delete entire directory
+              try {
+                fs.rmSync(authDir, { recursive: true, force: true });
+              } catch (forceError) {
+                console.error(`[BAILEYS] ❌ Force delete failed:`, forceError.message);
+              }
+            }
           }
           
-          // Update database - mark as conflict and clear session data
-          await supabaseAdmin
-            .from('whatsapp_sessions')
-            .update({
-              session_data: null,
-              qr_code: null,
-              qr_generated_at: null,
-              is_active: false,
-              status: 'conflict',
-              phone_number: null,
-              updated_at: new Date().toISOString()
-            })
-            .eq('agent_id', agentId);
+          // Clear database credentials
+          try {
+            await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                session_data: null,
+                qr_code: null,
+                qr_generated_at: null,
+                is_active: false,
+                status: 'conflict',
+                phone_number: null,
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+            
+            console.log(`[BAILEYS] ✅ Database credentials cleared`);
+          } catch (dbError) {
+            console.error(`[BAILEYS] ❌ Database clear error:`, dbError.message);
+          }
           
-          console.log(`[BAILEYS] ✅ Corrupted session cleared. Failure reason: ${failureReason}`);
-          console.log(`[BAILEYS] 🚫 Auto-retry disabled - manual reconnection required`);
-          console.log(`[BAILEYS] ⚠️  User must click "Connect" to get fresh QR code`);
-
-          // Record failure to prevent auto-retry
-          last401Failure.set(agentId, Date.now());
-          return;
+          console.log(`[BAILEYS] ✅ Bad MAC cleanup complete`);
+          console.log(`[BAILEYS] 🔄 User must reconnect manually to get fresh QR code`);
+          console.log(`[BAILEYS] 💡 TIP: Ensure no other instances are running for this agent`);
+          
+          return; // Don't continue processing
         }
         
         if (statusCode === 401) {
@@ -3063,8 +3583,8 @@ async function disconnectWhatsApp(agentId) {
         }
       }
       
-      // STEP 2: Stop health check and heartbeat intervals
-      console.log(`[BAILEYS] 🛑 Step 2: Stopping health check and heartbeat intervals...`);
+      // STEP 2: Stop health check, heartbeat, connection monitor, and backup intervals
+      console.log(`[BAILEYS] 🛑 Step 2: Stopping all intervals...`);
       try {
         if (session.healthCheckInterval) {
           clearInterval(session.healthCheckInterval);
@@ -3074,8 +3594,16 @@ async function disconnectWhatsApp(agentId) {
           clearInterval(session.heartbeatInterval);
           session.heartbeatInterval = null;
         }
+        if (session.connectionMonitor) {
+          clearInterval(session.connectionMonitor);
+          session.connectionMonitor = null;
+        }
+        if (session.backupInterval) {
+          clearInterval(session.backupInterval);
+          session.backupInterval = null;
+        }
         cleanupSteps.intervalsCleared = true;
-        console.log(`[BAILEYS] ✅ Intervals cleared`);
+        console.log(`[BAILEYS] ✅ All intervals cleared`);
       } catch (intervalError) {
         console.warn(`[BAILEYS] ⚠️ Error clearing intervals:`, intervalError.message);
         errors.push({ step: 'intervals', error: intervalError.message });

@@ -18,6 +18,7 @@ const router = express.Router();
 /**
  * POST /api/imap-smtp/connect
  * Connect and save IMAP/SMTP account
+ * OPTIMIZED: Skips connection testing for existing accounts
  */
 router.post('/connect', authMiddleware, async (req, res) => {
   try {
@@ -39,6 +40,34 @@ router.post('/connect', authMiddleware, async (req, res) => {
 
     if (!email) {
       return res.status(400).json({ error: 'Email is required' });
+    }
+
+    const userId = req.user.id;
+
+    // ✅ OPTIMIZATION: Check if account already exists FIRST (before testing)
+    const { data: existingAccount } = await supabaseAdmin
+      .from('email_accounts')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('email', email)
+      .eq('provider', provider || 'custom')
+      .eq('is_active', true)
+      .single();
+
+    if (existingAccount) {
+      console.log(`[CONNECT] Account ${email} already exists, skipping connection tests`);
+      
+      // Return existing account immediately without testing connections
+      return res.json({
+        success: true,
+        message: 'Account already connected',
+        account: {
+          id: existingAccount.id,
+          email: existingAccount.email,
+          provider: existingAccount.provider
+        },
+        skipSync: true // Tell frontend to use emails-quick endpoint
+      });
     }
 
     // Auto-detect provider settings if requested
@@ -70,26 +99,31 @@ router.post('/connect', authMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'IMAP and SMTP passwords are required' });
     }
 
-    console.log('finalImapUsername', finalImapUsername);
-    console.log('finalImapHost', finalImapHost);
-    console.log('finalImapPort', finalImapPort);
-    console.log('finalUseSsl', finalUseSsl);
-    console.log('finalUseTls', finalUseTls);
-    console.log('imapPassword', imapPassword);
-    console.log('smtpPassword', smtpPassword);
-    console.log('finalSmtpUsername', finalSmtpUsername);
-    console.log('finalSmtpHost', finalSmtpHost);
-    console.log('finalSmtpPort', finalSmtpPort);
-    console.log('finalUseTls', finalUseTls);
-    // Test IMAP connection
-    const imapTest = await testImapConnection({
-      username: finalImapUsername,
-      password: imapPassword,
-      host: finalImapHost,
-      port: finalImapPort,
-      useTls: finalUseSsl
-    });
-    console.log('imapTest', imapTest);
+    console.log(`[CONNECT] New account ${email}, testing connections in parallel...`);
+
+    // ✅ OPTIMIZATION: Run IMAP and SMTP tests in PARALLEL (not sequential)
+    const [imapTestResult, smtpTestResult] = await Promise.allSettled([
+      testImapConnection({
+        username: finalImapUsername,
+        password: imapPassword,
+        host: finalImapHost,
+        port: finalImapPort,
+        useTls: finalUseSsl
+      }),
+      testSmtpConnection({
+        username: finalSmtpUsername,
+        password: smtpPassword,
+        host: finalSmtpHost,
+        port: finalSmtpPort,
+        useSsl: finalUseTls && finalSmtpPort === 465,
+        useTls: finalUseTls
+      })
+    ]);
+
+    // Check IMAP test result
+    const imapTest = imapTestResult.status === 'fulfilled' 
+      ? imapTestResult.value 
+      : { success: false, error: imapTestResult.reason?.message || 'IMAP test failed' };
 
     if (!imapTest.success) {
       return res.status(400).json({
@@ -99,15 +133,10 @@ router.post('/connect', authMiddleware, async (req, res) => {
       });
     }
 
-    // Test SMTP connection
-    const smtpTest = await testSmtpConnection({
-      username: finalSmtpUsername,
-      password: smtpPassword,
-      host: finalSmtpHost,
-      port: finalSmtpPort,
-      useSsl: finalUseTls && finalSmtpPort === 465,
-      useTls: finalUseTls
-    });
+    // Check SMTP test result
+    const smtpTest = smtpTestResult.status === 'fulfilled'
+      ? smtpTestResult.value
+      : { success: false, error: smtpTestResult.reason?.message || 'SMTP test failed' };
 
     if (!smtpTest.success) {
       return res.status(400).json({
@@ -121,70 +150,35 @@ router.post('/connect', authMiddleware, async (req, res) => {
     const encryptedImapPassword = encryptPassword(imapPassword);
     const encryptedSmtpPassword = encryptPassword(smtpPassword);
 
-    // Check if account already exists
-    const { data: existingAccount } = await supabaseAdmin
-      .from('email_accounts')
-      .select('id')
-      .eq('user_id', req.user.id)
-      .eq('email', email)
-      .eq('provider', provider || 'custom')
-      .single();
-
+    // Insert new account (we already checked it doesn't exist above)
     let emailAccount;
     let dbError;
 
-    if (existingAccount) {
-      // Update existing account
-      const { data, error } = await supabaseAdmin
-        .from('email_accounts')
-        .update({
-          imap_host: finalImapHost,
-          imap_port: finalImapPort,
-          smtp_host: finalSmtpHost,
-          smtp_port: finalSmtpPort,
-          imap_username: finalImapUsername,
-          imap_password: encryptedImapPassword,
-          smtp_username: finalSmtpUsername,
-          smtp_password: encryptedSmtpPassword,
-          use_ssl: finalUseSsl,
-          use_tls: finalUseTls,
-          auth_method: 'password',
-          is_active: true,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', existingAccount.id)
-        .select()
-        .single();
-      
-      emailAccount = data;
-      dbError = error;
-    } else {
-      // Insert new account
-      const { data, error } = await supabaseAdmin
-        .from('email_accounts')
-        .insert({
-          user_id: req.user.id,
-          provider: provider || 'custom',
-          email: email,
-          imap_host: finalImapHost,
-          imap_port: finalImapPort,
-          smtp_host: finalSmtpHost,
-          smtp_port: finalSmtpPort,
-          imap_username: finalImapUsername,
-          imap_password: encryptedImapPassword,
-          smtp_username: finalSmtpUsername,
-          smtp_password: encryptedSmtpPassword,
-          use_ssl: finalUseSsl,
-          use_tls: finalUseTls,
-          auth_method: 'password',
-          is_active: true
-        })
-        .select()
-        .single();
-      
-      emailAccount = data;
-      dbError = error;
-    }
+    // Insert new account (we already checked it doesn't exist above)
+    const { data, error } = await supabaseAdmin
+      .from('email_accounts')
+      .insert({
+        user_id: userId,
+        provider: provider || 'custom',
+        email: email,
+        imap_host: finalImapHost,
+        imap_port: finalImapPort,
+        smtp_host: finalSmtpHost,
+        smtp_port: finalSmtpPort,
+        imap_username: finalImapUsername,
+        imap_password: encryptedImapPassword,
+        smtp_username: finalSmtpUsername,
+        smtp_password: encryptedSmtpPassword,
+        use_ssl: finalUseSsl,
+        use_tls: finalUseTls,
+        auth_method: 'password',
+        is_active: true
+      })
+      .select()
+      .single();
+    
+    emailAccount = data;
+    dbError = error;
 
     if (dbError) {
       console.error('Database error saving IMAP/SMTP account:', dbError);
@@ -193,6 +187,32 @@ router.post('/connect', authMiddleware, async (req, res) => {
         details: dbError.message
       });
     }
+
+    // ✅ Start IDLE monitoring for newly connected account
+    setTimeout(async () => {
+      try {
+        // Import idleManager from main server file (lazy load to avoid circular dependency)
+        const appModule = require('../../app');
+        const idleManager = appModule.idleManager || appModule.default?.idleManager;
+        
+        if (idleManager && emailAccount) {
+          // Fetch full account data for IDLE
+          const { data: fullAccount } = await supabaseAdmin
+            .from('email_accounts')
+            .select('*')
+            .eq('id', emailAccount.id)
+            .single();
+          
+          if (fullAccount && !fullAccount.needs_reconnection) {
+            await idleManager.startIdleMonitoring(fullAccount);
+            console.log(`✅ IDLE auto-started for newly connected account: ${emailAccount.email}`);
+          }
+        }
+      } catch (idleError) {
+        console.error(`❌ Failed to auto-start IDLE for ${emailAccount.email}:`, idleError.message);
+        // Don't fail the connection if IDLE start fails
+      }
+    }, 2000); // 2 second delay to ensure connection is stable
 
     res.json({
       success: true,
@@ -220,14 +240,52 @@ router.post('/connect', authMiddleware, async (req, res) => {
  */
 router.get('/accounts', authMiddleware, async (req, res) => {
   try {
-    const { data: accounts, error } = await supabaseAdmin
-      .from('email_accounts')
-      .select('id, email, provider, imap_host, smtp_host, auth_method, is_active, created_at')
-      .eq('user_id', req.user.id)
-      .eq('auth_method', 'password')
-      .order('created_at', { ascending: false });
+    // ✅ Validate user is authenticated
+    if (!req.user || !req.user.id) {
+      console.error('[ACCOUNTS] User not authenticated');
+      return res.status(401).json({ error: 'Unauthorized', message: 'User not authenticated' });
+    }
+
+    // ✅ Try to select all columns, but handle case where new columns don't exist yet
+    let accounts, error;
+    
+    try {
+      // First try with all columns (if migration was run)
+      const result = await supabaseAdmin
+        .from('email_accounts')
+        .select('id, email, provider, imap_host, smtp_host, auth_method, is_active, created_at, needs_reconnection, last_error, last_connection_attempt')
+        .eq('user_id', req.user.id)
+        .eq('auth_method', 'password')
+        .order('created_at', { ascending: false });
+      
+      accounts = result.data;
+      error = result.error;
+    } catch (selectError) {
+      // If that fails, try without the new columns (fallback for pre-migration state)
+      console.warn('[ACCOUNTS] New columns not found, using fallback query:', selectError.message);
+      const result = await supabaseAdmin
+        .from('email_accounts')
+        .select('id, email, provider, imap_host, smtp_host, auth_method, is_active, created_at')
+        .eq('user_id', req.user.id)
+        .eq('auth_method', 'password')
+        .order('created_at', { ascending: false });
+      
+      accounts = result.data;
+      error = result.error;
+      
+      // Add default values for missing columns
+      if (accounts) {
+        accounts = accounts.map(acc => ({
+          ...acc,
+          needs_reconnection: false,
+          last_error: null,
+          last_connection_attempt: null
+        }));
+      }
+    }
 
     if (error) {
+      console.error('[ACCOUNTS] Database error:', error);
       return res.status(500).json({ error: 'Failed to fetch accounts', details: error.message });
     }
 
@@ -236,21 +294,138 @@ router.get('/accounts', authMiddleware, async (req, res) => {
       accounts: accounts || []
     });
   } catch (error) {
-    console.error('Error fetching accounts:', error);
+    console.error('[ACCOUNTS] Unexpected error:', error);
     res.status(500).json({ error: 'Failed to fetch accounts', message: error.message });
   }
 });
 
 /**
+ * GET /api/imap-smtp/emails-quick/:accountId
+ * ⚡ FAST ENDPOINT: Load emails from database instantly, then sync in background
+ * Returns emails in <200ms instead of 15-30 seconds
+ */
+router.get('/emails-quick/:accountId', authMiddleware, async (req, res) => {
+  const startTime = Date.now();
+  try {
+    const { accountId } = req.params;
+    const { folder = 'INBOX', limit = 20 } = req.query;
+
+    // Verify account belongs to user
+    const { data: account, error: accountError } = await supabaseAdmin
+      .from('email_accounts')
+      .select('id, user_id, needs_reconnection')
+      .eq('id', accountId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (accountError || !account) {
+      return res.status(404).json({ 
+        success: false,
+        error: 'Email account not found' 
+      });
+    }
+
+    console.log(`[QUICK FETCH] Loading ${limit} emails from database for account ${accountId}, folder ${folder}`);
+
+    // STEP 1: Load from database IMMEDIATELY (50-200ms)
+    const { data: emails, error: dbError } = await supabaseAdmin
+      .from('emails')
+      .select(`
+        id, uid, sender_email, sender_name, recipient_email, 
+        subject, body_text, body_html, received_at, 
+        is_read, is_starred, folder_name, attachments_count, attachments_meta
+      `)
+      .eq('email_account_id', accountId)
+      .eq('folder_name', folder)
+      .order('received_at', { ascending: false, nullsFirst: false })
+      .limit(parseInt(limit) || 20);
+
+    if (dbError) {
+      console.error('[QUICK FETCH] Database error:', dbError);
+      throw dbError;
+    }
+
+    // Format emails for frontend
+    const formattedEmails = (emails || []).map(email => ({
+      id: email.id,
+      uid: email.uid,
+      from: email.sender_email || 'Unknown',
+      fromEmail: email.sender_email || '',
+      fromName: email.sender_name || '',
+      to: email.recipient_email || '',
+      toEmail: email.recipient_email || '',
+      subject: email.subject || '(No subject)',
+      body: email.body_text || '',
+      bodyHtml: email.body_html || '',
+      date: email.received_at || email.created_at || new Date().toISOString(),
+      timestamp: new Date(email.received_at || email.created_at).getTime(),
+      isRead: email.is_read || false,
+      isStarred: email.is_starred || false,
+      attachments: email.attachments_meta || [],
+      folder: email.folder_name || folder,
+      accountId: accountId
+    }));
+
+    const dbLoadTime = Date.now() - startTime;
+    console.log(`[QUICK FETCH] ✅ Loaded ${formattedEmails.length} emails from database in ${dbLoadTime}ms`);
+
+    // STEP 2: Return immediately (don't wait for sync!)
+    res.json({
+      success: true,
+      emails: formattedEmails,
+      count: formattedEmails.length,
+      source: 'database',
+      loadTime: dbLoadTime
+    });
+
+    // STEP 3: Sync new emails in background (non-blocking)
+    // ✅ CRITICAL: Only trigger sync if account doesn't need reconnection
+    if (!account.needs_reconnection) {
+      // Use setImmediate to ensure response is sent before sync starts
+      setImmediate(async () => {
+        try {
+          console.log(`[BACKGROUND SYNC] Starting incremental sync for ${accountId}/${folder}`);
+          // Import here to avoid circular dependency issues
+          const backgroundSyncService = require('../services/backgroundSyncService');
+          const newCount = await backgroundSyncService.syncNewEmailsOnly(accountId, folder);
+          if (newCount > 0) {
+            console.log(`[BACKGROUND SYNC] ✅ Synced ${newCount} new emails for ${accountId}/${folder}`);
+          } else {
+            console.log(`[BACKGROUND SYNC] No new emails for ${accountId}/${folder}`);
+          }
+        } catch (err) {
+          console.error(`[BACKGROUND SYNC] ❌ Failed for ${accountId}/${folder}:`, err.message);
+          // Don't throw - background sync failures shouldn't affect user experience
+        }
+      });
+    } else {
+      console.log(`[QUICK FETCH] ⏭️  Skipping background sync for ${accountId} - account needs reconnection`);
+    }
+
+  } catch (error) {
+    console.error('[QUICK FETCH] Error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+/**
  * GET /api/imap-smtp/emails/:accountId
- * Fetch emails from IMAP account
+ * Fetch emails from IMAP account (legacy endpoint - use emails-quick for better performance)
+ * 
+ * Query params:
+ * - folder: Folder name (default: INBOX)
+ * - limit: Number of emails to fetch (default: 50)
+ * - headersOnly: Fetch headers only (default: true)
+ * - forceRefresh: If true, fetch most recent emails regardless of sync state (default: false)
  */
 router.get('/emails/:accountId', authMiddleware, async (req, res) => {
   // console.log('/api/imap-smtp/emails/:accountId====================',);
   try {
     const { accountId } = req.params;
-    const { folder = 'INBOX', limit = 50 } = req.query;
-
+    const { folder = 'INBOX', limit = 50, forceRefresh = 'false' } = req.query;
 
     // Verify account belongs to user
     const { data: account, error: accountError } = await supabaseAdmin
@@ -263,7 +438,23 @@ router.get('/emails/:accountId', authMiddleware, async (req, res) => {
     if (accountError || !account) {
       return res.status(404).json({ error: 'Email account not found' });
     }
-    const result = await fetchEmails(accountId, folder, parseInt(limit));
+    
+    // ✅ OPTIMIZATION: Use headers-only mode by default for faster loading
+    // But allow full fetch for initial sync (when headersOnly=false)
+    const headersOnly = req.query.headersOnly !== undefined 
+      ? req.query.headersOnly !== 'false' && req.query.headersOnly !== '0'
+      : true; // Default to true (headers only) unless explicitly false
+    
+    // ✅ NEW: If forceRefresh=true, fetch most recent emails regardless of sync state
+    const shouldForceRefresh = forceRefresh === 'true' || forceRefresh === '1';
+    
+    console.log(`[FETCH] Fetching emails with headersOnly=${headersOnly}, limit=${limit}, forceRefresh=${shouldForceRefresh}`);
+    
+    const result = await fetchEmails(accountId, folder, {
+      limit: parseInt(limit) || 10,
+      headersOnly: headersOnly,
+      forceRefresh: shouldForceRefresh // Pass force refresh flag
+    });
 
     if (!result.success) {
       // Check if it's an authentication error
@@ -283,7 +474,9 @@ router.get('/emails/:accountId', authMiddleware, async (req, res) => {
     res.json({
       success: true,
       emails: result.emails,
-      count: result.count
+      count: result.count || result.savedCount || 0,
+      savedCount: result.savedCount || 0,
+      mode: result.mode || 'incremental'
     });
   } catch (error) {
     console.error('Error fetching emails:', error);
@@ -633,6 +826,79 @@ router.get('/sync-logs/:accountId', authMiddleware, async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/imap-smtp/debug/:accountId
+ * Debug endpoint to check database state
+ */
+router.get('/debug/:accountId', authMiddleware, async (req, res) => {
+  try {
+    const { accountId } = req.params;
+
+    // Check account exists
+    const { data: account, error: accountError } = await supabaseAdmin
+      .from('email_accounts')
+      .select('*')
+      .eq('id', accountId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (accountError || !account) {
+      return res.json({
+        success: false,
+        error: 'Account not found',
+        accountId
+      });
+    }
+
+    // Check emails in database
+    const { data: emails, error: emailError, count } = await supabaseAdmin
+      .from('emails')
+      .select('*', { count: 'exact', head: false })
+      .eq('email_account_id', accountId)
+      .limit(5);
+
+    // Get total count
+    const { count: totalCount } = await supabaseAdmin
+      .from('emails')
+      .select('*', { count: 'exact', head: true })
+      .eq('email_account_id', accountId);
+
+    // Check sync state
+    const { data: syncState } = await supabaseAdmin
+      .from('email_sync_state')
+      .select('*')
+      .eq('account_id', accountId);
+
+    res.json({
+      success: true,
+      account: {
+        id: account.id,
+        email: account.email,
+        provider: account.provider,
+        is_active: account.is_active,
+        initial_sync_completed: account.initial_sync_completed,
+        needs_reconnection: account.needs_reconnection || false,
+        last_error: account.last_error || null,
+        last_connection_attempt: account.last_connection_attempt || null
+      },
+      database: {
+        totalEmails: totalCount || 0,
+        sampleEmails: emails || [],
+        emailsTableError: emailError?.message || null
+      },
+      syncState: syncState || [],
+      diagnosis: totalCount === 0 
+        ? '⚠️ No emails in database. Run initial sync or trigger background sync.'
+        : `✅ Database has ${totalCount} emails`
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });

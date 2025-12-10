@@ -3,6 +3,7 @@ const nodemailer = require('nodemailer');
 const { simpleParser } = require('mailparser');
 const { supabaseAdmin } = require('../config/supabase');
 const { decryptPassword } = require('../utils/encryption');
+const { retryWithBackoff, isThrottlingError } = require('../utils/imapRetry');
 
 // Note: decryptPassword is imported from ../utils/encryption.js (line 5)
 
@@ -134,9 +135,24 @@ async function testImapConnection(config) {
         // Ignore errors when closing connection
       }
     }
+    
+    // Provide more helpful error messages
+    let errorMessage = error.message;
+    if (error.message?.includes('ECONNREFUSED')) {
+      errorMessage = 'Connection refused. Please check the IMAP host and port.';
+    } else if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timeout')) {
+      errorMessage = 'Connection timeout. Please check your network connection and IMAP settings.';
+    } else if (error.message?.includes('authentication') || error.message?.includes('credentials') || error.message?.includes('LOGIN') || error.message?.includes('AUTHENTICATIONFAILED')) {
+      errorMessage = 'Authentication failed. Please check your email and password.';
+    } else if (error.message?.includes('Connection ended unexpectedly') || error.message?.includes('connection closed')) {
+      errorMessage = 'Connection closed unexpectedly. This usually means invalid credentials or the server rejected the connection. Please verify your email and app password.';
+    }
+    
+    console.error(`[TEST IMAP] ❌ Connection failed: ${errorMessage}`);
+    
     return {
       success: false,
-      error: error.message,
+      error: errorMessage,
       details: error.toString()
     };
   }
@@ -177,8 +193,26 @@ async function testSmtpConnection(config) {
 
 /**
  * Fetch emails from IMAP
+ * OPTIMIZED: Supports headersOnly mode and reduced default limit
+ * @param {string} accountId - Account ID
+ * @param {string} folder - Folder name (default: 'INBOX')
+ * @param {number|object} limitOrOptions - Either limit number or options object
+ * @param {object} options - Options object (if limitOrOptions is a number)
  */
-async function fetchEmails(accountId, folder = 'INBOX', limit = 50) {
+async function fetchEmails(accountId, folder = 'INBOX', limitOrOptions = 10, options = {}) {
+  // Handle both old API (limit) and new API (options object)
+  let limit, headersOnly, forceRefresh;
+  if (typeof limitOrOptions === 'object') {
+    // New API: fetchEmails(accountId, folder, { limit: 10, headersOnly: true, forceRefresh: false })
+    limit = limitOrOptions.limit || options.limit || 10;
+    headersOnly = limitOrOptions.headersOnly !== undefined ? limitOrOptions.headersOnly : (options.headersOnly !== undefined ? options.headersOnly : true);
+    forceRefresh = limitOrOptions.forceRefresh !== undefined ? limitOrOptions.forceRefresh : (options.forceRefresh !== undefined ? options.forceRefresh : false);
+  } else {
+    // Old API: fetchEmails(accountId, folder, 10)
+    limit = limitOrOptions || 10; // ✅ REDUCED from 50 to 10
+    headersOnly = options.headersOnly !== undefined ? options.headersOnly : true; // ✅ Default to headers only
+    forceRefresh = options.forceRefresh !== undefined ? options.forceRefresh : false;
+  }
 
   try {
     // Get account from database
@@ -200,46 +234,292 @@ async function fetchEmails(accountId, folder = 'INBOX', limit = 50) {
     // Decrypt password
     const password = decryptPassword(account.imap_password);
     
-    // Connect to IMAP
-    const connection = await imaps.connect({
-      imap: {
-        user: account.imap_username,
-        password: password,
-        host: account.imap_host,
-        port: account.imap_port || 993,
-        tls: account.use_ssl !== false,
-        tlsOptions: { rejectUnauthorized: false },
-        authTimeout: 10000,
+    // Connect to IMAP with retry
+    const connection = await retryWithBackoff(
+      async () => {
+        return await imaps.connect({
+          imap: {
+            user: account.imap_username,
+            password: password,
+            host: account.imap_host,
+            port: account.imap_port || 993,
+            tls: account.use_ssl !== false,
+            tlsOptions: { rejectUnauthorized: false },
+            authTimeout: 10000,
+          }
+        });
+      },
+      {
+        maxRetries: 3,
+        baseDelay: 2000,
+        maxDelay: 30000,
+        operationName: `Connecting to IMAP for ${account.email}`
       }
-    });
+    );
     
-    // Open mailbox
-    await connection.openBox(folder);
+    // Open mailbox with retry
+    const box = await retryWithBackoff(
+      async () => {
+        try {
+          return await connection.openBox(folder);
+        } catch (error) {
+          // Handle folder not found gracefully
+          if (error.textCode === 'NONEXISTENT' || error.message?.includes('Unknown Mailbox')) {
+            throw new Error(`Folder ${folder} does not exist`);
+          }
+          throw error;
+        }
+      },
+      {
+        maxRetries: 3,
+        baseDelay: 2000,
+        maxDelay: 30000,
+        operationName: `Opening folder ${folder}`
+      }
+    );
     
-    // Fetch messages - get all messages, not just UNSEEN
-    // This ensures we sync all emails to Supabase
-    const messages = await connection.search(['ALL'], { 
-      bodies: '', 
-      struct: true 
-    });
+    // ✅ CRITICAL: Determine sync mode (initial vs incremental vs force refresh)
+    const isInitialSync = !account.initial_sync_completed;
+    const totalMessages = box.messages?.total || 0;
     
-    // Limit results
-    const limitedMessages = messages.slice(0, 3000);
+    // ✅ If forceRefresh=true, treat as initial sync to fetch most recent emails
+    const effectiveSyncMode = forceRefresh ? 'FORCE_REFRESH' : (isInitialSync ? 'INITIAL' : 'INCREMENTAL');
+    
+    console.log('[FETCH] ========================================');
+    console.log('[FETCH] Account:', accountId);
+    console.log('[FETCH] Folder:', folder);
+    console.log('[FETCH] Mode:', effectiveSyncMode);
+    console.log('[FETCH] Initial sync completed:', account.initial_sync_completed);
+    console.log('[FETCH] Force refresh:', forceRefresh);
+    console.log('[FETCH] Total messages in mailbox:', totalMessages);
+    console.log('[FETCH] ========================================');
+    
+    // ✅ OPTIMIZATION: Fetch strategy based on headersOnly mode
+    // If headersOnly=true, only fetch headers/metadata (faster)
+    // If headersOnly=false, fetch full email bodies (slower)
+    const fetchOptions = headersOnly 
+      ? {
+          bodies: '', // Empty string means fetch headers only
+          struct: false // Don't need structure for headers
+        }
+      : {
+          bodies: '', // Full body
+          struct: true // Need structure for attachments
+        };
+    
+    let messages;
+    
+    // ✅ SMART INITIAL SYNC: Fetch only 20 most recent emails using sequence numbers
+    if (isInitialSync) {
+      console.log('[FETCH] 🎯 INITIAL SYNC - Fetching 20 most recent emails');
+      
+      if (totalMessages === 0) {
+        console.log('[FETCH] 📭 Mailbox is empty, no emails to fetch');
+        connection.end();
+        return {
+          success: true,
+          emails: [],
+          count: 0,
+          mode: 'initial',
+          savedCount: 0
+        };
+      }
+      
+      const fetchLimit = Math.min(20, totalMessages);
+      console.log(`[FETCH] 📊 Will fetch ${fetchLimit} most recent emails from ${totalMessages} total`);
+      
+      // Calculate sequence range for last N emails
+      // Example: If 5000 emails exist, fetch sequence 4981:5000 (last 20)
+      const startSeq = Math.max(1, totalMessages - fetchLimit + 1);
+      const endSeq = totalMessages;
+      
+      console.log(`[FETCH] 📬 Fetching sequence ${startSeq}:${endSeq} (last ${fetchLimit} emails)`);
+      
+      try {
+        // Try to fetch using sequence number range
+        // imap-simple search accepts sequence ranges like "1:20" or "4981:5000"
+        messages = await retryWithBackoff(
+          async () => {
+            return await connection.search([`${startSeq}:${endSeq}`], fetchOptions);
+          },
+          {
+            maxRetries: 5,
+            baseDelay: 3000,
+            maxDelay: 60000,
+            operationName: `Fetching last ${fetchLimit} emails by sequence (${startSeq}:${endSeq})`
+          }
+        );
+        
+        console.log(`[FETCH] ✅ Retrieved ${messages.length} messages from IMAP using sequence range`);
+        
+        // Sort by UID descending to ensure newest first (sequence numbers may not guarantee order)
+        messages.sort((a, b) => {
+          const uidA = parseInt(a.attributes.uid) || 0;
+          const uidB = parseInt(b.attributes.uid) || 0;
+          return uidB - uidA; // Descending order (highest UID = newest)
+        });
+        
+        console.log(`[FETCH] 🔄 Sorted ${messages.length} messages by UID (newest first)`);
+        
+      } catch (seqError) {
+        // Fallback: If sequence range doesn't work, fetch all and filter
+        console.warn('[FETCH] ⚠️  Sequence range search failed, falling back to UID-based fetch:', seqError.message);
+        
+        messages = await retryWithBackoff(
+          async () => {
+            return await connection.search(['ALL'], fetchOptions);
+          },
+          {
+            maxRetries: 5,
+            baseDelay: 3000,
+            maxDelay: 60000,
+            operationName: `Fetching all emails for initial sync (fallback)`
+          }
+        );
+        
+        // Sort by UID descending and take top 20
+        messages.sort((a, b) => {
+          const uidA = parseInt(a.attributes.uid) || 0;
+          const uidB = parseInt(b.attributes.uid) || 0;
+          return uidB - uidA;
+        });
+        
+        messages = messages.slice(0, fetchLimit);
+        console.log(`[FETCH] ✅ Selected ${messages.length} newest emails (fallback method)`);
+      }
+      
+    } else {
+      // ✅ INCREMENTAL SYNC: Fetch only new emails since last sync (unless forceRefresh)
+      if (forceRefresh) {
+        // ✅ FORCE REFRESH: Fetch most recent emails regardless of sync state
+        console.log('[FETCH] 🔄 Force refresh - fetching most recent emails');
+        
+        // Fetch most recent emails by sequence number (most efficient)
+        const totalCount = box.messages?.total || 0;
+        if (totalCount > 0) {
+          const startSeq = Math.max(1, totalCount - limit + 1);
+          const endSeq = totalCount;
+          
+          console.log(`[FETCH] 📊 Fetching sequence ${startSeq}:${endSeq} (most recent ${limit} emails)`);
+          
+          messages = await retryWithBackoff(
+            async () => {
+              return await connection.search([`${startSeq}:${endSeq}`], fetchOptions);
+            },
+            {
+              maxRetries: 5,
+              baseDelay: 3000,
+              maxDelay: 60000,
+              operationName: `Fetching most recent emails from ${folder} (force refresh)`
+            }
+          );
+          
+          // Sort by UID descending (highest UID = newest)
+          messages.sort((a, b) => {
+            const uidA = parseInt(a.attributes.uid) || 0;
+            const uidB = parseInt(b.attributes.uid) || 0;
+            return uidB - uidA; // Descending
+          });
+          
+          console.log(`[FETCH] ✅ Retrieved ${messages.length} most recent emails`);
+        } else {
+          messages = [];
+          console.log('[FETCH] ⚠️  Mailbox is empty');
+        }
+      } else {
+        // Normal incremental sync
+        console.log('[FETCH] 📥 Incremental sync - fetching new emails since last sync');
+        
+        // Get last synced UID
+        const { data: syncState } = await supabaseAdmin
+          .from('email_sync_state')
+          .select('last_uid_synced')
+          .eq('account_id', accountId)
+          .eq('folder_name', folder)
+          .single();
+        
+        const lastUID = syncState?.last_uid_synced || 0;
+        console.log(`[FETCH] 🔢 Last synced UID: ${lastUID}`);
+        
+        if (lastUID > 0) {
+          // Fetch all messages, then filter client-side by UID
+          // (imap-simple doesn't support UID range search directly)
+          const allMessages = await retryWithBackoff(
+            async () => {
+              return await connection.search(['ALL'], fetchOptions);
+            },
+            {
+              maxRetries: 5,
+              baseDelay: 3000,
+              maxDelay: 60000,
+              operationName: `Fetching emails from ${folder} (incremental)`
+            }
+          );
+          
+          // Filter to only get new emails (UID > lastUID)
+          messages = allMessages.filter(msg => {
+            const uid = parseInt(msg.attributes.uid) || 0;
+            return uid > lastUID;
+          });
+          
+          console.log(`[FETCH] 📨 Found ${messages.length} new emails (out of ${allMessages.length} total)`);
+        } else {
+          // No previous sync state, fetch all (shouldn't happen, but handle gracefully)
+          console.log('[FETCH] ⚠️  No previous sync state, fetching all messages');
+          messages = await retryWithBackoff(
+            async () => {
+              return await connection.search(['ALL'], fetchOptions);
+            },
+            {
+              maxRetries: 5,
+              baseDelay: 3000,
+              maxDelay: 60000,
+              operationName: `Fetching emails from ${folder}`
+            }
+          );
+        }
+        
+        // Limit incremental sync results
+        messages = messages.slice(0, Math.min(limit, 100)); // Max 100 for performance
+      }
+    }
+    
+    const limitedMessages = messages;
     
     // Parse emails
     const emails = [];
     for (const message of limitedMessages) {
       try {
-        const all = message.parts.find(part => part.which === '');
         const id = message.attributes.uid;
-        const idHeader = 'Imap-Id: ' + id + '\r\n';
+        const flags = message.attributes.flags || [];
         
-        const parsed = await simpleParser(idHeader + all.body);
+        let parsed;
+        if (headersOnly) {
+          // ✅ Fast path: Extract from IMAP envelope/attributes directly (no parsing needed)
+          const envelope = message.attributes.envelope;
+          if (envelope) {
+            parsed = {
+              from: { value: envelope.from || [], text: envelope.from?.[0]?.address || '' },
+              to: { value: envelope.to || [], text: envelope.to?.[0]?.address || '' },
+              subject: envelope.subject || '',
+              date: message.attributes.date || new Date()
+            };
+          } else {
+            // Fallback: still need to parse if envelope not available
+            const all = message.parts.find(part => part.which === '');
+            const idHeader = 'Imap-Id: ' + id + '\r\n';
+            parsed = await simpleParser(idHeader + all.body);
+          }
+        } else {
+          // Full parsing for body content
+          const all = message.parts.find(part => part.which === '');
+          const idHeader = 'Imap-Id: ' + id + '\r\n';
+          parsed = await simpleParser(idHeader + all.body);
+        }
         
-        // Get accurate date from email - use parsed.date which is the actual email date
-        let emailDate = parsed.date;
+        // Get accurate date from email
+        let emailDate = parsed.date || message.attributes.date;
         if (!emailDate || !(emailDate instanceof Date) || isNaN(emailDate.getTime())) {
-          // Fallback to current date if date is invalid
           emailDate = new Date();
         }
         
@@ -250,16 +530,16 @@ async function fetchEmails(accountId, folder = 'INBOX', limit = 50) {
           fromEmail: parsed.from?.value?.[0]?.address || parsed.from?.text || '',
           to: parsed.to?.text || parsed.to?.value?.[0]?.address || '',
           subject: parsed.subject || '(No subject)',
-          body: parsed.text || '',
-          bodyHtml: parsed.html || '',
-          date: emailDate.toISOString(), // Store as ISO string for accurate time
-          timestamp: emailDate.getTime(), // Store timestamp for sorting
-          isRead: message.attributes.flags?.includes('\\Seen') || false,
-          attachments: parsed.attachments?.map(att => ({
+          body: headersOnly ? '' : (parsed.text || ''), // Only include body if not headersOnly
+          bodyHtml: headersOnly ? '' : (parsed.html || ''), // Only include HTML if not headersOnly
+          date: emailDate.toISOString(),
+          timestamp: emailDate.getTime(),
+          isRead: flags.includes('\\Seen') || false,
+          attachments: headersOnly ? [] : (parsed.attachments?.map(att => ({
             filename: att.filename,
             contentType: att.contentType,
             size: att.size
-          })) || [],
+          })) || []),
           folder: folder
         });
       } catch (parseError) {
@@ -275,14 +555,215 @@ async function fetchEmails(accountId, folder = 'INBOX', limit = 50) {
       return timeB - timeA; // Descending order (newest first)
     });
     
+    // ✅ CRITICAL: Save emails to database (for initial sync)
+    console.log(`[FETCH] Saving ${emails.length} emails to database...`);
+    const savedEmails = [];
+    
+    // Import webhook function (only if not initial sync)
+    let callEmailWebhook = null;
+    if (!isInitialSync) {
+      try {
+        const webhookModule = require('../utils/emailWebhook');
+        callEmailWebhook = webhookModule.callEmailWebhook;
+      } catch (err) {
+        console.warn('[FETCH] Could not load webhook module:', err.message);
+      }
+    }
+    
+    for (const email of emails) {
+      try {
+        const providerId = `${accountId}_${email.uid}_${folder}`;
+        
+        // ✅ USE UPSERT with correct constraint (prevents duplicates from competing syncs)
+        const { error: upsertError } = await supabaseAdmin
+          .from('emails')
+          .upsert({
+            email_account_id: accountId,
+            provider_message_id: providerId,
+            uid: email.uid,
+            sender_email: email.fromEmail || email.from || '',
+            sender_name: email.fromName || '',
+            recipient_email: email.toEmail || email.to || '',
+            subject: email.subject || '[No Subject]',
+            body_text: email.body || '',
+            body_html: email.bodyHtml || '',
+            received_at: email.date || new Date().toISOString(),
+            folder_name: folder,
+            is_read: email.isRead || false,
+            is_starred: email.isStarred || false,
+            is_deleted: false,
+            attachments_count: email.attachments?.length || 0,
+            attachments_meta: email.attachments || [],
+            updated_at: new Date().toISOString()
+          }, {
+            onConflict: 'email_account_id,provider_message_id', // ✅ Correct constraint
+            ignoreDuplicates: false // Update if exists
+          });
+        
+        // ✅ Only log real errors (not duplicate key errors)
+        if (upsertError) {
+          // Suppress duplicate key errors (code 23505) - they're expected when multiple syncs run
+          if (upsertError.code !== '23505' && !upsertError.message?.includes('duplicate key')) {
+            console.error(`[FETCH] ❌ Upsert error for UID ${email.uid}:`, upsertError.message);
+          }
+          // Skip this email if there's a real error
+          continue;
+        }
+        
+        // Email saved successfully
+        savedEmails.push(email);
+        
+        // ✅ Send webhook for new emails (only if not initial sync)
+        if (!isInitialSync && callEmailWebhook && account.user_id) {
+          try {
+            const emailData = {
+              uid: email.uid,
+              subject: email.subject || '[No Subject]',
+              sender_name: email.fromName || '',
+              sender_email: email.fromEmail || email.from || '',
+              recipient_email: email.toEmail || email.to || '',
+              body_text: email.body || '',
+              body_html: email.bodyHtml || '',
+              received_at: email.date || new Date().toISOString(),
+              folder_name: folder,
+              is_read: email.isRead || false,
+              is_starred: email.isStarred || false,
+              attachments_count: email.attachments?.length || 0,
+              attachments_meta: email.attachments || []
+            };
+            await callEmailWebhook(emailData, accountId, account.user_id);
+          } catch (webhookError) {
+            console.error(`[FETCH] Error calling webhook for email UID ${email.uid}:`, webhookError.message);
+            // Don't fail the whole process if webhook fails
+          }
+        }
+      } catch (err) {
+        console.error(`[FETCH] Error saving email UID ${email.uid}:`, err.message);
+      }
+    }
+    
+    console.log(`[FETCH] 💾 Saved ${savedEmails.length}/${emails.length} emails to database`);
+    
+    // Update sync state
+    if (savedEmails.length > 0) {
+      const maxUID = Math.max(...savedEmails.map(e => e.uid));
+      await supabaseAdmin
+        .from('email_sync_state')
+        .upsert({
+          account_id: accountId,
+          folder_name: folder,
+          last_uid_synced: maxUID,
+          total_server_count: emails.length,
+          last_sync_at: new Date().toISOString(),
+          sync_errors_count: 0,
+          last_error_message: null,
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'account_id,folder_name'
+        });
+      
+      console.log(`[FETCH] 🔢 Updated sync state: last_uid_synced = ${maxUID}`);
+    }
+    
+    // ✅ CRITICAL: Mark initial sync as completed and enable webhook
+    if (isInitialSync && savedEmails.length > 0) {
+      try {
+        console.log('[FETCH] ✅ Marking initial sync as completed and enabling webhook...');
+        const { error: updateError } = await supabaseAdmin
+          .from('email_accounts')
+          .update({ 
+            initial_sync_completed: true,
+            webhook_enabled_at: new Date().toISOString(), // ✅ Enable webhook
+            last_successful_sync_at: new Date().toISOString()
+          })
+          .eq('id', accountId)
+          .eq('initial_sync_completed', false); // Only update if still FALSE (atomic check)
+        
+        if (updateError) {
+          console.error('[FETCH] ⚠️  Failed to mark initial sync as completed:', updateError.message);
+          // Don't throw - emails were saved successfully
+        } else {
+          console.log('[FETCH] ✅ Initial sync completed successfully - account marked as synced, webhook enabled');
+        }
+      } catch (markError) {
+        console.error('[FETCH] ❌ Error marking initial sync:', markError.message);
+        // Don't throw - emails were saved successfully
+      }
+    } else if (isInitialSync && savedEmails.length === 0) {
+      console.log('[FETCH] ⚠️  Initial sync completed but no emails saved - not marking as completed');
+    }
+    
     connection.end();
     
-    return {
+    const result = {
       success: true,
-      emails: emails,
-      count: emails.length
+      emails: savedEmails.length > 0 ? savedEmails : emails, // Return saved emails if any, otherwise original
+      count: savedEmails.length > 0 ? savedEmails.length : emails.length,
+      mode: forceRefresh ? 'force_refresh' : (isInitialSync ? 'initial' : (headersOnly ? 'headers' : 'incremental')), // Indicate sync mode
+      savedCount: savedEmails.length, // Indicate how many were saved
+      isInitialSync: isInitialSync
     };
+    
+    console.log(`[FETCH] ✅ Fetch complete: ${result.count} emails, mode: ${result.mode}`);
+    
+    return result;
   } catch (error) {
+    // ✅ Detect and mark authentication errors
+    const isAuthError = error.message?.includes('Not authenticated') || 
+                       error.message?.includes('AUTHENTICATIONFAILED') ||
+                       error.message?.includes('Invalid credentials') ||
+                       error.message?.includes('authentication') ||
+                       error.message?.includes('credentials') ||
+                       error.message?.includes('LOGIN');
+
+    if (isAuthError) {
+      console.error(`[FETCH] ❌ Authentication failed for account ${accountId}:`, error.message);
+      
+      // Mark account as needing reconnection
+      try {
+        await supabaseAdmin
+          .from('email_accounts')
+          .update({ 
+            needs_reconnection: true,
+            last_error: `Authentication failed: ${error.message}`,
+            last_connection_attempt: new Date().toISOString()
+          })
+          .eq('id', accountId);
+        
+        console.log(`[FETCH] ✅ Marked account ${accountId} as needing reconnection`);
+      } catch (updateErr) {
+        console.error('[FETCH] Failed to update account status:', updateErr);
+      }
+      
+      return {
+        success: false,
+        error: error.message,
+        emails: [],
+        isAuthError: true
+      };
+    }
+    
+    // Handle throttling errors gracefully
+    if (isThrottlingError(error)) {
+      console.error('Error fetching emails (throttled):', error.message);
+      return {
+        success: false,
+        error: 'Gmail rate limit exceeded. Please try again in a few minutes.',
+        emails: [],
+        throttled: true
+      };
+    }
+    
+    // Handle folder not found
+    if (error.message?.includes('does not exist')) {
+      console.warn(`Folder ${folder} does not exist for account ${accountId}`);
+      return {
+        success: false,
+        error: `Folder ${folder} does not exist`,
+        emails: []
+      };
+    }
+    
     console.error('Error fetching emails:', error);
     return {
       success: false,
@@ -375,24 +856,49 @@ async function getFolders(accountId) {
       throw new Error('IMAP settings not configured for this account');
     }
     
+    // ✅ CRITICAL: Skip if account needs reconnection (prevents rate limiting)
+    if (account.needs_reconnection) {
+      throw new Error('Account needs reconnection. Please reconnect your email account first.');
+    }
+    
     // Decrypt password
     const password = decryptPassword(account.imap_password);
     
-    // Connect to IMAP
-    const connection = await imaps.connect({
-      imap: {
-        user: account.imap_username,
-        password: password,
-        host: account.imap_host,
-        port: account.imap_port || 993,
-        tls: account.use_ssl !== false,
-        tlsOptions: { rejectUnauthorized: false },
-        authTimeout: 10000,
+    // Connect to IMAP with retry
+    const connection = await retryWithBackoff(
+      async () => {
+        return await imaps.connect({
+          imap: {
+            user: account.imap_username,
+            password: password,
+            host: account.imap_host,
+            port: account.imap_port || 993,
+            tls: account.use_ssl !== false,
+            tlsOptions: { rejectUnauthorized: false },
+            authTimeout: 10000,
+          }
+        });
+      },
+      {
+        maxRetries: 3,
+        baseDelay: 2000,
+        maxDelay: 30000,
+        operationName: `Connecting to IMAP for folders (${account.email})`
       }
-    });
+    );
     
-    // Get all mailboxes
-    const boxes = await connection.getBoxes();
+    // Get all mailboxes with retry
+    const boxes = await retryWithBackoff(
+      async () => {
+        return await connection.getBoxes();
+      },
+      {
+        maxRetries: 5,
+        baseDelay: 3000,
+        maxDelay: 60000,
+        operationName: `Getting folders for ${account.email}`
+      }
+    );
     
     // Flatten folder structure and filter out system folders
     const folders = [];
@@ -434,6 +940,17 @@ async function getFolders(accountId) {
       folders: folders
     };
   } catch (error) {
+    // Handle throttling errors gracefully
+    if (isThrottlingError(error)) {
+      console.error('Error getting folders (throttled):', error.message);
+      return {
+        success: false,
+        error: 'Gmail rate limit exceeded. Please try again in a few minutes.',
+        folders: [],
+        throttled: true
+      };
+    }
+    
     console.error('Error getting folders:', error);
     return {
       success: false,

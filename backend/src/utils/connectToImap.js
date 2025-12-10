@@ -51,18 +51,27 @@ async function validateImap({ email, password, host, port, useSsl }) {
       port: port || 993,
       tls: useSsl !== false,
       tlsOptions: { rejectUnauthorized: false },
-      authTimeout: 10000,
-      connTimeout: 10000
+      authTimeout: 15000, // Increased timeout
+      connTimeout: 15000,
+      keepalive: true
     }
   };
 
   let connection = null;
   try {
+    console.log(`[VALIDATE IMAP] Testing connection to ${host}:${port || 993} for ${email}`);
     connection = await imaps.connect(config);
-    await connection.end();
-    return true;
-  } catch (error) {
-    console.error('IMAP validation error:', error);
+    console.log(`[VALIDATE IMAP] ✅ Connection successful`);
+    
+    // Try to open INBOX to verify full connection works
+    try {
+      await connection.openBox('INBOX');
+      console.log(`[VALIDATE IMAP] ✅ INBOX opened successfully`);
+    } catch (openError) {
+      console.warn(`[VALIDATE IMAP] ⚠️  Could not open INBOX:`, openError.message);
+      // Still consider it valid if connection was established
+    }
+    
     if (connection) {
       try {
         await connection.end();
@@ -70,7 +79,34 @@ async function validateImap({ email, password, host, port, useSsl }) {
         // Ignore cleanup errors
       }
     }
-    throw error;
+    return true;
+  } catch (error) {
+    console.error(`[VALIDATE IMAP] ❌ Validation failed:`, error.message);
+    
+    // Provide more helpful error message
+    let errorMessage = error.message;
+    if (error.message?.includes('Connection ended unexpectedly') || error.message?.includes('connection closed')) {
+      errorMessage = 'Connection closed unexpectedly. This usually means invalid credentials. Please verify your email and app password.';
+    } else if (error.message?.includes('authentication') || error.message?.includes('credentials') || error.message?.includes('LOGIN') || error.message?.includes('AUTHENTICATIONFAILED')) {
+      errorMessage = 'Authentication failed. Please check your email and password.';
+    } else if (error.message?.includes('ECONNREFUSED')) {
+      errorMessage = 'Connection refused. Please check the IMAP host and port.';
+    } else if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timeout')) {
+      errorMessage = 'Connection timeout. Please check your network connection.';
+    }
+    
+    if (connection) {
+      try {
+        await connection.end();
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+    }
+    
+    // Create a new error with the improved message
+    const improvedError = new Error(errorMessage);
+    improvedError.originalError = error;
+    throw improvedError;
   }
 }
 

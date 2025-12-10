@@ -9,6 +9,8 @@ import { API_URL } from '@/config';
 // 🔧 FIX: Global singleton to prevent multiple subscriptions (React Strict Mode proof)
 let authSubscription = null;
 let pendingSessionCreation = null; // Global promise for true deduplication
+let sessionCreationInProgress = false; // Track if session creation is currently happening
+let sessionCreationTimeout = null; // Timeout for debouncing
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
@@ -122,8 +124,20 @@ export function AuthProvider({ children }) {
 
     initializeAuth();
 
-    // 🔧 FIX: Create session cookies with promise deduplication
+    // 🔧 FIX: Create session cookies with promise deduplication and debouncing
     const createSessionCookies = async (session) => {
+      // ✅ Debouncing: Cancel previous timeout
+      if (sessionCreationTimeout) {
+        clearTimeout(sessionCreationTimeout);
+        sessionCreationTimeout = null;
+      }
+      
+      // ✅ Prevent duplicate calls if already in progress
+      if (sessionCreationInProgress) {
+        console.log('⏭️  Session creation already in progress, skipping...');
+        return;
+      }
+      
       // 🔧 FIX: If there's already a pending request, return that promise
       // This prevents race conditions where multiple calls bypass the ref check
       if (pendingSessionCreation) {
@@ -131,6 +145,8 @@ export function AuthProvider({ children }) {
         return pendingSessionCreation;
       }
 
+      sessionCreationInProgress = true;
+      
       // Create the promise and store it globally
       pendingSessionCreation = (async () => {
         try {
@@ -185,11 +201,12 @@ export function AuthProvider({ children }) {
           console.error('❌ Failed to create session cookies:', error.message);
           throw error;
         } finally {
-          // Clear pending promise after completion (with small delay for any stragglers)
-          setTimeout(() => {
+          // ✅ Reset flags after delay to allow future sessions (debounce cooldown)
+          sessionCreationTimeout = setTimeout(() => {
+            sessionCreationInProgress = false;
             pendingSessionCreation = null;
-            console.log('🔧 Cleared pending session creation flag');
-          }, 2000);
+            console.log('🔧 Cleared session creation flags (1 second cooldown)');
+          }, 1000); // 1 second cooldown
         }
       })();
 
