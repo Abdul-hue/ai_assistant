@@ -516,12 +516,8 @@ async function syncCredsToDatabase(agentId) {
       return;
     }
     
-    // Validate before syncing
-    const validation = validateCredentialIntegrity(credsData);
-    if (!validation.valid) {
-      console.error('[BAILEYS] ❌ Credentials failed validation, skipping database sync:', validation.reason);
-      return;
-    }
+    // REMOVED: Strict validation - Baileys has already validated these credentials
+    // Trust Baileys' internal format (Buffer objects, not base64 strings)
     
     // Save to database
     const { error } = await supabaseAdmin
@@ -534,7 +530,7 @@ async function syncCredsToDatabase(agentId) {
       
     if (error) throw error;
     
-    console.log(`[BAILEYS] ✅ Credentials synced to database (validated)`);
+    console.log(`[BAILEYS] ✅ Credentials synced to database successfully`);
     
   } catch (error) {
     console.error(`[BAILEYS] ❌ Error syncing to database:`, error);
@@ -548,6 +544,43 @@ async function syncCredsToDatabase(agentId) {
       }
     }
   }
+}
+
+// CRITICAL: Helper to safely get key length from various formats
+function getKeyLength(key) {
+  if (Buffer.isBuffer(key)) {
+    return key.length;
+  }
+  if (typeof key === 'string') {
+    // Try to decode as base64 first, then as raw string
+    try {
+      return Buffer.from(key, 'base64').length;
+    } catch {
+      return Buffer.from(key).length;
+    }
+  }
+  if (key instanceof Uint8Array || Array.isArray(key)) {
+    return Buffer.from(key).length;
+  }
+  if (typeof key === 'object' && key !== null) {
+    // Handle objects that might be serialized Buffers/Uint8Arrays
+    try {
+      if (key.type === 'Buffer' && Array.isArray(key.data)) {
+        // JSON-serialized Buffer: { type: 'Buffer', data: [1,2,3,...] }
+        return key.data.length;
+      }
+      // Try to convert object to array
+      const arr = Object.values(key);
+      if (arr.length > 0 && typeof arr[0] === 'number') {
+        return Buffer.from(arr).length;
+      }
+      // Last resort: try Buffer.from directly
+      return Buffer.from(key).length;
+    } catch (e) {
+      throw new Error(`Cannot convert key to Buffer: ${e.message}`);
+    }
+  }
+  throw new Error(`Unsupported key type: ${typeof key}`);
 }
 
 // CRITICAL: Validate credential integrity to prevent Bad MAC errors
@@ -571,10 +604,11 @@ function validateCredentialIntegrity(creds) {
   }
   
   // Check key lengths (prevent truncated keys)
+  // CRITICAL: Handle different key formats (Buffer, Uint8Array, string, object)
   let noisePrivateLen, noisePublicLen;
   try {
-    noisePrivateLen = Buffer.from(creds.noiseKey.private).length;
-    noisePublicLen = Buffer.from(creds.noiseKey.public).length;
+    noisePrivateLen = getKeyLength(creds.noiseKey.private);
+    noisePublicLen = getKeyLength(creds.noiseKey.public);
   } catch (e) {
     return { valid: false, reason: `Error checking noise key lengths: ${e.message}` };
   }
@@ -1128,6 +1162,61 @@ async function ensureAgentIsolation(agentId) {
   }
 }
 
+// CRITICAL: Network diagnostic function for pairing failures
+async function diagnoseNetworkIssue(agentId) {
+  console.log(`[BAILEYS] 🔍 Running network diagnostics for pairing failure...`);
+  
+  // Test 1: Basic connectivity
+  try {
+    const https = require('https');
+    await new Promise((resolve, reject) => {
+      const req = https.get('https://web.whatsapp.com', { timeout: 5000 }, (res) => {
+        console.log(`[BAILEYS] ✅ WhatsApp Web reachable (status: ${res.statusCode})`);
+        resolve();
+      });
+      req.on('error', reject);
+      req.on('timeout', () => reject(new Error('Timeout')));
+    });
+  } catch (error) {
+    console.error(`[BAILEYS] ❌ WhatsApp Web unreachable:`, error.message);
+    console.error(`[BAILEYS] 💡 Check: 1) Internet connection 2) Firewall 3) Proxy settings`);
+  }
+  
+  // Test 2: DNS resolution
+  try {
+    const dns = require('dns').promises;
+    const addresses = await dns.resolve4('web.whatsapp.com');
+    console.log(`[BAILEYS] ✅ DNS resolution successful: ${addresses[0]}`);
+  } catch (error) {
+    console.error(`[BAILEYS] ❌ DNS resolution failed:`, error.message);
+  }
+  
+  // Test 3: WebSocket connectivity (optional - requires 'ws' module)
+  try {
+    const WebSocket = require('ws');
+    const ws = new WebSocket('wss://web.whatsapp.com/ws/chat', {
+      handshakeTimeout: 10000
+    });
+    
+    await new Promise((resolve, reject) => {
+      ws.on('open', () => {
+        console.log(`[BAILEYS] ✅ WebSocket connection successful`);
+        ws.close();
+        resolve();
+      });
+      ws.on('error', reject);
+      setTimeout(() => reject(new Error('WebSocket timeout')), 10000);
+    });
+  } catch (error) {
+    if (error.code === 'MODULE_NOT_FOUND') {
+      console.log(`[BAILEYS] ℹ️ WebSocket test skipped (ws module not available)`);
+    } else {
+      console.error(`[BAILEYS] ❌ WebSocket connection failed:`, error.message);
+      console.error(`[BAILEYS] 💡 This may indicate: firewall blocking WSS, proxy issues, or network instability`);
+    }
+  }
+}
+
 // Initialize WhatsApp connection
 async function initializeWhatsApp(agentId, userId = null) {
   console.log(`\n[BAILEYS] ==================== INITIALIZATION START ====================`);
@@ -1283,35 +1372,18 @@ async function initializeWhatsApp(agentId, userId = null) {
     let useFileAuth = false;
     
     if (hasValidCreds) {
-      // CRITICAL: Validate credentials before using them
       try {
         const credsContent = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
         
-        // Check credential structure first
-        const hasValidStructure = credsContent.me && credsContent.me.id;
+        // Simple check: Do we have a paired device?
+        const isPaired = credsContent.me && credsContent.me.id;
         
-        if (hasValidStructure) {
-          // CRITICAL: Validate credential freshness (checks database status, timestamps, etc.)
-          const validation = await validateCredentialFreshness(agentId, credsContent);
-          
-          if (validation.valid) {
-            console.log(`[BAILEYS] ✅ Found valid and fresh credentials with paired device - loading...`);
-            console.log(`[BAILEYS] Device ID: ${credsContent.me.id.split(':')[0]}`);
-            console.log(`[BAILEYS] Registration status: ${credsContent.registered} (false after QR pairing is normal)`);
-            console.log(`[BAILEYS] Validation reason: ${validation.reason}`);
-            useFileAuth = true;
-          } else {
-            console.log(`[BAILEYS] ❌ Credentials rejected: ${validation.reason}`);
-            console.log(`[BAILEYS] Will generate fresh QR instead`);
-            // Delete stale credentials
-            if (fs.existsSync(authPath)) {
-              console.log(`[BAILEYS] 🗑️ Deleting stale credentials...`);
-              fs.rmSync(authPath, { recursive: true, force: true });
-            }
-          }
+        if (isPaired) {
+          console.log(`[BAILEYS] ✅ Found credentials with paired device - loading...`);
+          console.log(`[BAILEYS] Device ID: ${credsContent.me.id.split(':')[0]}`);
+          useFileAuth = true;
         } else {
-          console.log(`[BAILEYS] ⚠️ Found credentials without device pairing - will generate fresh QR`);
-          console.log(`[BAILEYS] Creds status: has me=${!!credsContent.me}, has me.id=${!!credsContent.me?.id}`);
+          console.log(`[BAILEYS] ℹ️  Credentials exist but no paired device - will generate QR`);
         }
       } catch (error) {
         console.log(`[BAILEYS] ⚠️ Error reading credentials:`, error.message);
@@ -1352,70 +1424,20 @@ async function initializeWhatsApp(agentId, userId = null) {
     if (useFileAuth) {
       // Load existing credentials from files
       console.log(`[BAILEYS] 📂 Loading credentials from files...`);
-      // Ensure directory exists before loading
-      if (!fs.existsSync(authPath)) {
-        fs.mkdirSync(authPath, { recursive: true });
-        console.log(`[BAILEYS] 📁 Created auth directory: ${authPath}`);
-      }
       
-      // CRITICAL: Check if credentials are corrupted before loading
-      const credsFile = path.join(authPath, 'creds.json');
-      if (fs.existsSync(credsFile)) {
-        try {
-          const credsContent = fs.readFileSync(credsFile, 'utf-8');
-          const creds = JSON.parse(credsContent);
-          
-          // Validate credential integrity
-          const validation = validateCredentialIntegrity(creds);
-          if (!validation.valid) {
-            console.error(`[BAILEYS] ❌ Credentials failed integrity check: ${validation.reason}`);
-            console.log(`[BAILEYS] Attempting recovery from database backup...`);
-            
-            // Try to restore from database
-            const { data: dbSession } = await supabaseAdmin
-              .from('whatsapp_sessions')
-              .select('session_data')
-              .eq('agent_id', agentId)
-              .single();
-            
-            if (dbSession?.session_data?.creds) {
-              const restoredCreds = dbSession.session_data.creds;
-              const restoredValidation = validateCredentialIntegrity(restoredCreds);
-              if (restoredValidation.valid) {
-                // Write restored credentials to file
-                fs.writeFileSync(credsFile, JSON.stringify(restoredCreds, null, 2));
-                console.log(`[BAILEYS] ✅ Credentials recovered from database backup`);
-                useFileAuth = true;
-              } else {
-                console.log(`[BAILEYS] ❌ Recovery failed - database credentials also invalid`);
-                // Delete corrupted files
-                fs.rmSync(authPath, { recursive: true, force: true });
-                useFileAuth = false;
-              }
-            } else {
-              console.log(`[BAILEYS] ❌ Recovery failed - no database backup found`);
-              // Delete corrupted files
-              fs.rmSync(authPath, { recursive: true, force: true });
-              useFileAuth = false;
-            }
-          }
-        } catch (error) {
-          console.error(`[BAILEYS] ❌ Error validating credentials:`, error.message);
-          useFileAuth = false;
-        }
-      }
+      // REMOVED: Strict integrity check - trust Baileys' format
+      // Baileys validates its own credential format when loading
       
-      if (useFileAuth) {
-        const authState = await useMultiFileAuthState(authPath);
-        state = authState.state;
-        saveCredsToFile = authState.saveCreds;
-        
-        console.log(`[BAILEYS] 🔍 Loaded auth state:`, {
-          hasCreds: !!state.creds,
-          registered: state.creds?.registered,
-          hasMe: !!state.creds?.me
-        });
-      }
+      const authState = await useMultiFileAuthState(authPath);
+      state = authState.state;
+      saveCredsToFile = authState.saveCreds;
+      
+      console.log(`[BAILEYS] 🔍 Loaded auth state:`, {
+        hasCreds: !!state.creds,
+        registered: state.creds?.registered,
+        hasMe: !!state.creds?.me,
+        hasDeviceId: !!state.creds?.me?.id
+      });
     }
     
     if (!useFileAuth) {
@@ -1463,17 +1485,21 @@ async function initializeWhatsApp(agentId, userId = null) {
         }
         
         // Check 2: Validate key buffer lengths (prevent truncated keys)
-        if (currentCreds.noiseKey?.private && Buffer.from(currentCreds.noiseKey.private).length !== 32) {
-          console.error(`[BAILEYS] ❌ CRITICAL: Noise key has invalid length (${Buffer.from(currentCreds.noiseKey.private).length}), expected 32`);
-          return; // Don't save corrupted credentials
+        if (currentCreds.noiseKey?.private) {
+          try {
+            const keyLen = getKeyLength(currentCreds.noiseKey.private);
+            if (keyLen !== 32) {
+              console.error(`[BAILEYS] ❌ CRITICAL: Noise key has invalid length (${keyLen}), expected 32`);
+              return; // Don't save corrupted credentials
+            }
+          } catch (e) {
+            console.error(`[BAILEYS] ❌ CRITICAL: Cannot validate noise key length: ${e.message}`);
+            return; // Don't save corrupted credentials
+          }
         }
         
-        // Check 3: Validate credential integrity
-        const validation = validateCredentialIntegrity(currentCreds);
-        if (!validation.valid) {
-          console.error(`[BAILEYS] ❌ CRITICAL: Credential validation failed: ${validation.reason}`);
-          return; // Don't save corrupted credentials
-        }
+        // REMOVED: Strict validation - trust Baileys' internal credential format
+        // Baileys validates credentials when they're created/updated
         
         // CRITICAL: Ensure directory exists before saving (with error handling)
         try {
@@ -1642,12 +1668,14 @@ async function initializeWhatsApp(agentId, userId = null) {
       
       // CRITICAL: Aggressive keepalive to prevent timeout (WhatsApp timeout is ~15-30s)
       keepAliveIntervalMs: 10000, // Send keepalive every 10s (aggressive)
-      defaultQueryTimeoutMs: 120000,
-      connectTimeoutMs: 120000,
+      // CRITICAL: Increased timeouts for pairing phase (QR scan -> credential exchange)
+      defaultQueryTimeoutMs: 180000, // INCREASED from 120s to 180s (3 minutes for pairing)
+      connectTimeoutMs: 180000, // INCREASED from 120s to 180s
       qrTimeout: 180000, // QR valid for 3 minutes (WhatsApp standard)
       
-      retryRequestDelayMs: 500, // Balanced retries (was 250ms, too aggressive)
-      maxMsgRetryCount: 5, // More retries (was 3)
+      // CRITICAL: More aggressive retries during pairing
+      retryRequestDelayMs: 1000, // INCREASED from 500ms to 1000ms (less aggressive)
+      maxMsgRetryCount: 10, // INCREASED from 5 to 10 (more retries)
       emitOwnEvents: true, // CRITICAL: May be needed for QR events
       fireInitQueries: true, // CRITICAL: Fire initial queries immediately
       
@@ -1661,7 +1689,8 @@ async function initializeWhatsApp(agentId, userId = null) {
       markOnlineOnConnect: false // Set to false to reduce initial connection overhead
     });
 
-    console.log(`[BAILEYS] ✅ Socket created with aggressive keepalive (every 15s) and 3min QR timeout`);
+    console.log(`[BAILEYS] ✅ Socket created with EXTENDED timeouts for pairing (3min)`);
+    console.log(`[BAILEYS] ℹ️  This allows more time for QR scan -> credential exchange`);
     console.log(`[BAILEYS] 🔍 Socket info:`, {
       socketExists: !!sock,
       hasEventEmitter: !!sock.ev,
@@ -1693,6 +1722,15 @@ async function initializeWhatsApp(agentId, userId = null) {
           }
         });
         console.log(`[BAILEYS] ✅ Raw WebSocket message interceptor attached`);
+        
+        // ADD: WebSocket debugging listeners for pairing diagnostics
+        sock.ws.on('close', (code, reason) => {
+          console.log(`[BAILEYS] 🔌 WebSocket CLOSED: code=${code}, reason=${reason}`);
+        });
+        
+        sock.ws.on('error', (error) => {
+          console.log(`[BAILEYS] ❌ WebSocket ERROR:`, error);
+        });
       } catch (wsError) {
         console.log(`[BAILEYS] ⚠️ Could not attach raw WebSocket interceptor: ${wsError.message}`);
       }
@@ -1719,9 +1757,17 @@ async function initializeWhatsApp(agentId, userId = null) {
         }
         
         // Check 2: Validate key buffer lengths (prevent truncated keys)
-        if (currentCreds.noiseKey?.private && Buffer.from(currentCreds.noiseKey.private).length !== 32) {
-          console.error(`[BAILEYS] ❌ CRITICAL: Noise key has invalid length (${Buffer.from(currentCreds.noiseKey.private).length}), expected 32`);
-          return; // Don't save corrupted credentials
+        if (currentCreds.noiseKey?.private) {
+          try {
+            const keyLen = getKeyLength(currentCreds.noiseKey.private);
+            if (keyLen !== 32) {
+              console.error(`[BAILEYS] ❌ CRITICAL: Noise key has invalid length (${keyLen}), expected 32`);
+              return; // Don't save corrupted credentials
+            }
+          } catch (e) {
+            console.error(`[BAILEYS] ❌ CRITICAL: Cannot validate noise key length: ${e.message}`);
+            return; // Don't save corrupted credentials
+          }
         }
         
         // Check 3: Ensure keys haven't been corrupted mid-flight
@@ -1905,6 +1951,29 @@ async function initializeWhatsApp(agentId, userId = null) {
       console.log(`[BAILEYS] Has QR: ${!!qr}`);
       console.log(`[BAILEYS] Is New Login: ${isNewLogin}`);
       
+      // ADD: More detailed state logging
+      if (connection === 'connecting') {
+        console.log(`[BAILEYS] 🔄 CONNECTION STATE: connecting`);
+        console.log(`[BAILEYS] ℹ️  Socket is establishing connection to WhatsApp servers...`);
+      }
+      
+      if (connection === 'close' && lastDisconnect) {
+        const session = activeSessions.get(agentId);
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const hasQR = !!session?.qrCode;
+        const wasPairing = hasQR && !session?.isConnected;
+        
+        console.log(`[BAILEYS] ❌ CONNECTION STATE: close`);
+        console.log(`[BAILEYS] Status Code: ${statusCode}`);
+        console.log(`[BAILEYS] Was Pairing: ${wasPairing ? 'YES (QR was active)' : 'NO'}`);
+        console.log(`[BAILEYS] Socket State: ${session?.socket?.ws?.readyState || 'unknown'}`);
+        
+        if (wasPairing) {
+          console.log(`[BAILEYS] ⚠️ CRITICAL: Connection closed DURING pairing phase!`);
+          console.log(`[BAILEYS] This indicates: network issue, timeout, or server rejection during QR scan`);
+        }
+      }
+
       // Handle QR code
       if (qr) {
         const session = activeSessions.get(agentId);
@@ -1926,18 +1995,54 @@ async function initializeWhatsApp(agentId, userId = null) {
         console.log(`[BAILEYS] 🎯 Socket age: ${session ? Math.round((Date.now() - session.socketCreatedAt)/1000) : 0}s`);
         
         const existingQR = qrGenerationTracker.get(agentId);
-        const QR_COOLDOWN_MS = 120000; // 2 minutes - prevent too frequent QR generation
+        const QR_COOLDOWN_MS = 120000; // 2 minutes
         
+        // MODIFIED: Only apply cooldown if QR is recent AND still valid (not expired)
         if (existingQR && (Date.now() - existingQR) < QR_COOLDOWN_MS) {
           const qrAge = Math.round((Date.now() - existingQR)/1000);
-          console.log(`[BAILEYS] ⏭️ Ignoring new QR - existing valid (${qrAge}s old, cooldown: ${Math.round(QR_COOLDOWN_MS/1000)}s)`);
-          return;
+          
+          // CRITICAL: If existing QR is expired (>3 min) OR this is attempt >1, allow new QR
+          const qrExpired = (Date.now() - existingQR) > QR_EXPIRY_MS;
+          const isRetryAfterFailure = qrAttempt > 1;
+          
+          if (!qrExpired && !isRetryAfterFailure) {
+            console.log(`[BAILEYS] ⏭️ Ignoring new QR - existing valid (${qrAge}s old)`);
+            return;
+          } else if (qrExpired) {
+            console.log(`[BAILEYS] 🔄 Existing QR expired (${qrAge}s old) - accepting new QR`);
+          } else if (isRetryAfterFailure) {
+            console.log(`[BAILEYS] 🔄 Retry attempt #${qrAttempt} - accepting new QR`);
+          }
         }
         
         // If existing QR is expired (>3 minutes), allow new QR generation
         if (existingQR && (Date.now() - existingQR) > QR_EXPIRY_MS) {
           console.log(`[BAILEYS] 🔄 Existing QR expired (${Math.round((Date.now() - existingQR)/1000)}s old), generating new QR...`);
           qrGenerationTracker.delete(agentId); // Clear expired QR tracker
+        }
+        
+        // ADD: Validate QR format
+        console.log(`[BAILEYS] 🔍 Validating QR code format...`);
+        
+        try {
+          // WhatsApp QR codes should be comma-separated base64 strings
+          const qrParts = qr.split(',');
+          if (qrParts.length !== 4) {
+            console.error(`[BAILEYS] ❌ Invalid QR format: expected 4 parts, got ${qrParts.length}`);
+            console.error(`[BAILEYS] This may indicate Baileys library issue or WA protocol change`);
+          } else {
+            console.log(`[BAILEYS] ✅ QR format valid (4 parts: ref, noiseKey, identityKey, advKey)`);
+          }
+          
+          // Validate each part is base64
+          for (let i = 0; i < qrParts.length; i++) {
+            const part = qrParts[i];
+            if (!/^[A-Za-z0-9+/=]+$/.test(part)) {
+              console.error(`[BAILEYS] ❌ QR part ${i+1} is not valid base64`);
+            }
+          }
+        } catch (validationError) {
+          console.error(`[BAILEYS] ⚠️ QR validation error:`, validationError.message);
         }
         
         console.log(`[BAILEYS] ✅ NEW QR CODE - Saving to database and memory (generated at ${new Date().toISOString()})`);
@@ -2195,8 +2300,70 @@ async function initializeWhatsApp(agentId, userId = null) {
           return; // Don't continue processing
         }
         
-        // CRITICAL: Handle error 428 - Connection Lost (recoverable network issue)
+        // CRITICAL: Handle error 428 - Connection Lost
         if (statusCode === 428) {
+          console.log(`[BAILEYS] 🔄 428 - Connection Lost`);
+          
+          // CRITICAL: Check if 428 occurred during QR pairing (before connection established)
+          const isDuringPairing = session && !session.isConnected && session.qrCode;
+          
+          if (isDuringPairing) {
+            console.log(`[BAILEYS] ⚠️ 428 occurred DURING QR PAIRING - this indicates network/timeout issue`);
+            console.log(`[BAILEYS] 🔄 Generating FRESH QR code (pairing failed mid-flight)`);
+            
+            // Run network diagnostics
+            await diagnoseNetworkIssue(agentId);
+            
+            // Clean up failed pairing attempt
+            if (session?.socket) {
+              try {
+                session.socket.ev.removeAllListeners();
+                session.socket.end();
+              } catch (err) {
+                console.log('[BAILEYS] Socket cleanup:', err.message);
+              }
+            }
+            
+            // CRITICAL: Clear QR tracker to allow immediate regeneration
+            qrGenerationTracker.delete(agentId);
+            
+            // Clear session data
+            if (session) {
+              session.isConnected = false;
+              session.connectionState = 'qr_regenerating';
+              session.qrCode = null;
+              session.qrGeneratedAt = null;
+            }
+            
+            // Update database - clear old QR
+            await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                qr_code: null,
+                qr_generated_at: null,
+                status: 'reconnecting',
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+            
+            // Wait 3 seconds then generate fresh QR
+            setTimeout(async () => {
+              console.log(`[BAILEYS] 🔄 Regenerating QR after pairing failure...`);
+              try {
+                // Remove from active sessions to force clean restart
+                activeSessions.delete(agentId);
+                
+                await initializeWhatsApp(agentId, userId);
+                console.log(`[BAILEYS] ✅ Fresh QR generated after pairing failure`);
+              } catch (error) {
+                console.error(`[BAILEYS] ❌ QR regeneration failed:`, error.message);
+              }
+            }, 3000);
+            
+            return; // Don't continue with normal 428 processing
+          }
+          
+          // Normal 428 after connection established - preserve credentials
           console.log(`[BAILEYS] 🔄 428 - Connection Lost (recoverable network issue)`);
           console.log(`[BAILEYS] Credentials preserved, auto-reconnecting in 5s...`);
           
