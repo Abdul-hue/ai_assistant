@@ -122,10 +122,11 @@ export default function AgentQRCode({ agentId }) {
 
     const updateCountdown = () => {
       const elapsed = Date.now() - qrCodeTimestamp;
-      const remaining = Math.max(0, 60 - Math.floor(elapsed / 1000));
+      const QR_VALIDITY_SECONDS = 180; // 3 minutes - matches backend QR_EXPIRY_MS
+      const remaining = Math.max(0, QR_VALIDITY_SECONDS - Math.floor(elapsed / 1000));
       setQrCountdownSeconds(remaining);
       if (remaining <= 0) {
-        console.log('⏰ [QR EXPIRED] 60 seconds elapsed, clearing QR');
+        console.log('⏰ [QR EXPIRED] 3 minutes elapsed, clearing QR');
         setQrCode(null);
         setQrCodeTimestamp(null);
         setStatus('disconnected');

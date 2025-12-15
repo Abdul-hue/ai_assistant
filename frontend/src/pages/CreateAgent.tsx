@@ -8,7 +8,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { ArrowLeft, Bot, Loader2, MessageSquare, LayoutDashboard, Plus, Calendar as CalendarIcon, Settings, Home, User, Phone, FileText, Globe, Clock, Building2, Users, Upload, Trash2, Eye, EyeOff } from "lucide-react";
+import { ArrowLeft, Bot, Loader2, MessageSquare, MessageCircle, LayoutDashboard, Plus, Calendar as CalendarIcon, Settings, Home, User, Phone, FileText, Globe, Clock, Building2, Users, Upload, Trash2, Eye, EyeOff } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import AgentQRCode from "@/components/AgentQRCode";
 import KnowledgeBaseFilesSection from "@/components/agents/KnowledgeBaseFilesSection";
@@ -466,6 +466,16 @@ const CreateAgent = () => {
           >
             <LayoutDashboard className="h-5 w-5" />
             Dashboard
+          </Button>
+          <Button
+            variant="ghost"
+            className={`w-full justify-start gap-3 hover:bg-white/10 transition-all duration-300 ${
+              isActive("/agent-chat") ? "bg-primary/20 text-primary border-l-2 border-primary" : "text-gray-400"
+            }`}
+            onClick={() => navigate("/agent-chat")}
+          >
+            <MessageCircle className="h-5 w-5" />
+            Agent Chat
           </Button>
           <Button
             variant="ghost"

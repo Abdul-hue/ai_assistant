@@ -1,7 +1,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { supabaseAdmin } = require('../config/supabase');
-const { sendMessage, getWhatsAppStatus, initializeWhatsApp, activeSessions } = require('../services/baileysService');
+const { sendMessage, getWhatsAppStatus, safeInitializeWhatsApp, activeSessions } = require('../services/baileysService');
 
 const router = express.Router();
 
@@ -128,6 +128,27 @@ router.post('/', async (req, res) => {
     const session = activeSessions.get(agentId);
     
     if (!statusResult.connected || !statusResult.is_active || !session || !session.isConnected) {
+      // CRITICAL: Check session status BEFORE attempting reconnection
+      // This prevents automatic reconnection after 401 errors (device_removed conflicts)
+      const { data: whatsappSession } = await supabaseAdmin
+        .from('whatsapp_sessions')
+        .select('status, is_active')
+        .eq('agent_id', agentId)
+        .maybeSingle();
+      
+      // If status is 'conflict', it means a 401 error occurred (device_removed)
+      // Don't attempt automatic reconnection - require manual action
+      if (whatsappSession?.status === 'conflict') {
+        console.warn(`${logPrefix} 🚫 Session has conflict status (401 error/device_removed) - manual reconnection required`);
+        return res.status(503).json({
+          success: false,
+          error: 'SESSION_CONFLICT',
+          details: 'WhatsApp session was disconnected due to device removal or conflict. Please manually reconnect the agent and scan a new QR code.',
+          action_required: 'manual_reconnect',
+          status: 'conflict'
+        });
+      }
+      
       console.warn(`${logPrefix} ⚠️  Agent not connected, attempting to reconnect...`);
       
       // Get user_id from database
@@ -145,25 +166,76 @@ router.post('/', async (req, res) => {
         });
       }
       
-      // Attempt to reconnect
+      // Attempt to reconnect using safeInitializeWhatsApp (respects cooldowns and conflict checks)
       try {
         console.log(`${logPrefix} 🔄 Initiating reconnection...`);
-        await initializeWhatsApp(agentId, agentWithUser.user_id);
+        const reconnectResult = await safeInitializeWhatsApp(agentId, agentWithUser.user_id);
         
-        // Wait a bit for connection to establish
-        await new Promise(resolve => setTimeout(resolve, 3000));
+        // Check if reconnection was blocked due to cooldown or conflict
+        if (!reconnectResult.success) {
+          if (reconnectResult.status === 'conflict' || reconnectResult.status === 'cooldown') {
+            return res.status(503).json({
+              success: false,
+              error: reconnectResult.status === 'conflict' ? 'SESSION_CONFLICT' : 'COOLDOWN_ACTIVE',
+              details: reconnectResult.error || 'Reconnection blocked due to recent error or cooldown period',
+              action_required: reconnectResult.requiresManualAction ? 'manual_reconnect' : 'wait',
+              retryAfter: reconnectResult.retryAfter,
+              status: reconnectResult.status
+            });
+          }
+          
+          // Other failure reasons
+          return res.status(503).json({
+            success: false,
+            error: 'RECONNECTION_FAILED',
+            details: reconnectResult.error || 'Failed to reconnect WhatsApp',
+            action_required: 'scan_qr',
+            status: reconnectResult.status
+          });
+        }
+        
+        // ✅ CRITICAL: Check the status immediately - if it's qr_pending, we can't send messages yet
+        if (reconnectResult.status === 'qr_pending') {
+          // Get the QR code from status
+          const statusWithQR = await getWhatsAppStatus(agentId);
+          return res.status(503).json({
+            success: false,
+            error: 'QR_CODE_REQUIRED',
+            details: 'WhatsApp reconnection requires QR code scanning. Please scan the QR code to connect.',
+            action_required: 'scan_qr',
+            status: 'qr_pending',
+            qr_code: statusWithQR.qr_code
+          });
+        }
+        
+        // If status is 'connected', we can proceed immediately
+        // Otherwise, wait a bit for connection to establish
+        if (reconnectResult.status !== 'connected') {
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        }
         
         // Check if now connected
         const reconnectedStatus = await getWhatsAppStatus(agentId);
         const reconnectedSession = activeSessions.get(agentId);
         
+        // Check if connection is established
         if (!reconnectedStatus.connected || !reconnectedStatus.is_active || !reconnectedSession || !reconnectedSession.isConnected) {
+          // Provide more specific error based on status
+          const errorMessage = reconnectedStatus.status === 'connecting' 
+            ? 'WhatsApp is still connecting. Please wait a moment and try again.'
+            : reconnectedStatus.status === 'conflict'
+            ? 'WhatsApp session conflict detected. Please manually reconnect the agent.'
+            : reconnectedStatus.status === 'qr_pending'
+            ? 'WhatsApp requires QR code scanning. Please scan the QR code to connect.'
+            : 'Failed to reconnect WhatsApp. Please check the agent connection status.';
+          
           return res.status(503).json({
             success: false,
-            error: 'RECONNECTION_FAILED',
-            details: 'Failed to reconnect WhatsApp. Please scan QR code.',
-            action_required: 'scan_qr',
-            status: reconnectedStatus.status
+            error: reconnectedStatus.status === 'qr_pending' ? 'QR_CODE_REQUIRED' : 'RECONNECTION_FAILED',
+            details: errorMessage,
+            action_required: reconnectedStatus.status === 'conflict' ? 'manual_reconnect' : 'scan_qr',
+            status: reconnectedStatus.status,
+            qr_code: reconnectedStatus.qr_code || null
           });
         }
         

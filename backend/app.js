@@ -40,6 +40,7 @@ const agentFileRoutes = require('./src/routes/agentFileRoutes');
 const contactsRoutes = require('./src/routes/contacts');
 const profileRoutes = require('./src/routes/profile');
 const dashboardRoutes = require('./src/routes/dashboard');
+const messagesRoutes = require('./src/routes/messages');
 const imapSmtpRoutes = require('./src/routes/imapSmtp');
 const folderManagementRoutes = require('./src/routes/folderManagement');
 const fetchNewMailRoutes = require('./src/routes/fetchNewMail');
@@ -422,6 +423,7 @@ app.use('/api/whatsapp', whatsappRoutes);
 // Agent routes (rate limiting disabled)
 // IMPORTANT: Register more specific routes BEFORE general routes
 app.use('/api/agents', agentFileRoutes); // File routes must come before general agent routes
+app.use('/api/agents', messagesRoutes); // Messages/chat routes
 app.use('/api/agents', agentRoutes);
 app.use('/api/agents', contactsRoutes);
 app.use('/api/profile', profileRoutes);

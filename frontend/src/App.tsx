@@ -7,6 +7,7 @@ import Index from "./pages/Index";
 import { AuthProvider } from "./context/AuthContext.jsx";
 import Auth from "./pages/Auth";
 import Dashboard from "./pages/Dashboard";
+import AgentChat from "./pages/AgentChat";
 import CreateAgent from "./pages/CreateAgent";
 import Calendar from "./pages/Calendar";
 import ProfileSettings from "./pages/ProfileSettings";
@@ -37,6 +38,7 @@ const App = () => (
             <Route path="/" element={<Index />} />
             <Route path="/auth" element={<Auth />} />
             <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/agent-chat" element={<AgentChat />} />
             <Route path="/create-agent" element={<CreateAgent />} />
             <Route path="/calendar" element={<Calendar />} />
             <Route path="/profile" element={<ProfileSettings />} />

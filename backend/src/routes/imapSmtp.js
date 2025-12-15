@@ -44,18 +44,19 @@ router.post('/connect', authMiddleware, async (req, res) => {
 
     const userId = req.user.id;
 
-    // ✅ OPTIMIZATION: Check if account already exists FIRST (before testing)
+    // ✅ FIX: Check if account already exists (active OR inactive)
+    // If inactive account exists, delete it first to avoid unique constraint violation
     const { data: existingAccount } = await supabaseAdmin
       .from('email_accounts')
       .select('*')
       .eq('user_id', userId)
       .eq('email', email)
       .eq('provider', provider || 'custom')
-      .eq('is_active', true)
-      .single();
+      .maybeSingle(); // Use maybeSingle to handle both active and inactive accounts
 
     if (existingAccount) {
-      console.log(`[CONNECT] Account ${email} already exists, skipping connection tests`);
+      if (existingAccount.is_active) {
+        console.log(`[CONNECT] Account ${email} already exists and is active, skipping connection tests`);
       
       // Return existing account immediately without testing connections
       return res.json({
@@ -68,6 +69,38 @@ router.post('/connect', authMiddleware, async (req, res) => {
         },
         skipSync: true // Tell frontend to use emails-quick endpoint
       });
+      } else {
+        // ✅ FIX: Account exists but is inactive - delete it to allow reconnection
+        console.log(`[CONNECT] Found inactive account ${email}, deleting to allow reconnection...`);
+        
+        // Stop IDLE monitoring if running
+        try {
+          const appModule = require('../../app');
+          const idleManager = appModule.idleManager || appModule.default?.idleManager;
+          if (idleManager) {
+            await idleManager.stopIdleMonitoring(existingAccount.id);
+            console.log(`[CONNECT] Stopped IDLE monitoring for ${existingAccount.id}`);
+          }
+        } catch (idleError) {
+          console.warn(`[CONNECT] Error stopping IDLE monitoring:`, idleError.message);
+        }
+        
+        // Delete the inactive account (cascade will delete related emails and sync state)
+        const { error: deleteError } = await supabaseAdmin
+          .from('email_accounts')
+          .delete()
+          .eq('id', existingAccount.id);
+        
+        if (deleteError) {
+          console.error(`[CONNECT] Error deleting inactive account:`, deleteError);
+          return res.status(500).json({
+            error: 'Failed to remove previous account',
+            details: deleteError.message
+          });
+        }
+        
+        console.log(`[CONNECT] ✅ Deleted inactive account ${existingAccount.id}, proceeding with new connection`);
+      }
     }
 
     // Auto-detect provider settings if requested
@@ -225,6 +258,21 @@ router.post('/connect', authMiddleware, async (req, res) => {
         smtpTest: smtpTest
       }
     });
+
+    // ✅ NEW: Trigger comprehensive sync in background
+    setTimeout(async () => {
+      try {
+        console.log(`[CONNECT] ⚡ Starting comprehensive sync for ${emailAccount.email}`);
+        const { comprehensiveFolderSync } = require('../services/comprehensiveEmailSync');
+        const io = req.app.get('io');
+        
+        await comprehensiveFolderSync(emailAccount.id, req.user.id, io);
+        
+        console.log(`[CONNECT] ✅ Comprehensive sync completed for ${emailAccount.email}`);
+      } catch (error) {
+        console.error(`[CONNECT] ❌ Comprehensive sync failed:`, error.message);
+      }
+    }, 3000); // 3 second delay for IDLE to start first
   } catch (error) {
     console.error('Error connecting IMAP/SMTP account:', error);
     res.status(500).json({
@@ -301,19 +349,19 @@ router.get('/accounts', authMiddleware, async (req, res) => {
 
 /**
  * GET /api/imap-smtp/emails-quick/:accountId
- * ⚡ FAST ENDPOINT: Load emails from database instantly, then sync in background
- * Returns emails in <200ms instead of 15-30 seconds
+ * ⚡ LOAD FROM DATABASE ONLY - NO SYNC TRIGGERS
+ * ✅ UPDATED: Removed initial sync trigger - comprehensive sync handles everything
  */
 router.get('/emails-quick/:accountId', authMiddleware, async (req, res) => {
   const startTime = Date.now();
   try {
     const { accountId } = req.params;
-    const { folder = 'INBOX', limit = 20 } = req.query;
+    const { folder = 'INBOX', limit = 50 } = req.query;
 
-    // Verify account belongs to user
+    // Verify account
     const { data: account, error: accountError } = await supabaseAdmin
       .from('email_accounts')
-      .select('id, user_id, needs_reconnection')
+      .select('id, user_id, needs_reconnection, comprehensive_sync_completed, comprehensive_sync_status')
       .eq('id', accountId)
       .eq('user_id', req.user.id)
       .single();
@@ -325,9 +373,7 @@ router.get('/emails-quick/:accountId', authMiddleware, async (req, res) => {
       });
     }
 
-    console.log(`[QUICK FETCH] Loading ${limit} emails from database for account ${accountId}, folder ${folder}`);
-
-    // STEP 1: Load from database IMMEDIATELY (50-200ms)
+    // Load from database ONLY (NO SYNC)
     const { data: emails, error: dbError } = await supabaseAdmin
       .from('emails')
       .select(`
@@ -338,14 +384,11 @@ router.get('/emails-quick/:accountId', authMiddleware, async (req, res) => {
       .eq('email_account_id', accountId)
       .eq('folder_name', folder)
       .order('received_at', { ascending: false, nullsFirst: false })
-      .limit(parseInt(limit) || 20);
+      .limit(parseInt(limit) || 50);
 
-    if (dbError) {
-      console.error('[QUICK FETCH] Database error:', dbError);
-      throw dbError;
-    }
+    if (dbError) throw dbError;
 
-    // Format emails for frontend
+    // Format emails
     const formattedEmails = (emails || []).map(email => ({
       id: email.id,
       uid: email.uid,
@@ -357,8 +400,8 @@ router.get('/emails-quick/:accountId', authMiddleware, async (req, res) => {
       subject: email.subject || '(No subject)',
       body: email.body_text || '',
       bodyHtml: email.body_html || '',
-      date: email.received_at || email.created_at || new Date().toISOString(),
-      timestamp: new Date(email.received_at || email.created_at).getTime(),
+      date: email.received_at || new Date().toISOString(),
+      timestamp: new Date(email.received_at || new Date()).getTime(),
       isRead: email.is_read || false,
       isStarred: email.is_starred || false,
       attachments: email.attachments_meta || [],
@@ -367,65 +410,83 @@ router.get('/emails-quick/:accountId', authMiddleware, async (req, res) => {
     }));
 
     const dbLoadTime = Date.now() - startTime;
-    console.log(`[QUICK FETCH] ✅ Loaded ${formattedEmails.length} emails from database in ${dbLoadTime}ms`);
+    console.log(`[QUICK FETCH] ✅ Loaded ${formattedEmails.length} emails from DB in ${dbLoadTime}ms`);
 
-    // STEP 2: Return immediately (don't wait for sync!)
     res.json({
       success: true,
       emails: formattedEmails,
       count: formattedEmails.length,
       source: 'database',
-      loadTime: dbLoadTime
+      loadTime: dbLoadTime,
+      comprehensiveSyncCompleted: account.comprehensive_sync_completed || false,
+      comprehensiveSyncStatus: account.comprehensive_sync_status || 'pending'
     });
 
-    // STEP 3: Sync new emails in background (non-blocking)
-    // ✅ CRITICAL: Only trigger sync if account doesn't need reconnection
-    if (!account.needs_reconnection) {
-      // Use setImmediate to ensure response is sent before sync starts
-      setImmediate(async () => {
-        try {
-          console.log(`[BACKGROUND SYNC] Starting incremental sync for ${accountId}/${folder}`);
-          // Import here to avoid circular dependency issues
-          const backgroundSyncService = require('../services/backgroundSyncService');
-          const newCount = await backgroundSyncService.syncNewEmailsOnly(accountId, folder);
-          if (newCount > 0) {
-            console.log(`[BACKGROUND SYNC] ✅ Synced ${newCount} new emails for ${accountId}/${folder}`);
-          } else {
-            console.log(`[BACKGROUND SYNC] No new emails for ${accountId}/${folder}`);
-          }
-        } catch (err) {
-          console.error(`[BACKGROUND SYNC] ❌ Failed for ${accountId}/${folder}:`, err.message);
-          // Don't throw - background sync failures shouldn't affect user experience
-        }
-      });
-    } else {
-      console.log(`[QUICK FETCH] ⏭️  Skipping background sync for ${accountId} - account needs reconnection`);
-    }
+    // ❌ REMOVED: No initial sync trigger
+    // ❌ REMOVED: No background sync trigger
+    // Comprehensive sync handles initial load
+    // Background sync (scheduled) handles updates
 
   } catch (error) {
     console.error('[QUICK FETCH] Error:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/imap-smtp/comprehensive-sync-status/:accountId
+ * Get comprehensive sync status and progress
+ */
+router.get('/comprehensive-sync-status/:accountId', authMiddleware, async (req, res) => {
+  try {
+    const { accountId } = req.params;
+
+    const { data: account, error } = await supabaseAdmin
+      .from('email_accounts')
+      .select(`
+        comprehensive_sync_completed,
+        comprehensive_sync_status,
+        comprehensive_sync_progress,
+        comprehensive_sync_started_at,
+        comprehensive_sync_completed_at
+      `)
+      .eq('id', accountId)
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (error || !account) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+
+    res.json({
+      success: true,
+      syncCompleted: account.comprehensive_sync_completed || false,
+      syncStatus: account.comprehensive_sync_status || 'pending',
+      syncProgress: account.comprehensive_sync_progress || {},
+      syncStartedAt: account.comprehensive_sync_started_at,
+      syncCompletedAt: account.comprehensive_sync_completed_at
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
 /**
  * GET /api/imap-smtp/emails/:accountId
- * Fetch emails from IMAP account (legacy endpoint - use emails-quick for better performance)
+ * Fetch emails from IMAP account
+ * ⚠️ DEPRECATED: Use /emails-quick for better performance
+ * This endpoint should only be used for manual refresh, not on every folder click
  * 
  * Query params:
  * - folder: Folder name (default: INBOX)
- * - limit: Number of emails to fetch (default: 50)
- * - headersOnly: Fetch headers only (default: true)
+ * - limit: Number of emails to fetch (default: 20)
+ * - headersOnly: Fetch headers only (default: false for full emails)
  * - forceRefresh: If true, fetch most recent emails regardless of sync state (default: false)
  */
 router.get('/emails/:accountId', authMiddleware, async (req, res) => {
-  // console.log('/api/imap-smtp/emails/:accountId====================',);
   try {
     const { accountId } = req.params;
-    const { folder = 'INBOX', limit = 50, forceRefresh = 'false' } = req.query;
+    const { folder = 'INBOX', limit = 20, forceRefresh = 'false' } = req.query;
 
     // Verify account belongs to user
     const { data: account, error: accountError } = await supabaseAdmin
@@ -710,7 +771,9 @@ router.get('/detect/:email', authMiddleware, (req, res) => {
 
 /**
  * DELETE /api/imap-smtp/accounts/:accountId
- * Disconnect email account
+ * Disconnect email account - DELETES the account from database
+ * ✅ FIX: Now actually deletes the account instead of just deactivating it
+ * This prevents duplicate key constraint errors when reconnecting
  */
 router.delete('/accounts/:accountId', authMiddleware, async (req, res) => {
   try {
@@ -719,7 +782,7 @@ router.delete('/accounts/:accountId', authMiddleware, async (req, res) => {
     // Verify account belongs to user
     const { data: account, error: accountError } = await supabaseAdmin
       .from('email_accounts')
-      .select('id, user_id')
+      .select('id, user_id, email')
       .eq('id', accountId)
       .eq('user_id', req.user.id)
       .single();
@@ -728,19 +791,43 @@ router.delete('/accounts/:accountId', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Email account not found' });
     }
 
-    // Deactivate account
-    const { error: updateError } = await supabaseAdmin
+    // ✅ FIX: Stop IDLE monitoring before deleting
+    try {
+      const appModule = require('../../app');
+      const idleManager = appModule.idleManager || appModule.default?.idleManager;
+      if (idleManager) {
+        await idleManager.stopIdleMonitoring(accountId);
+        console.log(`[DISCONNECT] Stopped IDLE monitoring for account ${account.email}`);
+      }
+    } catch (idleError) {
+      console.warn(`[DISCONNECT] Error stopping IDLE monitoring:`, idleError.message);
+      // Continue with deletion even if IDLE stop fails
+    }
+
+    // ✅ FIX: DELETE the account instead of just deactivating it
+    // This prevents duplicate key constraint errors when user tries to reconnect
+    // Cascade delete will automatically remove:
+    // - Related emails (via email_account_id foreign key)
+    // - Email sync state (via account_id foreign key)
+    // - Other related data
+    const { error: deleteError } = await supabaseAdmin
       .from('email_accounts')
-      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .delete()
       .eq('id', accountId);
 
-    if (updateError) {
-      return res.status(500).json({ error: 'Failed to disconnect account', details: updateError.message });
+    if (deleteError) {
+      console.error(`[DISCONNECT] Error deleting account ${accountId}:`, deleteError);
+      return res.status(500).json({ 
+        error: 'Failed to disconnect account', 
+        details: deleteError.message 
+      });
     }
+
+    console.log(`[DISCONNECT] ✅ Account ${account.email} (${accountId}) deleted successfully`);
 
     res.json({
       success: true,
-      message: 'Email account disconnected successfully'
+      message: 'Email account disconnected and removed successfully'
     });
   } catch (error) {
     console.error('Error disconnecting account:', error);

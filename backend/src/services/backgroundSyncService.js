@@ -47,7 +47,7 @@ async function syncNewEmailsOnly(accountId, folder = 'INBOX') {
     // Get last synced UID from database
     const { data: syncState } = await supabaseAdmin
       .from('email_sync_state')
-      .select('last_uid_synced')
+      .select('last_uid_synced, last_sync_at')
       .eq('account_id', accountId)
       .eq('folder_name', folder)
       .single();
@@ -141,6 +141,13 @@ async function syncNewEmailsOnly(accountId, folder = 'INBOX') {
       : allMessages;
 
     console.log(`[BACKGROUND SYNC] Found ${messages.length} new emails (out of ${allMessages.length} total) in ${folder}`);
+    if (syncState?.last_sync_at) {
+      const lastSyncTime = new Date(syncState.last_sync_at);
+      const hoursSinceSync = (Date.now() - lastSyncTime.getTime()) / (1000 * 60 * 60);
+      if (hoursSinceSync > 1) {
+        console.log(`[BACKGROUND SYNC] ⚠️  Last sync was ${hoursSinceSync.toFixed(1)} hours ago`);
+      }
+    }
 
     if (messages.length === 0) {
       console.log(`[BACKGROUND SYNC] No new emails found for ${accountId}/${folder}`);
@@ -282,40 +289,47 @@ async function syncNewEmailsOnly(accountId, folder = 'INBOX') {
       }
     }
 
-    // Update sync state with highest UID
-    if (messages.length > 0) {
-      const maxUID = Math.max(...messages.map(m => parseInt(m.attributes.uid)));
-      await supabaseAdmin
-        .from('email_sync_state')
-        .upsert({
-          account_id: accountId,
-          folder_name: folder,
-          last_uid_synced: maxUID,
-          total_server_count: box.messages?.total || 0,
-          last_sync_at: new Date().toISOString(),
-          sync_errors_count: 0,
-          last_error_message: null,
-          updated_at: new Date().toISOString()
-        }, {
-          onConflict: 'account_id,folder_name'
-        });
+    // ✅ FIX: Update sync state with highest UID (even if no new messages, update timestamp)
+    // This ensures sync state is always current and background sync knows when last sync happened
+    const allUids = messages.length > 0 
+      ? messages.map(m => parseInt(m.attributes.uid))
+      : [];
+    const maxUID = allUids.length > 0 
+      ? Math.max(...allUids)
+      : lastUID; // Keep existing UID if no new messages
+    
+    await supabaseAdmin
+      .from('email_sync_state')
+      .upsert({
+        account_id: accountId,
+        folder_name: folder,
+        last_uid_synced: maxUID,
+        total_server_count: box.messages?.total || 0,
+        last_sync_at: new Date().toISOString(),
+        sync_errors_count: 0,
+        last_error_message: null,
+        updated_at: new Date().toISOString()
+      }, {
+        onConflict: 'account_id,folder_name'
+      });
 
-      console.log(`[BACKGROUND SYNC] Updated sync state: last_uid_synced = ${maxUID}`);
-    }
+    console.log(`[BACKGROUND SYNC] Updated sync state: last_uid_synced = ${maxUID} (${messages.length} new messages)`);
 
     // ✅ CRITICAL: Clear needs_reconnection flag on successful sync (even if 0 emails)
     // This ensures that if background sync works, the account is marked as healthy
+    // This is important because folder fetching and other operations depend on this flag
     try {
       await supabaseAdmin
         .from('email_accounts')
         .update({
           needs_reconnection: false,
           last_error: null,
-          last_successful_sync_at: new Date().toISOString()
+          last_successful_sync_at: new Date().toISOString(),
+          sync_status: 'idle'
         })
         .eq('id', accountId);
       
-      console.log(`[BACKGROUND SYNC] ✅ Cleared needs_reconnection flag for ${accountId} (sync successful)`);
+      console.log(`[BACKGROUND SYNC] ✅ Cleared needs_reconnection flag for ${accountId} (sync successful, ${savedCount} emails saved)`);
     } catch (updateErr) {
       console.warn('[BACKGROUND SYNC] Failed to clear needs_reconnection flag:', updateErr.message);
     }

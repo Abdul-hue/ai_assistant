@@ -8,7 +8,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
-import { Calendar as CalendarIcon, Plus, Trash2, Loader2, AlertCircle, MessageSquare, LayoutDashboard, Settings, Home } from "lucide-react";
+import { Calendar as CalendarIcon, Plus, Trash2, Loader2, AlertCircle, MessageSquare, MessageCircle, LayoutDashboard, Settings, Home } from "lucide-react";
 import ProfileAvatarMenu from "@/components/ProfileAvatarMenu";
 import { format, startOfMonth, endOfMonth, eachDayOfInterval, isSameMonth, isSameDay, addMonths, subMonths } from "date-fns";
 
@@ -390,6 +390,16 @@ const Calendar = () => {
           >
             <LayoutDashboard className="h-5 w-5" />
             Dashboard
+          </Button>
+          <Button
+            variant="ghost"
+            className={`w-full justify-start gap-3 hover:bg-white/10 transition-all duration-300 ${
+              isActive("/agent-chat") ? "bg-primary/20 text-primary border-l-2 border-primary" : "text-gray-400"
+            }`}
+            onClick={() => navigate("/agent-chat")}
+          >
+            <MessageCircle className="h-5 w-5" />
+            Agent Chat
           </Button>
           <Button
             variant="ghost"

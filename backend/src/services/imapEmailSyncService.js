@@ -461,9 +461,20 @@ async function syncFolder(connection, accountId, folderName) {
       }
     }
 
-    // Update sync state with highest UID
-    const highestUid = Math.max(...messages.map(msg => parseInt(msg.attributes.uid)));
+    // ✅ FIX: Update sync state with highest UID (even if no new messages, update timestamp)
+    // This ensures sync state is always current and background sync knows when last sync happened
+    const allUids = messages.length > 0 
+      ? messages.map(msg => parseInt(msg.attributes.uid))
+      : [];
+    const highestUid = allUids.length > 0 
+      ? Math.max(...allUids)
+      : lastSyncUid; // Keep existing UID if no new messages
+    
     await updateSyncState(accountId, folderName, highestUid, box.messages.total);
+    
+    if (messages.length === 0) {
+      console.log(`[SYNC] No new messages in ${folderName}, sync state updated (last_uid_synced: ${highestUid})`);
+    }
 
     const duration = Date.now() - startTime;
     console.log(`[SYNC] Completed ${folderName}: Fetched: ${emailsFetched}, Saved: ${emailsSaved}, Updated: ${emailsUpdated}, Errors: ${errorsCount}, Duration: ${duration}ms`);
@@ -541,30 +552,41 @@ async function syncAccountFolders(connection, account) {
     folderResults: {},
   };
   try {
-    // Get all folders
-    const boxes = await connection.getBoxes();
-    const folders = flattenFolderStructure(boxes);
-    console.log(`[SYNC] Account ${account.id} has ${folders.length} folders`);
+    // ✅ UPDATED: Get all folders that have been initially synced
+    // Only sync folders that were synced during comprehensive sync
+    const { data: syncedFolders, error: foldersError } = await supabaseAdmin
+      .from('email_sync_state')
+      .select('folder_name, initial_sync_completed')
+      .eq('account_id', account.id)
+      .eq('initial_sync_completed', true);
+
+    if (foldersError) {
+      console.error(`[SYNC] Error fetching synced folders:`, foldersError.message);
+      throw foldersError;
+    }
+
+    if (!syncedFolders || syncedFolders.length === 0) {
+      console.log(`[SYNC] No initially synced folders found for account ${account.id}`);
+      return results;
+    }
+
+    const folderNames = syncedFolders.map(f => f.folder_name);
+    console.log(`[SYNC] Account ${account.id} has ${folderNames.length} initially synced folders:`, folderNames);
 
     // Sync each folder
-    for (const folder of folders) {
-      // Skip system folders that can't be selected
-      if (folder.attributes?.includes('\\Noselect')) {
-        console.log(`[SYNC] Skipping non-selectable folder: ${folder.name}`);
-        continue;
-      }
+    for (const folderName of folderNames) {
       try {
-        const folderResult = await syncFolder(connection, account.id, folder.name);
+        const folderResult = await syncFolder(connection, account.id, folderName);
 
         results.foldersProcessed++;
         results.totalEmailsFetched += folderResult.emailsFetched;
         results.totalEmailsSaved += folderResult.emailsSaved;
         results.totalEmailsUpdated += folderResult.emailsUpdated;
         results.totalErrors += folderResult.errorsCount;
-        results.folderResults[folder.name] = folderResult;
+        results.folderResults[folderName] = folderResult;
 
         // Log this folder's sync
-        await logSyncActivity(account.id, folder.name, {
+        await logSyncActivity(account.id, folderName, {
           syncType: 'incremental',
           emailsFetched: folderResult.emailsFetched,
           emailsSaved: folderResult.emailsSaved,
@@ -573,9 +595,9 @@ async function syncAccountFolders(connection, account) {
           durationMs: folderResult.duration,
         });
       } catch (folderError) {
-        console.error(`Error syncing folder ${folder.name}:`, folderError.message);
+        console.error(`Error syncing folder ${folderName}:`, folderError.message);
         results.totalErrors++;
-        await logSyncActivity(account.id, folder.name, {
+        await logSyncActivity(account.id, folderName, {
           syncType: 'incremental',
           errorsCount: 1,
           errorDetails: folderError.message,
@@ -603,11 +625,13 @@ async function syncAllImapAccounts() {
   try {
     console.log('[SYNC] Starting global sync of all IMAP accounts');
 
-    // ✅ CRITICAL: Get all active IMAP/SMTP accounts with validation
+    // ✅ CRITICAL: Get all active IMAP/SMTP accounts where comprehensive sync is completed
+    // Only sync accounts that have been fully initialized
     const { data: accounts, error } = await supabaseAdmin
       .from('email_accounts')
       .select('*')
       .eq('is_active', true)
+      .eq('comprehensive_sync_completed', true) // Only sync fully initialized accounts
       .or('provider_type.eq.imap_smtp,provider_type.is.null')
       .not('imap_host', 'is', null)
       .not('imap_username', 'is', null);
@@ -634,10 +658,11 @@ async function syncAllImapAccounts() {
         console.warn(`[SYNC] ⚠️  Skipping account ${account.email || account.id} - missing IMAP settings`);
         return false;
       }
-      // ✅ CRITICAL: Skip accounts that need reconnection (prevents rate limiting)
+      // ✅ FIX: Don't skip accounts that need reconnection - try to sync anyway
+      // If sync succeeds, we'll clear the flag. If it fails, we'll keep it.
+      // This prevents accounts from being permanently stuck in "needs_reconnection" state
       if (account.needs_reconnection) {
-        console.log(`[SYNC] ⏭️  Skipping account ${account.email || account.id} - needs reconnection`);
-        return false;
+        console.log(`[SYNC] ⚠️  Account ${account.email || account.id} marked as needs_reconnection, but attempting sync anyway`);
       }
       return true;
     });
@@ -681,10 +706,10 @@ async function syncAllImapAccounts() {
           .update({ sync_status: 'syncing' })
           .eq('id', activeAccount.id);
 
-        // ✅ CRITICAL: Double-check needs_reconnection before connecting (prevent rate limiting)
+        // ✅ FIX: Don't skip - attempt sync even if needs_reconnection is true
+        // If sync succeeds, we'll clear the flag below
         if (activeAccount.needs_reconnection) {
-          console.log(`[SYNC] ⏭️  Skipping sync for ${activeAccount.email} - account needs reconnection`);
-          continue;
+          console.log(`[SYNC] ⚠️  Account ${activeAccount.email} marked as needs_reconnection, attempting sync to clear flag`);
         }
 
         // Connect to IMAP using connection pool (limits concurrent connections)
@@ -723,6 +748,8 @@ async function syncAllImapAccounts() {
           sync_status: 'idle',
           last_successful_sync_at: new Date().toISOString(),
           sync_error_details: null,
+          needs_reconnection: false, // ✅ FIX: Clear needs_reconnection flag on successful sync
+          last_error: null, // Clear any previous errors
         };
 
         // CRITICAL: Mark initial sync as completed after first successful sync

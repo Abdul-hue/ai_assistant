@@ -47,6 +47,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 // @ts-ignore - config.js doesn't have type definitions
 import { API_URL } from "../config";
+import { useAuth } from "@/context/AuthContext";
+import { io, Socket } from "socket.io-client";
 
 const UnifiedEmailInbox = () => {
   const { accountId } = useParams<{ accountId: string }>();
@@ -71,6 +73,126 @@ const UnifiedEmailInbox = () => {
   const [accountInfo, setAccountInfo] = useState<{ email: string; provider: string } | null>(null);
   const [lastRefresh, setLastRefresh] = useState<Date>(new Date());
   const [loadingMessage, setLoadingMessage] = useState<string>('');
+  const [comprehensiveSyncStatus, setComprehensiveSyncStatus] = useState<string>('pending');
+  const [comprehensiveSyncProgress, setComprehensiveSyncProgress] = useState<any>({});
+  const [socket, setSocket] = useState<Socket | null>(null);
+  const { user } = useAuth();
+
+  // Check sync status
+  const checkSyncStatus = async () => {
+    if (!accountId) return;
+    
+    try {
+      const res = await fetch(
+        `${API_URL}/api/imap-smtp/comprehensive-sync-status/${accountId}`,
+        { credentials: 'include' }
+      );
+      const data = await res.json();
+      
+      if (data.success) {
+        setComprehensiveSyncStatus(data.syncStatus);
+        setComprehensiveSyncProgress(data.syncProgress);
+      }
+    } catch (error) {
+      console.error('Error checking sync status:', error);
+    }
+  };
+
+  // Setup WebSocket connection
+  useEffect(() => {
+    if (!user?.id) return;
+
+    const wsUrl = API_URL.replace('http://', 'ws://').replace('https://', 'wss://');
+    const newSocket = io(wsUrl, {
+      transports: ['websocket'],
+      withCredentials: true,
+      query: {
+        userId: user.id // ✅ Pass userId in query for backend handshake
+      }
+    });
+
+    newSocket.on('connect', () => {
+      console.log('[WS] Connected with userId:', user.id);
+      // Also register with WebSocketManager for comprehensive sync events
+      newSocket.emit('register', { userId: user.id });
+      // Join user room for targeted events
+      newSocket.emit('join_user', { userId: user.id });
+    });
+
+    // Listen for comprehensive sync events
+    newSocket.on('comprehensive_sync_started', (data: { accountId: string; email: string }) => {
+      console.log(`[WS] Comprehensive sync started for ${data.email}`);
+      if (data.accountId === accountId) {
+        setComprehensiveSyncStatus('in_progress');
+        toast({
+          title: "Syncing All Folders",
+          description: `Syncing all folders for ${data.email}...`,
+          duration: 0, // Don't auto-dismiss
+        });
+      }
+    });
+
+    newSocket.on('comprehensive_sync_progress', (data: { 
+      accountId: string; 
+      folder: string;
+      count: number;
+      progress: { current: number; total: number; percentage: number } 
+    }) => {
+      if (data.accountId === accountId) {
+        console.log(`[WS] Sync progress: ${data.folder} (${data.progress.percentage}%)`);
+        setComprehensiveSyncProgress((prev: any) => ({
+          ...prev,
+          [data.folder]: { status: 'completed', count: data.count }
+        }));
+        toast({
+          title: "Sync Progress",
+          description: `Syncing folders: ${data.progress.current}/${data.progress.total} (${data.progress.percentage}%) - ${data.folder}: ${data.count} emails`,
+          duration: 2000,
+        });
+      }
+    });
+
+    newSocket.on('comprehensive_sync_completed', (data: { 
+      accountId: string; 
+      email: string; 
+      results: any 
+    }) => {
+      if (data.accountId === accountId) {
+        console.log(`[WS] Comprehensive sync completed:`, data.results);
+        setComprehensiveSyncStatus('completed');
+        toast({
+          title: "✅ All Folders Synced!",
+          description: `${data.results.totalEmails} emails loaded across ${data.results.completed} folders.`,
+          duration: 5000,
+        });
+        // Refresh current folder
+        loadImapEmails();
+      }
+    });
+
+    // Listen for background sync updates
+    newSocket.on('emails_synced', (data: { accountId: string; folder: string; count: number; type: string }) => {
+      if (data.accountId === accountId && data.count > 0 && data.folder === currentFolder) {
+        console.log(`[WS] ${data.count} new emails in ${data.folder}`);
+        loadImapEmails(); // Refresh current folder
+        toast({
+          title: "New Emails",
+          description: `${data.count} new email${data.count > 1 ? 's' : ''} in ${data.folder}`,
+          duration: 3000,
+        });
+      }
+    });
+
+    setSocket(newSocket);
+
+    return () => {
+      newSocket.off('comprehensive_sync_started');
+      newSocket.off('comprehensive_sync_progress');
+      newSocket.off('comprehensive_sync_completed');
+      newSocket.off('emails_synced');
+      newSocket.disconnect();
+    };
+  }, [user?.id, accountId, currentFolder]);
 
   useEffect(() => {
     if (!accountId) {
@@ -99,6 +221,7 @@ const UnifiedEmailInbox = () => {
     loadAccountInfo();
     loadImapEmails();
     loadFolders();
+    checkSyncStatus();
     
     // Auto-refresh every 15 minutes
     const refreshInterval = setInterval(() => {
@@ -110,7 +233,8 @@ const UnifiedEmailInbox = () => {
     return () => clearInterval(refreshInterval);
   }, [accountId, currentFolder]);
 
-  // Sync from IMAP and refresh UI
+  // ✅ FIX: Manual sync - only triggered by user clicking "Sync from IMAP" button
+  // This should NOT be called automatically on folder clicks
   const triggerInitialSync = async () => {
     if (!accountId) {
       toast({
@@ -125,7 +249,7 @@ const UnifiedEmailInbox = () => {
     setLoadingMessage('🔄 Syncing emails from IMAP...');
     
     try {
-      console.log('[UI] 🔄 Starting IMAP sync for:', accountId);
+      console.log('[UI] 🔄 Manual sync triggered for:', accountId);
       console.log(`[UI] Folder: ${currentFolder || 'INBOX'}`);
       
       // Map folder name
@@ -133,8 +257,7 @@ const UnifiedEmailInbox = () => {
         ? mapFolderNameToImap(currentFolder, folders)
         : currentFolder;
       
-      // Trigger IMAP sync - fetch emails and save to database
-      // ✅ Use forceRefresh=true to fetch most recent emails regardless of sync state
+      // ✅ FIX: Use forceRefresh=true only for manual sync (not automatic)
       const response = await fetch(
         `${API_URL}/api/imap-smtp/emails/${accountId}?folder=${actualFolder || 'INBOX'}&limit=20&headersOnly=false&forceRefresh=true`,
         {
@@ -150,8 +273,7 @@ const UnifiedEmailInbox = () => {
 
       const data = await response.json();
       
-      console.log(`[UI] ✅ Sync completed: ${data.count || data.savedCount || 0} emails synced`);
-      console.log('[UI] Sync mode:', data.mode || 'unknown');
+      console.log(`[UI] ✅ Manual sync completed: ${data.count || data.savedCount || 0} emails synced`);
       
       const emailCount = data.savedCount || data.count || data.emails?.length || 0;
       
@@ -162,7 +284,7 @@ const UnifiedEmailInbox = () => {
         duration: 3000,
       });
       
-      // 🎯 CRITICAL: Reload emails from database after sync
+      // Reload emails from database after sync
       await loadImapEmails();
       
     } catch (error: any) {
@@ -179,7 +301,7 @@ const UnifiedEmailInbox = () => {
     }
   };
 
-  // Load emails from DATABASE (with proper sorting)
+  // ✅ FIX: Load emails from DATABASE only - no aggressive syncing
   const loadImapEmails = async () => {
     if (!accountId) {
       console.warn('⚠️ [INBOX] No accountId provided');
@@ -198,7 +320,7 @@ const UnifiedEmailInbox = () => {
       
       console.log(`[UI] 📂 Folder: ${actualFolder} (displayed as: ${currentFolder})`);
       
-      // Fetch from database (not IMAP) - this is fast!
+      // ✅ FIX: Only fetch from database - emails-quick handles initial sync automatically
       const response = await fetch(
         `${API_URL}/api/imap-smtp/emails-quick/${accountId}?folder=${actualFolder || 'INBOX'}&limit=50`,
         {
@@ -222,7 +344,7 @@ const UnifiedEmailInbox = () => {
           return dateB - dateA; // Newest first
         });
         
-        console.log(`[UI] ✅ Loaded ${sortedEmails.length} emails (sorted by date)`);
+        console.log(`[UI] ✅ Loaded ${sortedEmails.length} emails from database (${data.loadTime}ms)`);
         if (sortedEmails.length > 0) {
           console.log('[UI] 📅 Newest email:', sortedEmails[0]?.subject, sortedEmails[0]?.date);
         }
@@ -234,60 +356,13 @@ const UnifiedEmailInbox = () => {
           setSelectedEmail(sortedEmails[0]);
         }
         
-        // ✅ IF NO EMAILS, CHECK IF IT'S AN AUTH ERROR BEFORE TRIGGERING SYNC
-        if (sortedEmails.length === 0) {
-          console.warn('⚠️ [INBOX] No emails in database, checking account status...');
-          
-          // Call debug endpoint to check if auth is failing
-          try {
-            const debugResponse = await fetch(`${API_URL}/api/imap-smtp/debug/${accountId}`, {
-              credentials: 'include',
-            });
-            const debugData = await debugResponse.json();
-            
-            // Check if account has auth issues
-            const account = debugData.account;
-            const hasAuthError = account?.last_error?.includes('authentication') ||
-                                account?.last_error?.includes('Not authenticated') ||
-                                account?.last_error?.includes('credentials') ||
-                                account?.last_error?.includes('AUTHENTICATIONFAILED') ||
-                                account?.needs_reconnection === true;
-            
-            if (hasAuthError) {
-              console.error('❌ [INBOX] Authentication error detected!');
-              setAuthError(true);
-              setShowReconnectPrompt(true);
-              
-              toast({
-                variant: "destructive",
-                title: "Authentication Failed",
-                description: "Your email password is incorrect or expired. Please reconnect your account.",
-                duration: 10000,
-              });
-              
-              return; // Don't trigger sync if auth is failing
-            }
-            
-            // Only trigger initial sync if NO auth errors
-            console.log('⚠️ [INBOX] No auth errors detected, triggering initial sync...');
-            
-            toast({
-              title: "First Time Setup",
-              description: "Syncing your emails for the first time. This may take a moment...",
-            });
-            
-            // Trigger initial sync in background
-            setTimeout(() => triggerInitialSync(), 1000);
-            
-          } catch (debugError) {
-            console.error('[INBOX] Error checking account status:', debugError);
-            // If debug check fails, still try initial sync
-            toast({
-              title: "First Time Setup",
-              description: "Syncing your emails for the first time. This may take a moment...",
-            });
-            setTimeout(() => triggerInitialSync(), 1000);
-          }
+        // ✅ FIX: If no emails and needs initial sync, show loading indicator
+        // Initial sync will happen automatically in background via emails-quick endpoint
+        if (sortedEmails.length === 0 && data.needsInitialSync) {
+          console.log('[UI] ⏳ First time accessing this folder - initial sync in progress...');
+          setLoadingMessage('Loading emails for the first time...');
+        } else {
+          setLoadingMessage('');
         }
         
       } else {
@@ -307,6 +382,7 @@ const UnifiedEmailInbox = () => {
       
       if (isAuthError) {
         setAuthError(true);
+        setShowReconnectPrompt(true);
       }
       
       toast({
@@ -318,6 +394,7 @@ const UnifiedEmailInbox = () => {
       });
     } finally {
       setLoading(false);
+      setLoadingMessage('');
       console.log('🏁 [INBOX] Email load complete');
     }
   };
@@ -675,6 +752,21 @@ const UnifiedEmailInbox = () => {
 
       {/* Main Content */}
       <div className="flex-1 flex flex-col">
+        {/* Sync Status Banner */}
+        {comprehensiveSyncStatus === 'in_progress' && (
+          <div className="bg-blue-50 border-b border-blue-200 p-4">
+            <div className="flex items-center gap-3">
+              <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-blue-600"></div>
+              <div className="flex-1">
+                <p className="font-medium text-blue-900">Initial Sync in Progress</p>
+                <p className="text-sm text-blue-700">
+                  Syncing all folders for the first time...
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+        
         {/* Header */}
         <div className="border-b p-4 space-y-4">
           <div className="flex items-center justify-between">

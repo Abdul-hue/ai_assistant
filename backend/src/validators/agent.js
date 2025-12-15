@@ -76,10 +76,24 @@ const createAgentSchema = z.object({
 
 // Schema for updating an existing agent (all fields optional)
 const updateAgentSchema = z.object({
+  // Support both 'name' and 'agent_name' for backward compatibility
   name: z.string()
     .min(1, 'Agent name is required')
     .max(100, 'Agent name must be less than 100 characters')
     .optional(),
+  agent_name: z.string()
+    .min(1, 'Agent name is required')
+    .max(100, 'Agent name must be less than 100 characters')
+    .optional(),
+  persona: z.string()
+    .max(5000, 'Persona must be less than 5000 characters')
+    .optional()
+    .nullable(),
+  avatar_url: z.string()
+    .url('Invalid avatar URL')
+    .optional()
+    .nullable()
+    .or(z.literal('')),
   
   description: z.string()
     .max(500, 'Description must be less than 500 characters')

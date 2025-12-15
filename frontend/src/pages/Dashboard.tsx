@@ -4,7 +4,7 @@ import { formatDistanceToNow } from "date-fns";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle, CardFooter } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Plus, Bot, MessageSquare, Loader2, Calendar as CalendarIcon, Eye, Users, Trash2, LayoutDashboard, Settings, Home, RefreshCw, AlertCircle, Globe, Clock, User, Mail, Menu, X, Key } from "lucide-react";
+import { Plus, Bot, MessageSquare, Loader2, Calendar as CalendarIcon, Eye, Users, Trash2, LayoutDashboard, Settings, Home, RefreshCw, AlertCircle, Globe, Clock, User, Mail, Menu, X, Key, MessageCircle } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import AgentDetailsModal from "@/components/AgentDetailsModal";
 import ContactsManagementDialog from "@/components/agents/ContactsManagementDialog";
@@ -140,6 +140,16 @@ const Dashboard = () => {
           >
             <LayoutDashboard className="h-5 w-5" />
             Dashboard
+          </Button>
+          <Button
+            variant="ghost"
+            className={`w-full justify-start gap-3 hover:bg-white/10 transition-all duration-300 ${
+              isActive("/agent-chat") ? "bg-primary/20 text-primary border-l-2 border-primary" : "text-gray-400"
+            }`}
+            onClick={() => navigate("/agent-chat")}
+          >
+            <MessageCircle className="h-5 w-5" />
+            Agent Chat
           </Button>
           <Button
             variant="ghost"

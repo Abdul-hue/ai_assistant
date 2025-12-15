@@ -29,7 +29,7 @@ const DEFAULT_AUDIO_BUCKET = 'agent-audio-messages';
 const FALLBACK_AUDIO_BUCKET = process.env.AUDIO_FALLBACK_BUCKET || 'agent-files';
 let audioBucketName = process.env.AUDIO_BUCKET || DEFAULT_AUDIO_BUCKET;
 const DEFAULT_AUDIO_SIGNED_URL_TTL = 60 * 60 * 24 * 7; // 7 days
-let audioBucketChecked = false;
+let audioBucketChecked = false;image.png
 const QR_EXPIRY_MS = 3 * 60 * 1000; // 3 minutes - WhatsApp QR code validity
 
 // SECURITY: Generate unique instance ID for multi-instance prevention
@@ -630,142 +630,56 @@ function validateCredentialIntegrity(creds) {
   return { valid: true };
 }
 
-// CRITICAL: Connection monitor for auto-reconnect
+// SIMPLIFIED CONNECTION MONITOR - Trust Baileys' internal keepalive
 function startConnectionMonitor(agentId, sock, session, userId) {
-  let lastPong = Date.now();
-  let consecutiveFailures = 0;
-  let reconnecting = false;
+  console.log(`[BAILEYS] 🔍 Starting simplified connection monitor for ${agentId.substring(0, 40)}`);
   
-  console.log(`[BAILEYS] 🔍 Starting connection monitor for ${agentId.substring(0, 40)}`);
+  // Track last successful connection.update event
+  let lastConnectionEvent = Date.now();
   
-  // Monitor WebSocket pongs
-  if (sock.ws) {
-    sock.ws.on('pong', () => {
-      lastPong = Date.now();
-      consecutiveFailures = 0;
-      if (session) {
-        session.lastPong = lastPong;
-      }
-    });
-    
-    // Also monitor ping events
-    sock.ws.on('ping', () => {
-      console.log(`[BAILEYS] 🏓 Received ping from server`);
-    });
-  }
-  
-  const monitor = setInterval(async () => {
+  // Simple monitor - only check if we're receiving connection.update events
+  const monitor = setInterval(() => {
     const currentSession = activeSessions.get(agentId);
     
-    // Stop monitor if session removed or in conflict
+    // Stop if session removed or in conflict
     if (!currentSession || currentSession.connectionState === 'conflict') {
-      console.log(`[BAILEYS] 🛑 Stopping connection monitor (session ${!currentSession ? 'removed' : 'in conflict'})`);
+      console.log(`[BAILEYS] 🛑 Stopping monitor (session ${!currentSession ? 'removed' : 'in conflict'})`);
       clearInterval(monitor);
       return;
     }
     
-    // Skip if already reconnecting
-    if (reconnecting) {
-      console.log(`[BAILEYS] ⏳ Reconnection in progress, skipping health check`);
-      return;
-    }
-    
     const now = Date.now();
-    const timeSinceLastPong = now - lastPong;
-    const timeSinceLastActivity = now - (currentSession.lastActivity || now);
-    const socketReadyState = sock.ws?.readyState;
+    const timeSinceLastEvent = now - lastConnectionEvent;
     
-    // Check 1: WebSocket still alive?
-    if (socketReadyState !== 1) { // 1 = OPEN
-      console.error(`[BAILEYS] ❌ WebSocket not open (state: ${socketReadyState})`);
-      consecutiveFailures++;
+    // Only reconnect if no connection events for 5 minutes (very conservative)
+    // Baileys handles keepalive internally, we just detect total silence
+    if (timeSinceLastEvent > 300000 && currentSession.isConnected) {
+      console.error(`[BAILEYS] ❌ No connection events for 5 minutes - connection may be dead`);
+      console.log(`[BAILEYS] 🔄 Triggering reconnection...`);
       
-      if (consecutiveFailures >= 2) {
-        console.error(`[BAILEYS] ❌ WebSocket closed, triggering reconnection`);
-        reconnecting = true;
-        clearInterval(monitor);
-        
+      clearInterval(monitor);
+      
+      // Graceful reconnect
+      setTimeout(async () => {
         try {
           await disconnectWhatsApp(agentId);
           await new Promise(resolve => setTimeout(resolve, 3000));
           await initializeWhatsApp(agentId, userId);
         } catch (error) {
           console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
-        } finally {
-          reconnecting = false;
         }
-        return;
-      }
+      }, 1000);
     }
     
-    // Check 2: No pong in too long?
-    if (timeSinceLastPong > 60000) { // 60 seconds without pong
-      consecutiveFailures++;
-      console.error(`[BAILEYS] ❌ No pong in ${Math.round(timeSinceLastPong/1000)}s (failure #${consecutiveFailures})`);
-      
-      if (consecutiveFailures >= 3) {
-        console.error(`[BAILEYS] ❌ Connection appears dead (3 consecutive failures), reconnecting...`);
-        reconnecting = true;
-        clearInterval(monitor);
-        
-        try {
-          await disconnectWhatsApp(agentId);
-          await new Promise(resolve => setTimeout(resolve, 5000));
-          await initializeWhatsApp(agentId, userId);
-        } catch (error) {
-          console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
-        } finally {
-          reconnecting = false;
-        }
-        return;
-      }
-      
-      // Try manual ping to wake up connection
-      try {
-        console.log(`[BAILEYS] 🏓 Sending manual ping to test connection`);
-        await sock.ws?.ping?.();
-      } catch (pingError) {
-        console.error(`[BAILEYS] ❌ Manual ping failed:`, pingError.message);
-      }
-    } else {
-      // Reset consecutive failures if we got recent pong
-      consecutiveFailures = 0;
-    }
-    
-    // Check 3: Inactive too long? Test connection health
-    if (currentSession.isConnected && timeSinceLastActivity > 180000) { // 3 minutes
-      console.log(`[BAILEYS] ⚠️ Connection inactive for ${Math.round(timeSinceLastActivity/1000)}s, testing health...`);
-      try {
-        await sock.ws?.ping?.();
-        console.log(`[BAILEYS] 🏓 Health check ping sent`);
-      } catch (error) {
-        console.error(`[BAILEYS] ❌ Health check ping failed:`, error.message);
-        consecutiveFailures++;
-      }
-    }
-    
-    // Check 4: Network connectivity test (every 2 minutes)
-    if (now % 120000 < 15000) { // Run approximately every 2 minutes
-      try {
-        await new Promise((resolve, reject) => {
-          const req = https.get('https://web.whatsapp.com', { timeout: 5000 }, (res) => {
-            resolve(res.statusCode === 200);
-          });
-          req.on('error', reject);
-          req.on('timeout', () => {
-            req.destroy();
-            reject(new Error('Network timeout'));
-          });
-        });
-      } catch (networkError) {
-        console.error(`[BAILEYS] ⚠️ Network check failed (WhatsApp unreachable):`, networkError.message);
-        // Don't disconnect yet - network might come back
-      }
-    }
-    
-  }, 15000); // Check every 15 seconds
+  }, 60000); // Check every 60 seconds (not 15)
   
-  // Store monitor reference so we can clean it up later
+  // Update lastConnectionEvent whenever we get ANY connection.update
+  if (sock.ev) {
+    sock.ev.on('connection.update', () => {
+      lastConnectionEvent = Date.now();
+    });
+  }
+  
   if (session) {
     session.connectionMonitor = monitor;
   }
@@ -1666,18 +1580,17 @@ async function initializeWhatsApp(agentId, userId = null) {
       logger: customLogger, // Use custom logger to intercept sender_pn
       browser: Browsers.ubuntu('Chrome'),
       
-      // CRITICAL: Aggressive keepalive to prevent timeout (WhatsApp timeout is ~15-30s)
-      keepAliveIntervalMs: 10000, // Send keepalive every 10s (aggressive)
-      // CRITICAL: Increased timeouts for pairing phase (QR scan -> credential exchange)
-      defaultQueryTimeoutMs: 180000, // INCREASED from 120s to 180s (3 minutes for pairing)
-      connectTimeoutMs: 180000, // INCREASED from 120s to 180s
-      qrTimeout: 180000, // QR valid for 3 minutes (WhatsApp standard)
+      // CRITICAL: Proper keepalive configuration
+      keepAliveIntervalMs: 30000, // Changed from 10s to 30s (less aggressive)
+      defaultQueryTimeoutMs: 60000, // Reduced from 180s to 60s
+      connectTimeoutMs: 60000, // Reduced from 180s to 60s
+      qrTimeout: 60000, // Standard QR timeout
       
-      // CRITICAL: More aggressive retries during pairing
-      retryRequestDelayMs: 1000, // INCREASED from 500ms to 1000ms (less aggressive)
-      maxMsgRetryCount: 10, // INCREASED from 5 to 10 (more retries)
-      emitOwnEvents: true, // CRITICAL: May be needed for QR events
-      fireInitQueries: true, // CRITICAL: Fire initial queries immediately
+      retryRequestDelayMs: 2000, // Increased from 1s to 2s
+      maxMsgRetryCount: 5, // Reduced from 10 to 5
+      
+      // IMPORTANT: Remove emitOwnEvents and fireInitQueries
+      // Let Baileys handle these internally
       
       // CRITICAL: getMessage handler - return undefined to prevent errors
       getMessage: async (key) => {
@@ -1686,7 +1599,7 @@ async function initializeWhatsApp(agentId, userId = null) {
       
       generateHighQualityLinkPreview: false,
       syncFullHistory: false,
-      markOnlineOnConnect: false // Set to false to reduce initial connection overhead
+      markOnlineOnConnect: true // Changed to true - helps maintain connection
     });
 
     console.log(`[BAILEYS] ✅ Socket created with EXTENDED timeouts for pairing (3min)`);
@@ -1704,6 +1617,8 @@ async function initializeWhatsApp(agentId, userId = null) {
       try {
         // Intercept raw WebSocket messages to extract sender_pn
         sock.ws.on('message', (data) => {
+          // REMOVED: lastActivity tracking - we can't reliably track it
+          
           try {
             // Baileys uses binary protocol, but we can try to parse JSON if it's text
             if (typeof data === 'string') {
@@ -1723,14 +1638,7 @@ async function initializeWhatsApp(agentId, userId = null) {
         });
         console.log(`[BAILEYS] ✅ Raw WebSocket message interceptor attached`);
         
-        // ADD: WebSocket debugging listeners for pairing diagnostics
-        sock.ws.on('close', (code, reason) => {
-          console.log(`[BAILEYS] 🔌 WebSocket CLOSED: code=${code}, reason=${reason}`);
-        });
-        
-        sock.ws.on('error', (error) => {
-          console.log(`[BAILEYS] ❌ WebSocket ERROR:`, error);
-        });
+        // REMOVED: WebSocket debugging listeners - not needed and adds noise
       } catch (wsError) {
         console.log(`[BAILEYS] ⚠️ Could not attach raw WebSocket interceptor: ${wsError.message}`);
       }
@@ -1810,8 +1718,6 @@ async function initializeWhatsApp(agentId, userId = null) {
       qrCode: null,
       qrGeneratedAt: null,
       socketCreatedAt: Date.now(),
-      lastPingAt: Date.now(),
-      lastActivity: Date.now(),
       connectionState: 'initializing',
       qrAttempts: 0,
       connectedAt: null,
@@ -1862,85 +1768,8 @@ async function initializeWhatsApp(agentId, userId = null) {
     sessionData.backupInterval = backupInterval;
     
     // CRITICAL: Add socket health check to detect premature disconnects
-    const healthCheckInterval = setInterval(async () => {
-      const session = activeSessions.get(agentId);
-      if (!session) {
-        console.log(`[BAILEYS] Health check: Session removed, clearing interval`);
-        clearInterval(healthCheckInterval);
-        return;
-      }
-      
-      // If session is marked as conflict (401 error), stop health check
-      if (session.connectionState === 'conflict' || session.failureReason) {
-        console.log(`[BAILEYS] Health check: Session in conflict state, clearing interval`);
-        clearInterval(healthCheckInterval);
-        return;
-      }
-      
-      const now = Date.now();
-      const socketAge = now - session.socketCreatedAt;
-      const timeSinceLastPing = now - session.lastPingAt;
-      const qrAge = session.qrGeneratedAt ? now - session.qrGeneratedAt : null;
-      
-      // Enhanced diagnostic logging
-      if (!session.isConnected && socketAge > 90000) {
-        const socketAgeSeconds = Math.round(socketAge/1000);
-        const hasQR = !!session.qrCode;
-        const qrAgeSeconds = qrAge ? Math.round(qrAge/1000) : null;
-        const isQRExpired = qrAge && qrAge > QR_EXPIRY_MS;
-        
-        console.warn(`[BAILEYS] ⚠️ Socket alive for ${socketAgeSeconds}s but not connected yet`);
-        console.warn(`[BAILEYS] ⚠️ Connection State: ${session.connectionState || 'unknown'}`);
-        console.warn(`[BAILEYS] ⚠️ Has QR: ${hasQR}, QR attempts: ${session.qrAttempts || 0}`);
-        
-        if (hasQR && qrAgeSeconds !== null) {
-          if (isQRExpired) {
-            console.warn(`[BAILEYS] ⚠️ QR Code EXPIRED (${qrAgeSeconds}s old, >180s limit)`);
-            console.warn(`[BAILEYS] 💡 Action: QR expired - waiting for new QR from WhatsApp servers...`);
-            console.warn(`[BAILEYS] 💡 If no new QR appears, try disconnecting and reconnecting`);
-          } else {
-            const timeLeft = Math.round((QR_EXPIRY_MS - qrAge) / 1000);
-            console.warn(`[BAILEYS] ⚠️ QR Code age: ${qrAgeSeconds}s (${timeLeft}s remaining before expiry)`);
-            console.warn(`[BAILEYS] 💡 Action: Please scan the QR code within ${timeLeft} seconds`);
-          }
-        } else if (!hasQR) {
-          console.warn(`[BAILEYS] ⚠️ No QR code available`);
-          console.warn(`[BAILEYS] 💡 Action: Waiting for QR code from WhatsApp servers...`);
-          console.warn(`[BAILEYS] 💡 Check network connectivity if QR doesn't appear soon`);
-        }
-        
-        // Check network connectivity if socket is very old
-        if (socketAge > 180000) { // 3 minutes
-          console.warn(`[BAILEYS] ⚠️ Socket has been waiting for ${socketAgeSeconds}s - checking network...`);
-          try {
-            const networkOk = await checkNetworkRequirements();
-            if (!networkOk) {
-              console.error(`[BAILEYS] ❌ Network check failed - cannot reach WhatsApp servers`);
-              console.error(`[BAILEYS] 💡 Please check: 1) Internet connection 2) Firewall 3) Proxy settings`);
-            } else {
-              console.log(`[BAILEYS] ✅ Network connectivity OK`);
-            }
-          } catch (networkError) {
-            console.error(`[BAILEYS] ❌ Network check error:`, networkError.message);
-          }
-        }
-      }
-      
-      session.lastPingAt = now;
-      session.lastActivity = now;
-      
-      // CRITICAL: Health checks run FOREVER while session exists
-      // Only stop when:
-      // - Session is removed from activeSessions (checked above)
-      // - Session state is 'conflict' (checked above)
-      // - Manual disconnect is called
-      // DO NOT stop after 5 minutes - connection can stay alive indefinitely
-    }, 30000); // Check every 30 seconds
-    
-    // Store interval ID in session so we can clear it if needed
-    sessionData.healthCheckInterval = healthCheckInterval;
-
-    console.log(`[BAILEYS] ✅ Socket health monitor started (checks every 30s)`);
+    // REMOVED: Health check interval - causes false disconnects
+    // Baileys handles keepalive internally, we don't need to monitor it
 
     // Connection updates
     sock.ev.on('connection.update', async (update) => {
@@ -1951,11 +1780,7 @@ async function initializeWhatsApp(agentId, userId = null) {
       console.log(`[BAILEYS] Has QR: ${!!qr}`);
       console.log(`[BAILEYS] Is New Login: ${isNewLogin}`);
       
-      // ADD: More detailed state logging
-      if (connection === 'connecting') {
-        console.log(`[BAILEYS] 🔄 CONNECTION STATE: connecting`);
-        console.log(`[BAILEYS] ℹ️  Socket is establishing connection to WhatsApp servers...`);
-      }
+      // REMOVED: Connecting state logging - causes false disconnects during pairing
       
       if (connection === 'close' && lastDisconnect) {
         const session = activeSessions.get(agentId);
@@ -1986,7 +1811,6 @@ async function initializeWhatsApp(agentId, userId = null) {
         
         if (session) {
           session.connectionState = 'qr_pending';
-          session.lastActivity = Date.now();
         }
         
         console.log(`[BAILEYS] 🎯 QR CODE RECEIVED! (Attempt #${qrAttempt})`);
@@ -2146,7 +1970,6 @@ async function initializeWhatsApp(agentId, userId = null) {
             session.qrGeneratedAt = null;
             session.connectionState = 'open';
             session.connectedAt = Date.now();
-            session.lastActivity = Date.now();
             session.socketReadyState = session.socket?.ws?.readyState ?? null;
             session.failureReason = null;
             session.failureAt = null;
@@ -2181,7 +2004,6 @@ async function initializeWhatsApp(agentId, userId = null) {
         if (session) {
           session.isConnected = false;
           session.connectionState = 'closed';
-          session.lastActivity = Date.now();
           session.socketReadyState = session.socket?.ws?.readyState ?? null;
         }
 
@@ -2199,7 +2021,6 @@ async function initializeWhatsApp(agentId, userId = null) {
         if (session) {
           session.connectionState = 'closed';
           session.socketReadyState = session.socket?.ws?.readyState ?? null;
-          session.lastActivity = Date.now();
         }
         
         emitAgentEvent(agentId, 'disconnected', {
@@ -2245,11 +2066,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           }
           
           // Stop health check and heartbeat to prevent warning spam
-          if (session?.healthCheckInterval) {
-            clearInterval(session.healthCheckInterval);
-            session.healthCheckInterval = null;
-            console.log(`[BAILEYS] ✅ Health check stopped`);
-          }
+          // REMOVED: healthCheckInterval - no longer used
           if (session?.heartbeatInterval) {
             clearInterval(session.heartbeatInterval);
             session.heartbeatInterval = null;
@@ -2302,141 +2119,81 @@ async function initializeWhatsApp(agentId, userId = null) {
         
         // CRITICAL: Handle error 428 - Connection Lost
         if (statusCode === 428) {
-          console.log(`[BAILEYS] 🔄 428 - Connection Lost`);
+          console.log(`[BAILEYS] 🔄 428 - Connection Lost (network issue)`);
           
-          // CRITICAL: Check if 428 occurred during QR pairing (before connection established)
-          const isDuringPairing = session && !session.isConnected && session.qrCode;
+          // Stop all intervals
+          // REMOVED: healthCheckInterval - no longer used
+          if (session?.connectionMonitor) clearInterval(session.connectionMonitor);
+          if (session?.heartbeatInterval) clearInterval(session.heartbeatInterval);
           
-          if (isDuringPairing) {
-            console.log(`[BAILEYS] ⚠️ 428 occurred DURING QR PAIRING - this indicates network/timeout issue`);
-            console.log(`[BAILEYS] 🔄 Generating FRESH QR code (pairing failed mid-flight)`);
-            
-            // Run network diagnostics
-            await diagnoseNetworkIssue(agentId);
-            
-            // Clean up failed pairing attempt
-            if (session?.socket) {
-              try {
-                session.socket.ev.removeAllListeners();
-                session.socket.end();
-              } catch (err) {
-                console.log('[BAILEYS] Socket cleanup:', err.message);
-              }
-            }
-            
-            // CRITICAL: Clear QR tracker to allow immediate regeneration
-            qrGenerationTracker.delete(agentId);
-            
-            // Clear session data
-            if (session) {
-              session.isConnected = false;
-              session.connectionState = 'qr_regenerating';
-              session.qrCode = null;
-              session.qrGeneratedAt = null;
-            }
-            
-            // Update database - clear old QR
-            await supabaseAdmin
-              .from('whatsapp_sessions')
-              .update({
-                qr_code: null,
-                qr_generated_at: null,
-                status: 'reconnecting',
-                updated_at: new Date().toISOString()
-              })
-              .eq('agent_id', agentId);
-            
-            // Wait 3 seconds then generate fresh QR
-            setTimeout(async () => {
-              console.log(`[BAILEYS] 🔄 Regenerating QR after pairing failure...`);
-              try {
-                // Remove from active sessions to force clean restart
-                activeSessions.delete(agentId);
-                
-                await initializeWhatsApp(agentId, userId);
-                console.log(`[BAILEYS] ✅ Fresh QR generated after pairing failure`);
-              } catch (error) {
-                console.error(`[BAILEYS] ❌ QR regeneration failed:`, error.message);
-              }
-            }, 3000);
-            
-            return; // Don't continue with normal 428 processing
-          }
-          
-          // Normal 428 after connection established - preserve credentials
-          console.log(`[BAILEYS] 🔄 428 - Connection Lost (recoverable network issue)`);
-          console.log(`[BAILEYS] Credentials preserved, auto-reconnecting in 5s...`);
-          
-          // Clean up old socket but keep credentials
+          // Clean up socket
           if (session?.socket) {
             try {
               session.socket.ev.removeAllListeners();
               session.socket.end();
             } catch (err) {
-              console.log('[BAILEYS] Socket cleanup after 428:', err.message);
+              console.log('[BAILEYS] Socket cleanup:', err.message);
             }
           }
           
-          // Mark as disconnected but don't delete credentials
-          if (session) {
-            session.isConnected = false;
-            session.connectionState = 'reconnecting';
-            session.lastActivity = Date.now();
-          }
+          // Remove from memory
+          activeSessions.delete(agentId);
           
-          // Schedule reconnection with exponential backoff
+          // Calculate backoff (max 30 seconds)
           const reconnectAttempt = session?.reconnectAttempts || 0;
-          const backoffDelay = Math.min(5000 * Math.pow(2, reconnectAttempt), 60000); // 5s, 10s, 20s, 40s, 60s max
+          const backoffDelay = Math.min(3000 * Math.pow(1.5, reconnectAttempt), 30000);
           
-          if (session) {
-            session.reconnectAttempts = reconnectAttempt + 1;
-          }
-          
-          console.log(`[BAILEYS] 🔄 Reconnecting after 428 error (attempt ${reconnectAttempt + 1}, delay ${backoffDelay}ms)...`);
+          console.log(`[BAILEYS] 🔄 Reconnecting in ${backoffDelay/1000}s (attempt ${reconnectAttempt + 1})`);
           
           setTimeout(async () => {
             try {
-              // Reset reconnect attempts on successful connection
               await initializeWhatsApp(agentId, userId);
-              console.log(`[BAILEYS] ✅ Reconnection initiated after 428 error`);
+              console.log(`[BAILEYS] ✅ Reconnected after 428`);
             } catch (error) {
               console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
-              // Will retry on next 428 if it happens again
             }
           }, backoffDelay);
           
-          return; // Don't continue processing
+          return;
         }
         
-        // CRITICAL: Handle error 515 - Restart Required (EXPECTED after QR pairing!)
+        // Error 515 - Restart Required (EXPECTED after QR pairing!)
         if (statusCode === 515) {
-          console.log(`[BAILEYS] 🔄 Error 515 - Stream Errored (restart required)`);
-          console.log(`[BAILEYS] This is EXPECTED after QR pairing - credentials saved, restarting...`);
+          console.log(`[BAILEYS] 🔄 Error 515 - Restart required (EXPECTED after QR pairing)`);
           
-          // Clean up old socket
+          // Stop all intervals to prevent interference
+          // REMOVED: healthCheckInterval - no longer used
+          if (session?.connectionMonitor) {
+            clearInterval(session.connectionMonitor);
+            session.connectionMonitor = null;
+          }
+          
+          // Clean up socket
           if (session?.socket) {
             try {
+              session.socket.ev.removeAllListeners();
               session.socket.end();
             } catch (e) {
-              console.log(`[BAILEYS] Socket already ended`);
+              console.log(`[BAILEYS] Socket cleanup: ${e.message}`);
             }
           }
           
-          // Clear tracker to allow restart
+          // Remove from memory to force clean restart
+          activeSessions.delete(agentId);
           qrGenerationTracker.delete(agentId);
           
-          // Wait 2 seconds then restart with saved credentials
+          // Wait 5 seconds then restart (give WhatsApp time to register credentials)
           setTimeout(async () => {
-            console.log(`[BAILEYS] 🔄 Reconnecting with saved credentials...`);
+            console.log(`[BAILEYS] 🔄 Reconnecting after 515...`);
             try {
               await initializeWhatsApp(agentId, userId);
-              console.log(`[BAILEYS] ✅ Restart initiated after 515 error`);
+              console.log(`[BAILEYS] ✅ Reconnected successfully after 515`);
             } catch (error) {
-              console.error(`[BAILEYS] ❌ Reconnection failed:`, error);
+              console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
             }
-          }, 2000);
+          }, 5000); // Increased from 2s to 5s
           
-          return; // Don't continue processing
+          return;
         }
         
         qrGenerationTracker.delete(agentId);
@@ -2475,10 +2232,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           console.log(`  4. Concurrent credential writes from multiple instances`);
           
           // Stop all intervals immediately
-          if (session?.healthCheckInterval) {
-            clearInterval(session.healthCheckInterval);
-            session.healthCheckInterval = null;
-          }
+          // REMOVED: healthCheckInterval - no longer used
           if (session?.heartbeatInterval) {
             clearInterval(session.heartbeatInterval);
             session.heartbeatInterval = null;
@@ -3439,6 +3193,50 @@ async function initializeWhatsApp(agentId, userId = null) {
           Object.entries(messageMetadata).filter(([, value]) => value !== undefined && value !== null)
         );
 
+        // ✅ CRITICAL: Check for duplicate messages before inserting
+        // This prevents duplicate messages when:
+        // 1. User sends message via chat interface (saved in messages route with generated message_id)
+        // 2. WhatsApp echoes back the message (received via messages.upsert with WhatsApp message_id)
+        const timeWindow = 10000; // 10 seconds window for duplicate detection
+        const duplicateCheckStart = new Date(new Date(timestampIso).getTime() - timeWindow).toISOString();
+        const duplicateCheckEnd = new Date(new Date(timestampIso).getTime() + timeWindow).toISOString();
+        
+        // Check for duplicate by message_id first (most reliable)
+        const { data: existingByMessageId } = await supabaseAdmin
+          .from('message_log')
+          .select('id')
+          .eq('message_id', messageId)
+          .eq('agent_id', agentId)
+          .maybeSingle();
+        
+        if (existingByMessageId) {
+          console.log(`[BAILEYS][DB] ⚠️ Duplicate message detected by message_id: ${messageId}, skipping insert`);
+          continue; // Skip to next message
+        }
+        
+        // Also check for duplicate by content, timestamp, sender, and conversation (fallback)
+        // This catches cases where message_id differs (e.g., generated ID vs WhatsApp ID) but it's the same message
+        // For outgoing messages (fromMe=true), check if same content was sent to same recipient recently
+        // For incoming messages (fromMe=false), check if same content was received from same sender recently
+        const { data: existingByContent } = await supabaseAdmin
+          .from('message_log')
+          .select('id, message_id, received_at')
+          .eq('agent_id', agentId)
+          .eq('message_text', content)
+          .eq('conversation_id', remoteJid)
+          .eq('sender_phone', sanitizedFromNumber)
+          .gte('received_at', duplicateCheckStart)
+          .lte('received_at', duplicateCheckEnd)
+          .order('received_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        
+        if (existingByContent) {
+          const timeDiff = Math.abs(new Date(timestampIso).getTime() - new Date(existingByContent.received_at).getTime());
+          console.log(`[BAILEYS][DB] ⚠️ Duplicate message detected by content/timestamp: ${messageId} (existing: ${existingByContent.message_id}, time diff: ${timeDiff}ms), skipping insert`);
+          continue; // Skip to next message
+        }
+
         const dbPayload = {
           message_id: messageId,
           agent_id: agentId, // CRITICAL: Include agent_id
@@ -3458,18 +3256,30 @@ async function initializeWhatsApp(agentId, userId = null) {
         try {
           const { error: insertError } = await supabaseAdmin.from('message_log').insert(dbPayload);
           if (insertError) {
-            console.error('[BAILEYS][DB] ❌ Failed to insert chat message', {
-              messageId,
-              agentId,
-              insertError,
-            });
+            // Check if it's a duplicate key error (message_id already exists)
+            if (insertError.code === '23505' || insertError.message?.includes('duplicate key') || insertError.message?.includes('unique constraint')) {
+              console.log(`[BAILEYS][DB] ⚠️ Duplicate message detected (database constraint): ${messageId}, skipping`);
+            } else {
+              console.error('[BAILEYS][DB] ❌ Failed to insert chat message', {
+                messageId,
+                agentId,
+                insertError,
+              });
+            }
+          } else {
+            console.log(`[BAILEYS][DB] ✅ Message saved: ${messageId} (${messageType})`);
           }
         } catch (error) {
-          console.error('[BAILEYS][DB] ❌ Unexpected error inserting chat message', {
-            messageId,
-            agentId,
-            error: error.message,
-          });
+          // Check if it's a duplicate key error
+          if (error.code === '23505' || error.message?.includes('duplicate key') || error.message?.includes('unique constraint')) {
+            console.log(`[BAILEYS][DB] ⚠️ Duplicate message detected (catch block): ${messageId}, skipping`);
+          } else {
+            console.error('[BAILEYS][DB] ❌ Unexpected error inserting chat message', {
+              messageId,
+              agentId,
+              error: error.message,
+            });
+          }
         }
 
         // Extract sender name from message (pushName, verifiedBisName, or notify)
@@ -3753,10 +3563,7 @@ async function disconnectWhatsApp(agentId) {
       // STEP 2: Stop health check, heartbeat, connection monitor, and backup intervals
       console.log(`[BAILEYS] 🛑 Step 2: Stopping all intervals...`);
       try {
-        if (session.healthCheckInterval) {
-          clearInterval(session.healthCheckInterval);
-          session.healthCheckInterval = null;
-        }
+        // REMOVED: healthCheckInterval - no longer used
         if (session.heartbeatInterval) {
           clearInterval(session.heartbeatInterval);
           session.heartbeatInterval = null;
@@ -4051,9 +3858,7 @@ async function getWhatsAppStatus(agentId) {
     if (session) {
       response.source = 'memory';
       response.socket_state = session.socket?.ws?.readyState ?? null;
-      response.last_activity = session.lastActivity
-        ? new Date(session.lastActivity).toISOString()
-        : nowIso;
+      // REMOVED: last_activity tracking - we can't reliably track it
       response.phone_number =
         session.phoneNumber ||
         session.socket?.user?.id?.split(':')[0]?.replace('@s.whatsapp.net', '') ||

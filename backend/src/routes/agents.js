@@ -1,7 +1,10 @@
 const express = require('express');
+const multer = require('multer');
+const pino = require('pino');
 const { authMiddleware } = require('../middleware/auth');
 const pool = require('../database'); // DEPRECATED: Use supabase SDK directly for new code
 const { supabase } = require('../database'); // Direct Supabase SDK access
+const { supabaseAdmin } = require('../config/supabase');
 const { randomUUID } = require('crypto');
 const { validate, validateUUID } = require('../validators/middleware');
 const { createAgentSchema, updateAgentSchema, sendMessageSchema } = require('../validators/agent');
@@ -85,6 +88,196 @@ router.get('/', authMiddleware, async (req, res) => {
     res.json(result.rows);
   } catch (error) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Agent Avatar Management (MUST BE BEFORE /:id route to avoid conflicts)
+const AGENT_AVATAR_BUCKET = 'agent_avator';
+const MAX_FILE_BYTES = 5 * 1024 * 1024;
+const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/jpg'];
+
+let agentAvatarBucketChecked = false;
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_BYTES },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+      return cb(null, true);
+    }
+    return cb(new Error('Unsupported file type. Please upload jpg, jpeg, png, gif, or webp images.'));
+  },
+});
+
+async function ensureAgentAvatarBucket() {
+  if (agentAvatarBucketChecked) {
+    return;
+  }
+
+  try {
+    const { data, error } = await supabaseAdmin.storage.getBucket(AGENT_AVATAR_BUCKET);
+    if (!error && data) {
+      agentAvatarBucketChecked = true;
+      return;
+    }
+  } catch (error) {
+    console.warn('[AGENT AVATAR] Bucket lookup failed, attempting creation');
+  }
+
+  try {
+    const { error: createError } = await supabaseAdmin.storage.createBucket(AGENT_AVATAR_BUCKET, {
+      public: true,
+    });
+
+    if (createError && !createError.message?.toLowerCase().includes('already exists')) {
+      console.error('[AGENT AVATAR] Failed to create agent_avator bucket');
+      throw createError;
+    }
+    agentAvatarBucketChecked = true;
+  } catch (error) {
+    console.error('[AGENT AVATAR] Unable to ensure agent avatar bucket');
+    throw error;
+  }
+}
+
+function buildAgentAvatarFileName(agentId, originalName, mimetype) {
+  const timestamp = Date.now();
+  const extension =
+    originalName?.split('.').pop()?.toLowerCase() ||
+    mimetype?.split('/').pop() ||
+    'jpg';
+  // Use format: {agent_id}_avatar_{timestamp}.{extension}
+  return `${agentId}_avatar_${timestamp}.${extension}`;
+}
+
+function extractAgentAvatarStoragePath(url) {
+  if (!url) return null;
+  const marker = `${AGENT_AVATAR_BUCKET}/`;
+  const index = url.indexOf(marker);
+  if (index === -1) return null;
+  return url.substring(index + marker.length);
+}
+
+// POST /api/agents/:agentId/avatar - Upload agent avatar (MUST BE BEFORE /:id)
+router.post('/:agentId/avatar', authMiddleware, validateUUID('agentId'), upload.single('avatar'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No avatar file uploaded' });
+    }
+
+    const { agentId } = req.params;
+    const userId = req.user.id;
+
+    // Verify agent ownership
+    const agentResult = await pool.query(
+      'SELECT id, avatar_url FROM agents WHERE id = $1 AND user_id = $2',
+      [agentId, userId]
+    );
+
+    if (agentResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    const agent = agentResult.rows[0];
+
+    await ensureAgentAvatarBucket();
+
+    const filename = buildAgentAvatarFileName(agentId, req.file.originalname, req.file.mimetype);
+
+    const { error: uploadError } = await supabaseAdmin.storage
+      .from(AGENT_AVATAR_BUCKET)
+      .upload(filename, req.file.buffer, {
+        cacheControl: '3600',
+        upsert: true,
+        contentType: req.file.mimetype,
+      });
+
+    if (uploadError) {
+      console.error('[AGENT AVATAR] ❌ Failed to upload avatar:', uploadError.message);
+      return res.status(500).json({ error: 'Failed to upload avatar' });
+    }
+
+    const { data: publicData } = supabaseAdmin.storage.from(AGENT_AVATAR_BUCKET).getPublicUrl(filename);
+    const avatarUrl = publicData?.publicUrl || null;
+
+    if (!avatarUrl) {
+      return res.status(500).json({ error: 'Failed to generate avatar URL' });
+    }
+
+    // Delete old avatar if exists
+    if (agent.avatar_url) {
+      const oldPath = extractAgentAvatarStoragePath(agent.avatar_url);
+      if (oldPath) {
+        await supabaseAdmin.storage.from(AGENT_AVATAR_BUCKET).remove([oldPath]);
+      }
+    }
+
+    // Update agent with new avatar URL - use Supabase to ensure consistency
+    const { data: updatedAgent, error: updateError } = await supabaseAdmin
+      .from('agents')
+      .update({ avatar_url: avatarUrl, updated_at: new Date().toISOString() })
+      .eq('id', agentId)
+      .eq('user_id', userId)
+      .select()
+      .single();
+
+    if (updateError || !updatedAgent) {
+      console.error('[AGENT AVATAR] ❌ Failed to update agent:', updateError);
+      return res.status(500).json({ error: 'Failed to update agent' });
+    }
+
+    console.log(`✅ Agent avatar uploaded for agent ${agentId}`);
+    res.json({ avatar_url: avatarUrl, agent: updatedAgent });
+  } catch (error) {
+    console.error('[AGENT AVATAR] ❌ Failed to upload avatar:', error.message);
+    const status = error.message?.includes('Unsupported file type') ? 400 : 500;
+    res.status(status).json({ error: error.message || 'Failed to upload avatar' });
+  }
+});
+
+// DELETE /api/agents/:agentId/avatar - Delete agent avatar (MUST BE BEFORE /:id)
+router.delete('/:agentId/avatar', authMiddleware, validateUUID('agentId'), async (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const userId = req.user.id;
+
+    // Verify agent ownership and get avatar URL
+    const { data: agent, error: agentError } = await supabaseAdmin
+      .from('agents')
+      .select('id, avatar_url')
+      .eq('id', agentId)
+      .eq('user_id', userId)
+      .single();
+
+    if (agentError || !agent) {
+      return res.status(404).json({ error: 'Agent not found' });
+    }
+
+    // Delete avatar from storage if exists
+    if (agent.avatar_url) {
+      const path = extractAgentAvatarStoragePath(agent.avatar_url);
+      if (path) {
+        await supabaseAdmin.storage.from(AGENT_AVATAR_BUCKET).remove([path]);
+      }
+    }
+
+    // Update agent to remove avatar URL
+    const { error: updateError } = await supabaseAdmin
+      .from('agents')
+      .update({ avatar_url: null, updated_at: new Date().toISOString() })
+      .eq('id', agentId)
+      .eq('user_id', userId);
+
+    if (updateError) {
+      console.error('[AGENT AVATAR] ❌ Failed to delete avatar:', updateError);
+      return res.status(500).json({ error: 'Failed to delete avatar' });
+    }
+
+    console.log(`✅ Agent avatar deleted for agent ${agentId}`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[AGENT AVATAR] ❌ Failed to delete avatar:', error.message);
+    res.status(500).json({ error: 'Failed to delete avatar' });
   }
 });
 
@@ -362,7 +555,7 @@ router.put('/:id', authMiddleware, validateUUID('id'), (req, res, next) => {
     });
     
     const {
-      name, description, systemPrompt, webhookUrl,
+      name, agent_name, persona, avatar_url, description, systemPrompt, webhookUrl,
       enableChatHistory, erpCrsData, featureToggles,
       integrationEndpoints, isActive,
       ownerName, ownerPhone, timezone, webhookEnabled,
@@ -371,7 +564,7 @@ router.put('/:id', authMiddleware, validateUUID('id'), (req, res, next) => {
     // Verify agent belongs to user
     const { data: existingAgent, error: fetchError } = await supabase
       .from('agents')
-      .select('id, user_id')
+      .select('id, user_id, agent_name, persona, avatar_url')
       .eq('id', agentId)
       .eq('user_id', userId)
       .single();
@@ -385,7 +578,35 @@ router.put('/:id', authMiddleware, validateUUID('id'), (req, res, next) => {
 
     // Prepare update object (only include provided fields)
     const updateData = {};
-    if (name !== undefined) updateData.agent_name = name;
+    
+    // Handle agent_name - support both 'name' and 'agent_name' for backward compatibility
+    if (agent_name !== undefined) {
+      const trimmedName = String(agent_name).trim();
+      if (trimmedName === '') {
+        return res.status(400).json({ error: 'Agent name cannot be empty' });
+      }
+      updateData.agent_name = trimmedName;
+      console.log('[UPDATE-AGENT] Will update agent_name to:', trimmedName);
+    } else if (name !== undefined) {
+      const trimmedName = String(name).trim();
+      if (trimmedName === '') {
+        return res.status(400).json({ error: 'Agent name cannot be empty' });
+      }
+      updateData.agent_name = trimmedName;
+      console.log('[UPDATE-AGENT] Will update agent_name (from name field) to:', trimmedName);
+    }
+    
+    // Handle persona
+    if (persona !== undefined) {
+      updateData.persona = persona !== null && persona !== '' ? String(persona).trim() : null;
+      console.log('[UPDATE-AGENT] Will update persona to:', updateData.persona);
+    }
+    
+    // Handle avatar_url
+    if (avatar_url !== undefined) {
+      updateData.avatar_url = avatar_url !== null && avatar_url !== '' ? String(avatar_url).trim() : null;
+      console.log('[UPDATE-AGENT] Will update avatar_url');
+    }
     if (description !== undefined) updateData.description = description;
     if (systemPrompt !== undefined) updateData.initial_prompt = systemPrompt; // Use initial_prompt (actual column name)
     if (webhookUrl !== undefined) updateData.webhook_url = webhookUrl || null;
@@ -936,5 +1157,8 @@ router.get('/:agentId/disconnect-whatsapp', authMiddleware, async (req, res) => 
     res.status(500).json({ error: err.message });
   }
 });
+
+// NOTE: The PUT /:id route above now handles agent_name, persona, and avatar_url
+// All agent updates (including profile updates) go through the main PUT /:id route
 
 module.exports = router;
