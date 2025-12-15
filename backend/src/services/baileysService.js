@@ -639,7 +639,7 @@ function startConnectionMonitor(agentId, sock, session, userId) {
   
   // Simple monitor - only check if we're receiving connection.update events
   const monitor = setInterval(() => {
-    const currentSession = activeSessions.get(agentId);
+      const currentSession = activeSessions.get(agentId);
     
     // Stop if session removed or in conflict
     if (!currentSession || currentSession.connectionState === 'conflict') {
@@ -657,8 +657,8 @@ function startConnectionMonitor(agentId, sock, session, userId) {
       console.error(`[BAILEYS] ❌ No connection events for 5 minutes - connection may be dead`);
       console.log(`[BAILEYS] 🔄 Triggering reconnection...`);
       
-      clearInterval(monitor);
-      
+        clearInterval(monitor);
+        
       // Graceful reconnect
       setTimeout(async () => {
         try {
@@ -2127,18 +2127,18 @@ async function initializeWhatsApp(agentId, userId = null) {
           if (session?.heartbeatInterval) clearInterval(session.heartbeatInterval);
           
           // Clean up socket
-          if (session?.socket) {
-            try {
-              session.socket.ev.removeAllListeners();
-              session.socket.end();
-            } catch (err) {
-              console.log('[BAILEYS] Socket cleanup:', err.message);
+            if (session?.socket) {
+              try {
+                session.socket.ev.removeAllListeners();
+                session.socket.end();
+              } catch (err) {
+                console.log('[BAILEYS] Socket cleanup:', err.message);
+              }
             }
-          }
-          
+            
           // Remove from memory
-          activeSessions.delete(agentId);
-          
+                activeSessions.delete(agentId);
+                
           // Calculate backoff (max 30 seconds)
           const reconnectAttempt = session?.reconnectAttempts || 0;
           const backoffDelay = Math.min(3000 * Math.pow(1.5, reconnectAttempt), 30000);
@@ -3260,11 +3260,11 @@ async function initializeWhatsApp(agentId, userId = null) {
             if (insertError.code === '23505' || insertError.message?.includes('duplicate key') || insertError.message?.includes('unique constraint')) {
               console.log(`[BAILEYS][DB] ⚠️ Duplicate message detected (database constraint): ${messageId}, skipping`);
             } else {
-              console.error('[BAILEYS][DB] ❌ Failed to insert chat message', {
-                messageId,
-                agentId,
-                insertError,
-              });
+            console.error('[BAILEYS][DB] ❌ Failed to insert chat message', {
+              messageId,
+              agentId,
+              insertError,
+            });
             }
           } else {
             console.log(`[BAILEYS][DB] ✅ Message saved: ${messageId} (${messageType})`);
@@ -3274,11 +3274,11 @@ async function initializeWhatsApp(agentId, userId = null) {
           if (error.code === '23505' || error.message?.includes('duplicate key') || error.message?.includes('unique constraint')) {
             console.log(`[BAILEYS][DB] ⚠️ Duplicate message detected (catch block): ${messageId}, skipping`);
           } else {
-            console.error('[BAILEYS][DB] ❌ Unexpected error inserting chat message', {
-              messageId,
-              agentId,
-              error: error.message,
-            });
+          console.error('[BAILEYS][DB] ❌ Unexpected error inserting chat message', {
+            messageId,
+            agentId,
+            error: error.message,
+          });
           }
         }
 
