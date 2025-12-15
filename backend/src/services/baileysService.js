@@ -29,7 +29,7 @@ const DEFAULT_AUDIO_BUCKET = 'agent-audio-messages';
 const FALLBACK_AUDIO_BUCKET = process.env.AUDIO_FALLBACK_BUCKET || 'agent-files';
 let audioBucketName = process.env.AUDIO_BUCKET || DEFAULT_AUDIO_BUCKET;
 const DEFAULT_AUDIO_SIGNED_URL_TTL = 60 * 60 * 24 * 7; // 7 days
-let audioBucketChecked = false;image.png
+let audioBucketChecked = false;
 const QR_EXPIRY_MS = 3 * 60 * 1000; // 3 minutes - WhatsApp QR code validity
 
 // SECURITY: Generate unique instance ID for multi-instance prevention
