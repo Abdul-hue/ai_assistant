@@ -10,13 +10,16 @@ const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3001;
 
-// Initialize Socket.IO
+// Initialize Socket.IO with improved configuration
 const io = new Server(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+    origin: process.env.FRONTEND_URL || ['http://localhost:3000', 'http://localhost:5173'],
     methods: ['GET', 'POST'],
     credentials: true,
   },
+  transports: ['websocket', 'polling'], // Support both for reliability
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 // Make io available globally
@@ -681,29 +684,66 @@ process.on('unhandledRejection', (reason, promise) => {
 // Initialize existing WhatsApp sessions on startup
 const { initializeExistingSessions } = require('./src/services/baileysService');
 
-// Start the server
-// Socket.IO connection handling
-io.on('connection', (socket) => {
-  // Extract User ID from query parameter or handshake
-  const userId = socket.handshake.query.userId || socket.handshake.headers['user-id'];
-  
-  console.log(`\n👤 User connected: ${socket.id}`);
-  console.log(`   User ID: ${userId || 'NOT PROVIDED'}`);
+// Socket.IO authentication middleware
+// Note: supabaseAdmin is already imported at line 351
+io.use(async (socket, next) => {
+  const userId = socket.handshake.query.userId;
   
   if (!userId) {
-    console.error('   ❌ No User ID provided');
-    socket.emit('error', {
-      message: 'User ID required',
-      details: 'Please provide a User ID to connect',
-    });
-    socket.disconnect(true);
-    return;
+    console.error('[WebSocket] Connection rejected: No userId provided');
+    return next(new Error('Authentication error: userId required'));
   }
+  
+  // ✅ FIX: Validate userId exists in database or auth_users
+  try {
+    const { data: user, error } = await supabaseAdmin
+      .from('users')
+      .select('id')
+      .eq('id', userId)
+      .single();
+    
+    if (error || !user) {
+      // ✅ FIX: Check if this is an auth_users ID (Supabase auth)
+      try {
+        const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.getUserById(userId);
+        
+        if (authError || !authUser) {
+          console.error(`[WebSocket] ❌ Invalid userId: ${userId}`);
+          return next(new Error('Authentication failed: Invalid userId'));
+        }
+        
+        // Auth user exists but not in users table - this is okay
+        console.log(`[WebSocket] ✅ Auth user ${userId} connected (not in users table yet)`);
+      } catch (authCheckError) {
+        console.error(`[WebSocket] ❌ Invalid userId: ${userId}`, authCheckError.message);
+        return next(new Error('Authentication failed: Invalid userId'));
+      }
+    }
+    
+    socket.userId = userId;
+    socket.join(userId); // Join room for this user
+    console.log(`[WebSocket] ✅ User ${userId} authenticated and joined room`);
+    next();
+  } catch (error) {
+    console.error('[WebSocket] Authentication error:', error);
+    next(new Error('Authentication failed'));
+  }
+});
 
-  // User joins their room
+// Socket.IO connection handling
+io.on('connection', (socket) => {
+  console.log(`[WebSocket] User ${socket.userId} connected (socket: ${socket.id})`);
+  
+  // Send connection confirmation
+  socket.emit('connected', { 
+    userId: socket.userId, 
+    timestamp: new Date().toISOString() 
+  });
+  
+  // User joins their room (already done in middleware, but keep for compatibility)
   socket.on('join_user', (data) => {
-    const requestUserId = data?.userId || userId;
-    console.log(`👥 User ${requestUserId} joined room`);
+    const requestUserId = data?.userId || socket.userId;
+    console.log(`[WebSocket] User ${requestUserId} joined room`);
     socket.join(requestUserId);
   });
 
@@ -1005,12 +1045,14 @@ io.on('connection', (socket) => {
   });
   */
 
-  socket.on('disconnect', () => {
-    console.log(`\n👋 User disconnected: ${socket.id} (${userId || 'unknown'})`);
+  // Handle disconnection
+  socket.on('disconnect', (reason) => {
+    console.log(`[WebSocket] User ${socket.userId} disconnected (reason: ${reason})`);
   });
 
+  // Handle errors
   socket.on('error', (error) => {
-    console.error(`❌ Socket error for ${userId}:`, error);
+    console.error(`[WebSocket] Socket error for user ${socket.userId}:`, error);
   });
 });
 
@@ -1069,6 +1111,10 @@ server.listen(PORT, '0.0.0.0', async () => {
   idleManager = new ImapIdleManager(wsManager);
   console.log('🔄 ✅ IDLE Manager initialized');
   
+  // Start email sync cron job (runs every 5 minutes)
+  const { startEmailSyncCron } = require('./src/jobs/emailSyncCron');
+  startEmailSyncCron();
+  
   // Update exports so other modules can access managers
   module.exports.idleManager = idleManager;
   module.exports.wsManager = wsManager;
@@ -1100,10 +1146,10 @@ server.listen(PORT, '0.0.0.0', async () => {
             return false;
           }
           
-          // Skip if needs reconnection
+          // ✅ FIX: Don't skip accounts with needs_reconnection
+          // IDLE will attempt to start and clear the flag on success
           if (account.needs_reconnection) {
-            console.log(`[IDLE] ⏭️  Skipping ${account.email || account.id} - needs reconnection`);
-            return false;
+            console.log(`[IDLE] ⚠️  Account ${account.email || account.id} marked as needs_reconnection, but will attempt IDLE to clear flag`);
           }
           
           return true;
@@ -1128,64 +1174,22 @@ server.listen(PORT, '0.0.0.0', async () => {
     }
   }, 5000);
 
-  // Gmail scheduled jobs removed - using IMAP/SMTP only
+  // ✅ FIX: Removed duplicate sync jobs to prevent Gmail rate limiting
+  // Only keeping:
+  // 1. CRON job (every 5 minutes) - backup sync
+  // 2. IDLE monitoring (real-time) - primary sync method
+  // 
+  // REMOVED:
+  // - Initial email check (setTimeout)
+  // - Background sync (setInterval every 10 min)
+  // - Incremental sync (setInterval every 10 min)
+  // - Unread email check (setInterval every 15 min)
   
-  // Run immediately after 10 seconds (give server time to fully start)
-  setTimeout(async () => {
-    console.log('📧 Starting initial email check (IMAP/SMTP - will save new emails instantly to Supabase)...');
-    try {
-      // Check IMAP/SMTP accounts (enhanced UID-based sync)
-      await syncAllImapAccounts();
-      console.log('✅ Initial IMAP email check completed');
-    } catch (error) {
-      console.error('❌ Error in initial IMAP email check:', error.message);
-    }
-  }, 10000);
-
-  // IMAP/SMTP check - every 10 minutes (600,000 ms) - faster than Gmail
-  const EMAIL_CHECK_INTERVAL = 10 * 60 * 1000; // 10 minutes
-  const emailCheckInterval = setInterval(async () => {
-    try {
-      console.log('\n🔄 Running scheduled email check (every 10 minutes)...');
-      console.log('   📧 Checking for new emails and saving instantly to Supabase...');
-      // Check IMAP/SMTP accounts (enhanced UID-based sync)
-      await syncAllImapAccounts();
-      console.log('✅ Scheduled email check completed');
-    } catch (error) {
-      console.error('❌ Error in scheduled email check:', error.message);
-      console.error('   Stack:', error.stack);
-    }
-  }, EMAIL_CHECK_INTERVAL);
-
-  // Store interval ID for graceful shutdown
-  process.emailCheckInterval = emailCheckInterval;
-
-  console.log(`📧 ✅ Scheduled email check configured: IMAP/SMTP (every 10 minutes)`);
+  console.log(`📧 ✅ Email sync configured:`);
+  console.log(`   🔄 CRON job: Every 5 minutes (backup)`);
+  console.log(`   🔄 IDLE monitoring: Real-time (primary)`);
   console.log(`   📝 New emails will be saved INSTANTLY to Supabase`);
   console.log(`   📡 New emails will be pushed to frontend via WebSocket`);
-  console.log(`   🔄 IDLE monitoring enabled for real-time updates`);
-
-  // Start scheduled new unread email fetch job (every 15 minutes)
-  const NEW_MAIL_CHECK_INTERVAL = 15 * 60 * 1000; // 15 minutes
-  const newMailCheckInterval = setInterval(async () => {
-    try {
-      console.log('\n📬 [SCHEDULED] Starting new unread email check...');
-      const result = await fetchNewUnreadEmailsForAllAccounts();
-      if (result.success) {
-        console.log(`📬 [SCHEDULED] Check completed: ${result.emailsFound} new emails found, ${result.accountsProcessed} accounts processed`);
-      } else {
-        console.error(`📬 [SCHEDULED] Check failed:`, result.error);
-      }
-    } catch (error) {
-      console.error('❌ Error in scheduled new unread email check:', error.message);
-    }
-  }, NEW_MAIL_CHECK_INTERVAL);
-
-  // Store interval ID for graceful shutdown
-  process.newMailCheckInterval = newMailCheckInterval;
-
-  console.log(`📬 ✅ Scheduled new unread email check configured: Every 15 minutes`);
-  console.log(`   🔔 New unseen emails will be saved to Supabase and sent to webhook automatically`);
 });
 
 // Graceful shutdown
@@ -1216,13 +1220,8 @@ process.on('SIGTERM', async () => {
 process.on('SIGINT', async () => {
   console.log('📴 SIGINT received, shutting down gracefully...');
   
-  // Clear intervals
-  if (process.emailCheckInterval) {
-    clearInterval(process.emailCheckInterval);
-  }
-  if (process.newMailCheckInterval) {
-    clearInterval(process.newMailCheckInterval);
-  }
+  // Clear intervals (removed duplicate sync intervals)
+  // Only CRON and IDLE remain active
   
   // Stop all IDLE monitoring
   if (idleManager) {

@@ -11,8 +11,9 @@ class ImapConnectionPool {
     this.connectionTimestamps = new Map();
     // Map: accountId -> pending connection requests
     this.pendingRequests = new Map();
-    // Max connections per account
-    this.maxConnectionsPerAccount = 5;
+    // ✅ FIX: Limit to 3 connections per account to prevent Gmail rate limiting
+    // 1 for IDLE, 2 for sync operations
+    this.maxConnectionsPerAccount = 3;
     // Connection timeout (30 minutes)
     this.connectionTimeout = 30 * 60 * 1000;
   }
@@ -37,25 +38,48 @@ class ImapConnectionPool {
         // Move to end (LRU)
         accountConnections.shift();
         accountConnections.push(connection);
+        console.log(`[POOL] Reusing existing connection for account ${accountId} (state: ${connection.imap?.state || 'unknown'})`);
         return connection;
       } else {
         // Remove dead connection
+        console.log(`[POOL] Removing dead connection for account ${accountId} (state: ${connection.imap?.state || 'unknown'})`);
         this.removeConnection(accountId, connection);
       }
     }
 
     // If we're at max connections, wait for one to become available
     if (accountConnections.length >= this.maxConnectionsPerAccount) {
+      console.log(`[POOL] Max connections reached for ${accountId}, waiting for available connection...`);
       return await this.waitForAvailableConnection(accountId, createConnection);
     }
 
     // Create new connection
     try {
+      console.log(`[POOL] Creating new connection for account ${accountId}...`);
       const connection = await createConnection();
+      
+      // ✅ FIX: Verify connection is authenticated before adding to pool
+      if (connection && connection.imap) {
+        const state = connection.imap.state;
+        if (state !== 'authenticated') {
+          console.error(`[POOL] ❌ New connection not authenticated (state: ${state}), closing...`);
+          try {
+            if (typeof connection.end === 'function') {
+              connection.end();
+            }
+          } catch (e) {
+            // Ignore cleanup errors
+          }
+          throw new Error(`Connection not authenticated after creation (state: ${state})`);
+        }
+        console.log(`[POOL] ✅ New connection authenticated (state: ${state})`);
+      }
+      
       this.addConnection(accountId, connection);
       return connection;
     } catch (error) {
-      console.error(`[POOL] Error creating connection for account ${accountId}:`, error.message);
+      console.error(`[POOL] ❌ Error creating connection for account ${accountId}:`, error.message);
+      console.error(`[POOL] Stack:`, error.stack);
       throw error;
     }
   }
@@ -117,8 +141,49 @@ class ImapConnectionPool {
     if (connection.state === 'logout' || connection.state === 'disconnected') {
       return false;
     }
+    
+    // CRITICAL: Check IMAP authentication state
+    if (connection.imap) {
+      const state = connection.imap.state;
+      if (state !== 'authenticated') {
+        console.log(`[POOL] Connection not authenticated (state: ${state})`);
+        return false;
+      }
+    }
 
     return true;
+  }
+  
+  /**
+   * Check if connection is healthy and authenticated (async health check)
+   * @param {Object} connection - IMAP connection
+   * @returns {Promise<boolean>} - True if healthy
+   */
+  async isConnectionHealthy(connection) {
+    if (!this.isConnectionAlive(connection)) {
+      return false;
+    }
+    
+    try {
+      // Try a lightweight operation to verify authentication
+      if (connection && connection.getBoxes) {
+        await connection.getBoxes();
+        return true;
+      }
+      return false;
+    } catch (error) {
+      // Check for authentication errors
+      if (error.message?.includes('Not authenticated') || 
+          error.message?.includes('not authenticated') ||
+          error.message?.includes('authentication') ||
+          error.code === 'EAUTH') {
+        console.log(`[POOL] Connection authentication check failed: ${error.message}`);
+        return false;
+      }
+      // Other errors might be transient, but we'll be conservative
+      console.warn(`[POOL] Connection health check warning: ${error.message}`);
+      return false;
+    }
   }
 
   /**

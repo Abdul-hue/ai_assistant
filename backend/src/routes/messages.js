@@ -12,6 +12,7 @@ const router = express.Router();
 const { supabaseAdmin } = require('../config/supabase');
 const { authMiddleware } = require('../middleware/auth');
 const { sendMessage } = require('../services/baileysService');
+const webhookService = require('../services/webhookService');
 
 /**
  * GET /api/agents/chat-list
@@ -72,7 +73,11 @@ router.get('/chat-list', authMiddleware, async (req, res) => {
               agent_id: lastMessageData.agent_id,
               user_id: lastMessageData.user_id,
               message: lastMessageData.message || lastMessageData.message_text || '',
-              sender_type: lastMessageData.sender_type || (lastMessageData.sender_phone ? 'contact' : 'agent'),
+              // ✅ FIX: Respect sender_type from database (don't override if explicitly set)
+              // Only use fallback if sender_type is null/undefined
+              sender_type: lastMessageData.sender_type !== null && lastMessageData.sender_type !== undefined
+                ? lastMessageData.sender_type
+                : (lastMessageData.sender_phone ? 'contact' : 'agent'),
               is_from_me: lastMessageData.is_from_me !== undefined ? lastMessageData.is_from_me : false,
               timestamp: lastMessageData.timestamp || lastMessageData.received_at || lastMessageData.created_at,
               status: lastMessageData.status || 'delivered',
@@ -80,6 +85,8 @@ router.get('/chat-list', authMiddleware, async (req, res) => {
               whatsapp_message_id: lastMessageData.whatsapp_message_id || lastMessageData.message_id,
               contact_id: lastMessageData.contact_id || null,
               read_at: lastMessageData.read_at || null,
+              // ✅ NEW: Include source field for button parsing
+              source: lastMessageData.source || null,
             };
           }
 
@@ -193,14 +200,19 @@ router.get('/:agentId/messages', authMiddleware, async (req, res) => {
         agent_id: msg.agent_id,
         user_id: msg.user_id,
         contact_id: msg.contact_id || null,
-        message: msg.message || msg.message_text || '',
-        sender_type: msg.sender_type || (msg.sender_phone ? 'contact' : 'agent'),
+        message: msg.message_text || msg.message || '',
+        // ✅ FIX: Respect sender_type from database (don't override if explicitly set)
+        sender_type: msg.sender_type !== null && msg.sender_type !== undefined
+          ? msg.sender_type
+          : (msg.sender_phone ? 'contact' : 'agent'),
         is_from_me: msg.is_from_me !== undefined ? msg.is_from_me : false,
         timestamp: msg.timestamp || msg.received_at || msg.created_at,
         status: msg.status || 'delivered',
         message_type: msg.message_type || 'text',
         whatsapp_message_id: msg.whatsapp_message_id || msg.message_id || null,
         read_at: msg.read_at || null,
+        // ✅ FIX: Respect source from database (don't default to 'whatsapp' if it's 'dashboard')
+        source: msg.source || null, // Include source field, don't override
       };
     });
 
@@ -301,7 +313,8 @@ router.post('/:agentId/messages', authMiddleware, async (req, res) => {
       return phone.replace(/[+\s-]/g, '');
     };
 
-    const agentPhoneNumber = sanitizePhone(agent.whatsapp_phone_number); // Agent's WhatsApp number (TO)
+        const agentPhoneNumber = sanitizePhone(agent.whatsapp_phone_number); // Agent's WhatsApp number (TO)
+        const sanitizedAgentPhone = agentPhoneNumber; // Keep for webhook
 
     // Send message directly to agent's WhatsApp number using the agent's own session
     let whatsappMessageId = null;
@@ -358,6 +371,7 @@ router.post('/:agentId/messages', authMiddleware, async (req, res) => {
       received_at: now,
       created_at: now,
       message_type: 'text',
+      source: 'dashboard', // CRITICAL: Mark as dashboard origin
     };
     
     // Check for duplicate message before inserting
@@ -447,6 +461,7 @@ router.post('/:agentId/messages', authMiddleware, async (req, res) => {
         status: 'sent', // New column (may not exist yet)
         whatsapp_message_id: whatsappMessageId || userMessageId, // New column (may not exist yet)
         ...(contact_id && { contact_id }), // New column (may not exist yet)
+        source: 'dashboard', // CRITICAL: Mark as dashboard origin
       })
       .select()
       .single();
@@ -505,6 +520,52 @@ router.post('/:agentId/messages', authMiddleware, async (req, res) => {
       
       console.error('[MESSAGES] Error inserting user message:', insertError);
       throw insertError;
+    }
+
+    // CRITICAL: Send webhook for dashboard message
+    // This allows the webhook receiver to process dashboard messages separately from WhatsApp messages
+    try {
+      const webhookUrl = process.env.WHATSAPP_MESSAGE_WEBHOOK_PROD || 
+                        process.env.WHATSAPP_MESSAGE_WEBHOOK || 
+                        process.env.WHATSAPP_MESSAGE_WEBHOOK_TEST;
+      
+      if (webhookUrl) {
+        // Get agent's phone number for 'to' field
+        const agentPhoneForWebhook = sanitizedAgentPhone || agent.whatsapp_phone_number?.replace(/[+\s-]/g, '');
+        
+        const webhookPayload = {
+          source: 'dashboard',
+          messageId: userMessage.message_id || userMessage.id,
+          from: agentPhoneForWebhook, // Dashboard user sending to agent
+          to: agentPhoneForWebhook, // Agent's number (same in this case)
+          body: message.trim(),
+          timestamp: now,
+          isFromMe: true, // Dashboard messages are from the user (via agent's session)
+          agentId: agentId,
+          user_id: userId,
+          metadata: {
+            messageType: 'text',
+            conversationId: `${agentPhoneNumber}@s.whatsapp.net`,
+          }
+        };
+        
+        // Send webhook asynchronously (don't block response)
+        webhookService.sendWebhook(webhookUrl, webhookPayload).catch(error => {
+          console.error('[MESSAGES][WEBHOOK] Error sending dashboard message webhook:', error.message);
+          // Don't throw - webhook failures shouldn't block message sending
+        });
+        
+        console.log('[MESSAGES][WEBHOOK] ✅ Dashboard message webhook triggered:', {
+          messageId: webhookPayload.messageId,
+          source: 'dashboard',
+          agentId: agentId.substring(0, 8) + '...'
+        });
+      } else {
+        console.log('[MESSAGES][WEBHOOK] ⚠️ Webhook URL not configured, skipping webhook');
+      }
+    } catch (webhookError) {
+      console.error('[MESSAGES][WEBHOOK] Error preparing webhook:', webhookError.message);
+      // Don't throw - webhook failures shouldn't block message sending
     }
 
     // Note: Agent response will come through WhatsApp and be processed by Baileys

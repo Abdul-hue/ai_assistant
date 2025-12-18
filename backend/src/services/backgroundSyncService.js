@@ -34,10 +34,10 @@ async function syncNewEmailsOnly(accountId, folder = 'INBOX') {
       throw new Error(`Email account ${accountId} not found or inactive. Please reconnect your account.`);
     }
 
-    // ✅ CRITICAL: Skip sync if account needs reconnection (prevents endless retry loops)
+    // ✅ FIX: Attempt sync even if needs_reconnection is set
+    // This allows sync to clear the flag on success
     if (account.needs_reconnection) {
-      console.log(`[BACKGROUND SYNC] ⏭️  Skipping sync for ${accountId} (${account.email || 'unknown'}) - account needs reconnection`);
-      return 0; // No emails synced
+      console.log(`[BACKGROUND SYNC] ⚠️  Account ${accountId} (${account.email || 'unknown'}) marked as needs_reconnection, but attempting sync to clear flag`);
     }
 
     if (!account.imap_host || !account.imap_username) {
@@ -92,9 +92,64 @@ async function syncNewEmailsOnly(accountId, folder = 'INBOX') {
       }
     );
 
+    // ✅ FIX: Verify connection state before use
+    if (!connection || !connection.imap) {
+      console.error(`[BACKGROUND SYNC] ❌ Invalid connection object for ${accountId}`);
+      throw new Error('Invalid IMAP connection');
+    }
+
+    const connectionState = connection.imap.state;
+    console.log(`[BACKGROUND SYNC] Connection state: ${connectionState}`);
+    
+    if (connectionState !== 'authenticated') {
+      console.warn(`[BACKGROUND SYNC] ⚠️  Connection not authenticated (state: ${connectionState}), closing and creating new connection`);
+      try {
+        connectionPool.closeAccountConnections(accountId);
+      } catch (closeErr) {
+        console.warn(`[BACKGROUND SYNC] Error closing connections:`, closeErr.message);
+      }
+      
+      // Create fresh connection
+      connection = await connectionPool.getConnection(
+        accountId,
+        async () => {
+          return await retryWithBackoff(
+            async () => {
+              return await imaps.connect({
+                imap: {
+                  user: account.imap_username,
+                  password: password,
+                  host: account.imap_host,
+                  port: account.imap_port || 993,
+                  tls: account.use_ssl !== false,
+                  tlsOptions: { rejectUnauthorized: false },
+                  authTimeout: 10000,
+                }
+              });
+            },
+            {
+              maxRetries: 3,
+              baseDelay: 2000,
+              maxDelay: 30000,
+              operationName: `[BACKGROUND SYNC] Reconnecting to IMAP for ${account.email}`
+            }
+          );
+        }
+      );
+      
+      if (!connection || connection.imap?.state !== 'authenticated') {
+        throw new Error(`Failed to establish authenticated connection (state: ${connection?.imap?.state || 'unknown'})`);
+      }
+      console.log(`[BACKGROUND SYNC] ✅ New connection established and authenticated`);
+    }
+
     // Open mailbox with retry
+    console.log(`[BACKGROUND SYNC] Opening folder ${folder}...`);
     const box = await retryWithBackoff(
       async () => {
+        if (!connection || connection.imap?.state !== 'authenticated') {
+          throw new Error(`Connection lost before opening folder (state: ${connection?.imap?.state || 'unknown'})`);
+        }
         return await connection.openBox(folder);
       },
       {
@@ -105,42 +160,191 @@ async function syncNewEmailsOnly(accountId, folder = 'INBOX') {
       }
     );
 
-    // ✅ FIXED: imap-simple doesn't support UID ranges in search directly
-    // Strategy: Fetch ALL messages, then filter client-side by UID
-    // This is the same approach used in fetchNewMail.js
-    
-    console.log(`[BACKGROUND SYNC] Fetching messages from ${folder} (last synced UID: ${lastUID})`);
+    const totalMessages = box.messages?.total || 0;
+    console.log(`[BACKGROUND SYNC] ✅ Opened folder ${folder}, total messages: ${totalMessages}`);
 
-    const allMessages = await retryWithBackoff(
-      async () => {
-        return await connection.search(['ALL'], {
-          bodies: '',
-          struct: true,
-          markSeen: false
-        });
-      },
-      {
-        maxRetries: 5,
-        baseDelay: 3000,
-        maxDelay: 60000,
-        operationName: `[BACKGROUND SYNC] Searching messages in ${folder}`
+    // ✅ OPTIMIZED: Use UID-based incremental sync
+    // Strategy: Fetch only recent messages (last 500) instead of ALL to avoid timeouts
+    // Then filter by UID > lastUID for true incremental sync
+    
+    console.log(`[BACKGROUND SYNC] Fetching messages from ${folder} (last synced UID: ${lastUID}, total: ${totalMessages})`);
+
+    let allMessages = [];
+    
+    if (totalMessages === 0) {
+      console.log(`[BACKGROUND SYNC] Mailbox is empty, no messages to sync`);
+      allMessages = [];
+    } else if (lastUID > 0) {
+      // ✅ OPTIMIZED INCREMENTAL SYNC: Fetch only recent messages (last 100) to avoid timeouts
+      // For IDLE-triggered syncs, we only need the newest messages since IDLE tells us when new emails arrive
+      // This is much faster and prevents timeouts on large mailboxes
+      const fetchLimit = 100; // ✅ REDUCED: Fetch last 100 messages (was 500) to prevent timeouts
+      const startSeq = Math.max(1, totalMessages - fetchLimit + 1);
+      const endSeq = totalMessages;
+      
+      console.log(`[BACKGROUND SYNC] 📊 Fetching sequence ${startSeq}:${endSeq} (last ${fetchLimit} messages) for UID filtering`);
+      
+      allMessages = await retryWithBackoff(
+        async () => {
+          // ✅ FIX: Verify connection state before search
+          if (!connection || connection.imap?.state !== 'authenticated') {
+            throw new Error(`Connection lost before search (state: ${connection?.imap?.state || 'unknown'})`);
+          }
+          
+          console.log(`[BACKGROUND SYNC] Executing search on ${folder} (sequence ${startSeq}:${endSeq})...`);
+          
+          // Use sequence range search (more efficient than ALL)
+          // ✅ INCREASED TIMEOUT: 60 seconds for large mailboxes
+          const messages = await Promise.race([
+            connection.search([`${startSeq}:${endSeq}`], {
+              bodies: '',
+              struct: true,
+              markSeen: false
+            }),
+            // ✅ INCREASED TIMEOUT: 60 seconds instead of 30 to handle large mailboxes
+            new Promise((_, reject) => 
+              setTimeout(() => reject(new Error('Search timeout after 60 seconds')), 60000)
+            )
+          ]);
+          
+          console.log(`[BACKGROUND SYNC] Search completed, found ${messages?.length || 0} messages`);
+          return messages || [];
+        },
+        {
+          maxRetries: 2, // ✅ REDUCED: 2 retries instead of 3 to fail faster
+          baseDelay: 2000,
+          maxDelay: 30000,
+          operationName: `[BACKGROUND SYNC] Searching recent messages in ${folder}`
+        }
+      );
+      
+      // If we got fewer messages than expected, we might have missed some
+      // In that case, if lastUID is high, we should check if we need to fetch more
+      if (allMessages.length < fetchLimit && lastUID > 0) {
+        const maxUidInResults = Math.max(...allMessages.map(m => parseInt(m.attributes.uid) || 0), 0);
+        if (maxUidInResults <= lastUID && allMessages.length > 0) {
+          console.log(`[BACKGROUND SYNC] ⚠️  All fetched messages have UID <= ${lastUID}, but we only fetched last ${fetchLimit}. Fetching more...`);
+          // ✅ REDUCED: Fetch a smaller wider range (300 instead of 1000) to prevent timeouts
+          const widerLimit = 300;
+          const widerStartSeq = Math.max(1, totalMessages - widerLimit + 1);
+          const widerEndSeq = totalMessages;
+          console.log(`[BACKGROUND SYNC] 📊 Fetching wider range: sequence ${widerStartSeq}:${widerEndSeq}`);
+          
+          try {
+            const widerMessages = await Promise.race([
+              connection.search([`${widerStartSeq}:${widerEndSeq}`], {
+                bodies: '',
+                struct: true,
+                markSeen: false
+              }),
+              // ✅ INCREASED TIMEOUT: 90 seconds for wider range
+              new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Search timeout after 90 seconds')), 90000)
+              )
+            ]);
+            allMessages = widerMessages || [];
+            console.log(`[BACKGROUND SYNC] Wider search returned ${allMessages.length} messages`);
+          } catch (widerError) {
+            console.warn(`[BACKGROUND SYNC] Wider search failed: ${widerError.message}, using initial results`);
+          }
+        }
       }
-    );
+    } else {
+      // ✅ INITIAL SYNC: lastUID is 0, fetch only most recent messages (last 50)
+      console.log(`[BACKGROUND SYNC] 🎯 Initial sync (lastUID=0), fetching last 50 messages`);
+      const initialLimit = 50;
+      const startSeq = Math.max(1, totalMessages - initialLimit + 1);
+      const endSeq = totalMessages;
+      
+      allMessages = await retryWithBackoff(
+        async () => {
+          if (!connection || connection.imap?.state !== 'authenticated') {
+            throw new Error(`Connection lost before search (state: ${connection?.imap?.state || 'unknown'})`);
+          }
+          
+          console.log(`[BACKGROUND SYNC] Executing initial sync search (sequence ${startSeq}:${endSeq})...`);
+          const messages = await Promise.race([
+            connection.search([`${startSeq}:${endSeq}`], {
+              bodies: '',
+              struct: true,
+              markSeen: false
+            }),
+            new Promise((_, reject) => 
+              setTimeout(() => reject(new Error('Search timeout after 30 seconds')), 30000)
+            )
+          ]);
+          console.log(`[BACKGROUND SYNC] Initial search completed, found ${messages?.length || 0} messages`);
+          return messages || [];
+        },
+        {
+          maxRetries: 3,
+          baseDelay: 3000,
+          maxDelay: 60000,
+          operationName: `[BACKGROUND SYNC] Initial sync search in ${folder}`
+        }
+      );
+    }
 
     if (!allMessages || allMessages.length === 0) {
       console.log(`[BACKGROUND SYNC] No messages found in ${folder}`);
+      // Still update sync state timestamp even if no messages
+      await supabaseAdmin
+        .from('email_sync_state')
+        .upsert({
+          account_id: accountId,
+          folder_name: folder,
+          last_uid_synced: lastUID,
+          total_server_count: box.messages?.total || 0,
+          last_sync_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'account_id,folder_name'
+        });
       return 0;
     }
 
-    // ✅ Filter client-side to only get new emails (UID > lastUID)
-    const messages = lastUID > 0
-      ? allMessages.filter(msg => {
-          const uid = parseInt(msg.attributes.uid);
-          return uid > lastUID;
-        })
-      : allMessages;
+    console.log(`[BACKGROUND SYNC] ✅ Search returned ${allMessages.length} total messages from ${folder}`);
 
-    console.log(`[BACKGROUND SYNC] Found ${messages.length} new emails (out of ${allMessages.length} total) in ${folder}`);
+    // ✅ CRITICAL: Filter client-side to only get new emails (UID > lastUID)
+    // This is the core incremental sync logic
+    let messages = [];
+    
+    if (lastUID > 0 && allMessages.length > 0) {
+      // Filter by UID > lastUID
+      messages = allMessages.filter(msg => {
+        const uid = parseInt(msg.attributes.uid) || 0;
+        if (uid === 0) {
+          console.warn(`[BACKGROUND SYNC] ⚠️  Message missing UID, skipping`);
+          return false;
+        }
+        return uid > lastUID;
+      });
+      
+      console.log(`[BACKGROUND SYNC] 🔍 UID Filter: ${allMessages.length} total messages, ${messages.length} with UID > ${lastUID}`);
+      
+      // Log UID range for debugging
+      if (allMessages.length > 0) {
+        const allUids = allMessages.map(m => parseInt(m.attributes.uid) || 0).filter(uid => uid > 0).sort((a, b) => a - b);
+        if (allUids.length > 0) {
+          console.log(`[BACKGROUND SYNC] 📊 Fetched message UID range: ${allUids[0]} to ${allUids[allUids.length - 1]}`);
+        }
+      }
+    } else if (lastUID === 0) {
+      // Initial sync - take all fetched messages
+      messages = allMessages;
+      console.log(`[BACKGROUND SYNC] 🎯 Initial sync: using all ${messages.length} fetched messages`);
+    } else {
+      messages = [];
+    }
+
+    console.log(`[BACKGROUND SYNC] ✅ Found ${messages.length} new emails to sync (filtering by UID > ${lastUID})`);
+    
+    if (messages.length > 0) {
+      const uids = messages.map(m => parseInt(m.attributes.uid)).filter(uid => uid > 0).sort((a, b) => a - b);
+      if (uids.length > 0) {
+        console.log(`[BACKGROUND SYNC] 📧 New email UID range: ${uids[0]} to ${uids[uids.length - 1]} (${uids.length} emails)`);
+      }
+    }
     if (syncState?.last_sync_at) {
       const lastSyncTime = new Date(syncState.last_sync_at);
       const hoursSinceSync = (Date.now() - lastSyncTime.getTime()) / (1000 * 60 * 60);
@@ -150,11 +354,24 @@ async function syncNewEmailsOnly(accountId, folder = 'INBOX') {
     }
 
     if (messages.length === 0) {
-      console.log(`[BACKGROUND SYNC] No new emails found for ${accountId}/${folder}`);
+      console.log(`[BACKGROUND SYNC] No new emails found for ${accountId}/${folder} (last UID: ${lastUID}, total in mailbox: ${totalMessages})`);
+      // Still update sync state timestamp even if no new messages
+      await supabaseAdmin
+        .from('email_sync_state')
+        .upsert({
+          account_id: accountId,
+          folder_name: folder,
+          last_uid_synced: lastUID,
+          total_server_count: totalMessages,
+          last_sync_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }, {
+          onConflict: 'account_id,folder_name'
+        });
       return 0;
     }
 
-    console.log(`[BACKGROUND SYNC] Found ${messages.length} new emails for ${accountId}/${folder}`);
+    console.log(`[BACKGROUND SYNC] 📬 Processing ${messages.length} new emails for ${accountId}/${folder}`);
 
     // Parse and save emails
     let savedCount = 0;
@@ -289,14 +506,25 @@ async function syncNewEmailsOnly(accountId, folder = 'INBOX') {
       }
     }
 
-    // ✅ FIX: Update sync state with highest UID (even if no new messages, update timestamp)
-    // This ensures sync state is always current and background sync knows when last sync happened
-    const allUids = messages.length > 0 
-      ? messages.map(m => parseInt(m.attributes.uid))
+    // ✅ CRITICAL: Update sync state with highest UID from ALL fetched messages (not just new ones)
+    // This ensures we don't miss emails if they're in the fetched range but filtered out
+    // We need to track the highest UID we've seen, even if we didn't sync it
+    const allFetchedUids = allMessages.length > 0
+      ? allMessages.map(m => parseInt(m.attributes.uid) || 0).filter(uid => uid > 0)
       : [];
-    const maxUID = allUids.length > 0 
-      ? Math.max(...allUids)
-      : lastUID; // Keep existing UID if no new messages
+    const maxFetchedUID = allFetchedUids.length > 0 ? Math.max(...allFetchedUids) : lastUID;
+    
+    // For new messages, get the max UID
+    const newMessageUids = messages.length > 0
+      ? messages.map(m => parseInt(m.attributes.uid) || 0).filter(uid => uid > 0)
+      : [];
+    const maxNewUID = newMessageUids.length > 0 ? Math.max(...newMessageUids) : lastUID;
+    
+    // Use the maximum of: lastUID, maxFetchedUID, maxNewUID
+    // This ensures we always advance the UID pointer, even if we filtered out some messages
+    const maxUID = Math.max(lastUID, maxFetchedUID, maxNewUID);
+    
+    console.log(`[BACKGROUND SYNC] 📊 UID tracking: lastUID=${lastUID}, maxFetched=${maxFetchedUID}, maxNew=${maxNewUID}, final=${maxUID}`);
     
     await supabaseAdmin
       .from('email_sync_state')

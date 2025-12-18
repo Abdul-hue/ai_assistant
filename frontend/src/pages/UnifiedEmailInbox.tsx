@@ -58,6 +58,7 @@ const UnifiedEmailInbox = () => {
   const [emails, setEmails] = useState<ImapSmtpEmail[]>([]);
   const [selectedEmail, setSelectedEmail] = useState<ImapSmtpEmail | null>(null);
   const [loading, setLoading] = useState(true);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [composeOpen, setComposeOpen] = useState(false);
   const [folders, setFolders] = useState<ImapSmtpFolder[]>([]);
@@ -104,19 +105,32 @@ const UnifiedEmailInbox = () => {
 
     const wsUrl = API_URL.replace('http://', 'ws://').replace('https://', 'wss://');
     const newSocket = io(wsUrl, {
-      transports: ['websocket'],
-      withCredentials: true,
-      query: {
-        userId: user.id // ✅ Pass userId in query for backend handshake
-      }
+      query: { userId: user.id },
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      reconnectionAttempts: 5,
+      withCredentials: true
     });
 
     newSocket.on('connect', () => {
-      console.log('[WS] Connected with userId:', user.id);
+    });
+    
+    newSocket.on('connected', (data) => {
+      console.log('✅ WebSocket authenticated:', data);
       // Also register with WebSocketManager for comprehensive sync events
       newSocket.emit('register', { userId: user.id });
       // Join user room for targeted events
       newSocket.emit('join_user', { userId: user.id });
+    });
+    
+    newSocket.on('disconnect', (reason) => {
+      console.log('❌ WebSocket disconnected:', reason);
+    });
+    
+    newSocket.on('connect_error', (error) => {
+      console.error('❌ WebSocket connection error:', error.message);
     });
 
     // Listen for comprehensive sync events
@@ -182,6 +196,47 @@ const UnifiedEmailInbox = () => {
         });
       }
     });
+    
+    // Listen for new emails from IDLE
+    newSocket.on('new_emails', (data: { accountId: string; accountEmail: string; count: number; folder: string; timestamp: string }) => {
+      if (data.accountId === accountId && data.folder === currentFolder) {
+        console.log('📧 New emails received:', data);
+        loadImapEmails(); // Refresh current folder
+        toast({
+          title: "New Email",
+          description: `You have ${data.count} new email(s) in ${data.accountEmail}`,
+          duration: 3000,
+        });
+      }
+    });
+    
+    // Listen for sync completion
+    newSocket.on('sync_complete', (data: { accountId: string; folder: string; newEmailsCount: number; timestamp: string }) => {
+      if (data.accountId === accountId && data.folder === currentFolder) {
+        console.log('✅ Sync complete:', data);
+        loadImapEmails(); // Refresh current folder
+        if (data.newEmailsCount > 0) {
+          toast({
+            title: "Sync Complete",
+            description: `Synced ${data.newEmailsCount} new email(s)`,
+            duration: 3000,
+          });
+        }
+      }
+    });
+    
+    // Listen for sync errors
+    newSocket.on('sync_error', (data: { accountId: string; folder: string; error: string }) => {
+      if (data.accountId === accountId) {
+        console.error('❌ Sync error:', data);
+        toast({
+          variant: "destructive",
+          title: "Sync Error",
+          description: data.error,
+          duration: 5000,
+        });
+      }
+    });
 
     setSocket(newSocket);
 
@@ -190,6 +245,9 @@ const UnifiedEmailInbox = () => {
       newSocket.off('comprehensive_sync_progress');
       newSocket.off('comprehensive_sync_completed');
       newSocket.off('emails_synced');
+      newSocket.off('new_emails');
+      newSocket.off('sync_complete');
+      newSocket.off('sync_error');
       newSocket.disconnect();
     };
   }, [user?.id, accountId, currentFolder]);
@@ -235,6 +293,7 @@ const UnifiedEmailInbox = () => {
 
   // ✅ FIX: Manual sync - only triggered by user clicking "Sync from IMAP" button
   // This should NOT be called automatically on folder clicks
+  // NON-BLOCKING: Returns immediately and syncs in background
   const triggerInitialSync = async () => {
     if (!accountId) {
       toast({
@@ -245,8 +304,7 @@ const UnifiedEmailInbox = () => {
       return;
     }
     
-    setLoading(true);
-    setLoadingMessage('🔄 Syncing emails from IMAP...');
+    setIsSyncing(true);
     
     try {
       console.log('[UI] 🔄 Manual sync triggered for:', accountId);
@@ -257,12 +315,14 @@ const UnifiedEmailInbox = () => {
         ? mapFolderNameToImap(currentFolder, folders)
         : currentFolder;
       
-      // ✅ FIX: Use forceRefresh=true only for manual sync (not automatic)
+      // Use new non-blocking sync endpoint
       const response = await fetch(
-        `${API_URL}/api/imap-smtp/emails/${accountId}?folder=${actualFolder || 'INBOX'}&limit=20&headersOnly=false&forceRefresh=true`,
+        `${API_URL}/api/imap-smtp/manual-sync/${accountId}`,
         {
+          method: 'POST',
           credentials: 'include',
           headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ folder: actualFolder || 'INBOX' })
         }
       );
 
@@ -273,31 +333,38 @@ const UnifiedEmailInbox = () => {
 
       const data = await response.json();
       
-      console.log(`[UI] ✅ Manual sync completed: ${data.count || data.savedCount || 0} emails synced`);
-      
-      const emailCount = data.savedCount || data.count || data.emails?.length || 0;
-      
-      // Success toast
-      toast({
-        title: "Sync Complete!",
-        description: `Successfully synced ${emailCount} ${emailCount === 1 ? 'email' : 'emails'}!`,
-        duration: 3000,
-      });
-      
-      // Reload emails from database after sync
-      await loadImapEmails();
-      
+      if (data.success) {
+        // Show immediate feedback
+        toast({
+          title: "Sync Started!",
+          description: "New emails will appear shortly.",
+          duration: 3000,
+        });
+        
+        // The actual refresh will happen via WebSocket when sync completes
+        // But also set a fallback refresh after 10 seconds
+        setTimeout(() => {
+          loadImapEmails();
+        }, 10000);
+      } else {
+        toast({
+          variant: "destructive",
+          title: "Sync Failed",
+          description: data.error || 'Failed to start sync',
+          duration: 3000,
+        });
+      }
     } catch (error: any) {
       console.error('[UI] ❌ Sync error:', error);
       
       toast({
         variant: "destructive",
         title: "Sync Failed",
-        description: `Failed to sync emails: ${error.message || 'Unknown error'}`,
+        description: `Failed to start sync: ${error.message || 'Unknown error'}`,
+        duration: 3000,
       });
     } finally {
-      setLoading(false);
-      setLoadingMessage('');
+      setIsSyncing(false);
     }
   };
 

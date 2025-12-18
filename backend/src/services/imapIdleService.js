@@ -25,6 +25,11 @@ class ImapIdleManager {
     this.lastFailureTime = new Map(); // accountId -> timestamp
     this.maxFailures = 3; // Stop after 3 consecutive failures
     this.cooldownPeriod = 5 * 60 * 1000; // 5 minutes cooldown after failures
+    // ✅ NEW: Track restart attempts to prevent duplicates
+    this.isRestarting = new Set(); // accountId -> boolean
+    this.restartTimeouts = new Map(); // accountId -> timeoutId
+    this.connectionHealth = new Map(); // accountId -> {lastCheck, consecutiveDrops, lastDropTime, establishedAt}
+    this.healthCheckIntervals = new Map(); // accountId -> intervalId
   }
 
   // ============================================
@@ -42,53 +47,93 @@ class ImapIdleManager {
         return;
       }
 
-      // ✅ CRITICAL: Prevent multiple instances from starting
+      // ✅ CRITICAL: Stop any existing monitoring first (in case account was reconnected)
       if (this.activeConnections.has(account.id)) {
-        console.log(`[IDLE] ⏭️  Already monitoring account ${account.email}. Skipping duplicate start.`);
-        return;
+        console.log(`[IDLE] ⚠️  Account ${account.email} already being monitored. Stopping old monitoring before restarting...`);
+        await this.stopIdleMonitoring(account.id);
+        // Wait a bit for cleanup to complete
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
 
-      // Verify account still exists in database
-      const { data: accountData, error: accountError } = await supabaseAdmin
+      // ✅ FIX: Verify account exists with retry (for newly connected accounts)
+      let accountData = null;
+      let accountError = null;
+      
+      // Try up to 3 times with increasing delays (for newly connected accounts)
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt)); // 1s, 2s delays
+        }
+        
+        const result = await supabaseAdmin
         .from('email_accounts')
         .select('*')
         .eq('id', account.id)
         .eq('is_active', true)
         .single();
+        
+        accountData = result.data;
+        accountError = result.error;
+        
+        if (accountData && !accountError) {
+          break; // Found account, exit retry loop
+        }
+      }
 
       if (accountError || !accountData) {
-        console.error(`[IDLE] ❌ Account ${account.id} (${account.email || 'unknown'}) not found or inactive. Skipping IDLE setup.`);
+        console.error(`[IDLE] ❌ Account ${account.id} (${account.email || 'unknown'}) not found or inactive after retries. Skipping IDLE setup.`);
+        console.error(`[IDLE] Error details:`, accountError?.message || 'No account data returned');
         return;
       }
 
-      // ✅ CRITICAL: Check if account needs reconnection before attempting connection
+      // ✅ FIX: Attempt IDLE even if needs_reconnection is set
+      // This allows IDLE to work and potentially clear the flag
       if (accountData.needs_reconnection) {
-        console.log(`[IDLE] ⏭️  Skipping IDLE start for ${account.email} - account needs reconnection`);
-        return;
+        console.log(`[IDLE] ⚠️  Account ${account.email} marked as needs_reconnection, but attempting IDLE anyway to clear flag`);
       }
 
-      console.log(`[IDLE] Starting IDLE monitoring for ${account.email}`);
+      console.log(`[IDLE] 🔄 Starting IDLE for ${account.email}...`);
 
-      // Connect to IMAP with error handling
+      // ✅ FIX: Create DEDICATED connection for IDLE (not from pool)
+      // Don't use connection pool - IDLE needs its own persistent connection
+      const imaps = require('imap-simple');
+      const { decryptPassword } = require('../utils/encryption');
+      
       let connection;
       try {
-        connection = await connectToImap(account);
+        const password = decryptPassword(account.imap_password);
+        
+        connection = await imaps.connect({
+          imap: {
+            user: account.imap_username || account.email,
+            password,
+            host: account.imap_host,
+            port: account.imap_port || 993,
+            tls: account.use_ssl !== false,
+            tlsOptions: { 
+              rejectUnauthorized: false,
+              minVersion: 'TLSv1.2'
+            },
+            authTimeout: 15000,
+            connTimeout: 30000,
+            // ✅ CRITICAL: Keep connection alive
+            keepalive: {
+              interval: 10000,      // Send NOOP every 10 seconds
+              idleInterval: 300000,  // Restart IDLE every 5 minutes (Gmail requirement)
+              forceNoop: true
+            },
+            // ✅ Don't mark messages as seen
+            markSeen: false
+          }
+        });
+        
+        console.log(`[IDLE] ✅ Connected to IMAP for ${account.email}`);
       } catch (connectError) {
-        // ✅ Handle "Connection ended unexpectedly" - likely rate limiting
-        if (connectError.message?.includes('Connection ended unexpectedly') || 
-            connectError.message?.includes('ended unexpectedly')) {
-          console.error(`[IDLE] ❌ Connection ended unexpectedly for ${account.email}. Likely rate limiting. Marking as needs_reconnection.`);
-          await supabaseAdmin
-            .from('email_accounts')
-            .update({
-              needs_reconnection: true,
-              last_error: `Connection ended unexpectedly - possible rate limiting. Please wait 10-15 minutes and try again.`,
-              last_connection_attempt: new Date().toISOString()
-            })
-            .eq('id', account.id);
-          return; // Don't start IDLE
-        }
-        throw connectError; // Re-throw other errors
+        // ❌ DON'T mark account as needs_reconnection for IDLE errors
+        // Sync jobs will handle reconnection separately
+        console.error(`[IDLE] ❌ Failed to connect for ${account.email}:`, connectError.message);
+        console.log(`[IDLE] Will retry on next scheduled check`);
+        return; // Don't start IDLE, but don't mark as needs_reconnection
       }
 
       // Get folders to monitor
@@ -106,25 +151,339 @@ class ImapIdleManager {
       // Start monitoring
       await this.monitorFolders(account.id);
 
-      console.log(`[IDLE] IDLE monitoring started for ${account.email}`);
-    } catch (error) {
-      // ✅ Handle "Connection ended unexpectedly" in catch block too
-      if (error.message?.includes('Connection ended unexpectedly') || 
-          error.message?.includes('ended unexpectedly')) {
-        console.error(`[IDLE] ❌ Connection ended unexpectedly for ${account?.email || account?.id}. Likely rate limiting. Marking as needs_reconnection.`);
-        if (account?.id) {
-          await supabaseAdmin
+      // ✅ Open INBOX folder
+      await connection.openBox('INBOX');
+      console.log(`[IDLE] ✅ INBOX opened for ${account.email}`);
+      
+      // ✅ CRITICAL: Set up mail listener BEFORE starting IDLE mode
+      // The listener must be registered before IDLE starts to catch events
+      connection.imap.on('mail', async (numNewMsgs) => {
+        const accountEmail = account.email;
+        const accountIdFromClosure = account.id;
+        console.log(`[IDLE] 📧 ${accountEmail} received ${numNewMsgs} new email(s)`);
+        
+        // ✅ FIX: Get account from connectionData (most up-to-date) or use closure variable
+        const connectionData = this.activeConnections.get(accountIdFromClosure);
+        const currentAccount = connectionData?.account || account;
+        
+        // ✅ FIX: Run sync in background without blocking IDLE connection
+        // This ensures sync completes even if IDLE connection ends
+        (async () => {
+          try {
+          // ✅ FIX: Get fresh account data - try by ID first, then by email as fallback
+          let freshAccount = null;
+          
+          console.log(`[IDLE] 🔍 Looking up account: ID=${currentAccount.id}, email=${currentAccount.email || accountEmail}`);
+          
+          // First try: Look up by account ID from connectionData
+          const { data: accountById, error: idError } = await supabaseAdmin
             .from('email_accounts')
-            .update({
-              needs_reconnection: true,
-              last_error: `Connection ended unexpectedly - possible rate limiting. Please wait 10-15 minutes and try again.`,
-              last_connection_attempt: new Date().toISOString()
-            })
-            .eq('id', account.id);
-        }
+            .select('id, email, user_id, is_active')
+            .eq('id', currentAccount.id)
+            .eq('is_active', true)
+            .single();
+          
+          if (idError && idError.code !== 'PGRST116') {
+            console.error(`[IDLE] ❌ Error looking up account by ID ${currentAccount.id}:`, idError.message);
+          }
+          
+          if (accountById) {
+            freshAccount = accountById;
+            console.log(`[IDLE] ✅ Found account by ID: ${freshAccount.id}`);
+          } else {
+            // Fallback: Look up by email (account may have been reconnected with new ID)
+            console.log(`[IDLE] ⚠️  Account ${currentAccount.id} not found, trying lookup by email: ${currentAccount.email || accountEmail}`);
+            const { data: accountByEmail, error: emailError } = await supabaseAdmin
+              .from('email_accounts')
+              .select('id, email, user_id, is_active')
+              .eq('email', currentAccount.email || accountEmail)
+              .eq('is_active', true)
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            
+            if (emailError) {
+              console.error(`[IDLE] ❌ Error looking up account by email:`, emailError.message);
+            }
+            
+            if (accountByEmail) {
+              freshAccount = accountByEmail;
+              console.log(`[IDLE] ✅ Found account by email: ${freshAccount.id} (old ID was ${currentAccount.id})`);
+              // Update the connectionData account ID for future lookups
+              if (connectionData) {
+                connectionData.account.id = freshAccount.id;
+                connectionData.account.email = freshAccount.email;
+                // Also update the activeConnections map with new ID if different
+                if (freshAccount.id !== currentAccount.id) {
+                  this.activeConnections.set(freshAccount.id, connectionData);
+                  this.activeConnections.delete(currentAccount.id);
+                }
+              }
+            } else {
+              console.error(`[IDLE] ❌ Account ${currentAccount.id} (${currentAccount.email || accountEmail}) not found in database`);
+              return; // Don't stop IDLE, just skip this sync
+            }
+          }
+          
+          if (!freshAccount) {
+            console.error(`[IDLE] ❌ Could not find account for ${currentAccount.email || accountEmail}, aborting sync`);
         return;
       }
-      console.error(`[IDLE] Error starting monitoring for ${account?.email || 'unknown'}:`, error.message);
+          
+          // Trigger background sync for this specific account/folder
+          const { syncNewEmailsOnly } = require('./backgroundSyncService');
+          console.log(`[IDLE] 🔄 Triggering sync for account ${freshAccount.id} (${freshAccount.email})`);
+          
+          const count = await syncNewEmailsOnly(freshAccount.id, 'INBOX');
+          
+          console.log(`[IDLE] ✅ Synced ${count} new emails for ${freshAccount.email}`);
+          
+          // Notify frontend via WebSocket
+          if (this.wsManager && freshAccount.user_id) {
+            this.wsManager.io.to(freshAccount.user_id).emit('new_emails', {
+              accountId: freshAccount.id,
+              accountEmail: freshAccount.email,
+              count,
+              folder: 'INBOX',
+              timestamp: new Date().toISOString()
+            });
+            console.log(`[IDLE] 📡 Sent WebSocket notification to user ${freshAccount.user_id}`);
+          } else {
+            console.warn(`[IDLE] ⚠️  Cannot send WebSocket notification: wsManager=${!!this.wsManager}, user_id=${freshAccount.user_id}`);
+          }
+          } catch (syncError) {
+            console.error(`[IDLE] ❌ Sync error for ${accountEmail}:`, syncError.message);
+            console.error(`[IDLE] Stack:`, syncError.stack);
+            // Don't throw - keep IDLE connection alive
+          }
+        })(); // Execute immediately without blocking
+      });
+      
+      // ✅ CRITICAL: Start IDLE mode AFTER setting up the mail listener
+      // imap-simple doesn't automatically start IDLE - we need to call it on the underlying node-imap connection
+      // The underlying connection is at connection.imap (node-imap instance)
+      try {
+        // Access the underlying node-imap connection
+        const nodeImap = connection.imap;
+        
+        console.log(`[IDLE] 🔍 Checking IDLE support for ${account.email}...`);
+        console.log(`[IDLE] nodeImap exists: ${!!nodeImap}, type: ${typeof nodeImap}`);
+        console.log(`[IDLE] nodeImap.idle exists: ${!!(nodeImap && nodeImap.idle)}, type: ${nodeImap && typeof nodeImap.idle}`);
+        
+        if (nodeImap && typeof nodeImap.idle === 'function') {
+          console.log(`[IDLE] 🚀 Starting IDLE mode for ${account.email}...`);
+          
+          // Start IDLE mode - this enables real-time mail notifications
+          // The callback is called when IDLE starts (or errors)
+          nodeImap.idle((err) => {
+            if (err) {
+              console.error(`[IDLE] ❌ Error starting IDLE mode:`, err.message);
+              console.error(`[IDLE] Error stack:`, err.stack);
+              // If IDLE fails, we'll rely on polling (already set up via monitorFolders)
+            } else {
+              console.log(`[IDLE] ✅ IDLE mode started successfully for ${account.email} - waiting for new emails...`);
+            }
+          });
+          
+          // Store the idle state so we can stop it later
+          const connectionData = this.activeConnections.get(account.id);
+          if (connectionData) {
+            connectionData.idleStarted = true;
+            connectionData.idleStartTime = Date.now();
+            console.log(`[IDLE] ✅ IDLE state stored for ${account.email}`);
+          } else {
+            console.warn(`[IDLE] ⚠️  Connection data not found in activeConnections map`);
+          }
+        } else {
+          console.warn(`[IDLE] ⚠️  IDLE not supported for ${account.email} (nodeImap.idle not available), will use polling only`);
+          if (nodeImap) {
+            const methods = Object.keys(nodeImap).filter(k => typeof nodeImap[k] === 'function').slice(0, 10);
+            console.log(`[IDLE] Available methods on nodeImap:`, methods);
+          }
+        }
+      } catch (idleError) {
+        console.error(`[IDLE] ❌ Failed to start IDLE mode:`, idleError.message);
+        console.error(`[IDLE] Error stack:`, idleError.stack);
+        console.log(`[IDLE] Will rely on polling for ${account.email} (polling is already active)`);
+      }
+      
+      // ✅ Track connection health
+      this.connectionHealth.set(account.id, {
+        lastCheck: Date.now(),
+        consecutiveDrops: 0,
+        lastDropTime: null,
+        establishedAt: Date.now()
+      });
+      
+      // ✅ Handle connection errors
+      connection.imap.on('error', async (error) => {
+        const errorMsg = error.message || String(error);
+        console.error(`[IDLE] ❌ Connection error for ${account.email}:`, errorMsg);
+        
+        // Update health tracking
+        const health = this.connectionHealth.get(account.id) || {};
+        health.consecutiveDrops = (health.consecutiveDrops || 0) + 1;
+        health.lastDropTime = Date.now();
+        this.connectionHealth.set(account.id, health);
+        
+        console.log(`[IDLE] 📊 Connection health: ${health.consecutiveDrops} consecutive drops for ${account.email}`);
+        
+        // Clean up this connection
+        this.stopIdleMonitoring(account.id);
+        
+        // ❌ DON'T mark account as needs_reconnection for IDLE errors
+        // Sync jobs will handle reconnection separately
+        
+        // ✅ FIX: Prevent duplicate restart attempts
+        if (this.isRestarting.has(account.id)) {
+          console.log(`[IDLE] ⏭️  Restart already in progress for ${account.email}, skipping duplicate restart`);
+          return;
+        }
+        
+        // Calculate backoff delay (exponential backoff: 30s, 60s, 120s, max 5min)
+        const backoffDelay = Math.min(
+          300000, // Max 5 minutes
+          Math.pow(2, health.consecutiveDrops - 1) * 30000 // 30s * 2^(drops-1)
+        );
+        
+        console.log(`[IDLE] 🔄 Scheduling restart for ${account.email} in ${Math.round(backoffDelay / 1000)}s (backoff due to ${health.consecutiveDrops} drops)`);
+        
+        // Clear any existing restart timeout
+        if (this.restartTimeouts.has(account.id)) {
+          clearTimeout(this.restartTimeouts.get(account.id));
+        }
+        
+        // Schedule restart with backoff
+        const timeoutId = setTimeout(() => {
+          this.restartTimeouts.delete(account.id);
+          this.isRestarting.add(account.id);
+          
+          console.log(`[IDLE] 🔄 Attempting to restart IDLE for ${account.email}...`);
+          this.startIdleMonitoring(account)
+            .then(() => {
+              this.isRestarting.delete(account.id);
+              // Reset drop count on successful restart
+              const health = this.connectionHealth.get(account.id);
+              if (health) {
+                health.consecutiveDrops = 0;
+                health.lastCheck = Date.now();
+                health.establishedAt = Date.now();
+                this.connectionHealth.set(account.id, health);
+              }
+            })
+            .catch(err => {
+              this.isRestarting.delete(account.id);
+              console.error(`[IDLE] ❌ Failed to restart IDLE:`, err.message);
+            });
+        }, backoffDelay);
+        
+        this.restartTimeouts.set(account.id, timeoutId);
+      });
+      
+      // ✅ Handle connection end
+      connection.imap.on('end', () => {
+        console.log(`[IDLE] ⚠️  Connection ended for ${account.email}`);
+        
+        // Update health tracking
+        const health = this.connectionHealth.get(account.id) || {};
+        health.consecutiveDrops = (health.consecutiveDrops || 0) + 1;
+        health.lastDropTime = Date.now();
+        this.connectionHealth.set(account.id, health);
+        
+        const dropCount = health.consecutiveDrops || 0;
+        const timeSinceLastDrop = health.lastDropTime ? Date.now() - health.lastDropTime : 0;
+        console.log(`[IDLE] 📊 Connection end stats: ${dropCount} consecutive drops, ${Math.round(timeSinceLastDrop / 1000)}s since last drop`);
+        
+        this.stopIdleMonitoring(account.id);
+        
+        // ✅ FIX: Prevent duplicate restart attempts
+        if (this.isRestarting.has(account.id)) {
+          console.log(`[IDLE] ⏭️  Restart already in progress for ${account.email}, skipping duplicate restart`);
+          return;
+        }
+        
+        // Calculate backoff delay
+        const backoffDelay = Math.min(
+          300000, // Max 5 minutes
+          Math.pow(2, dropCount - 1) * 30000 // Exponential backoff
+        );
+        
+        console.log(`[IDLE] 🔄 Scheduling restart for ${account.email} in ${Math.round(backoffDelay / 1000)}s`);
+        
+        // Clear any existing restart timeout
+        if (this.restartTimeouts.has(account.id)) {
+          clearTimeout(this.restartTimeouts.get(account.id));
+        }
+        
+        // Schedule restart with backoff
+        const timeoutId = setTimeout(() => {
+          this.restartTimeouts.delete(account.id);
+          this.isRestarting.add(account.id);
+          
+          console.log(`[IDLE] 🔄 Restarting IDLE after connection end for ${account.email}...`);
+          this.startIdleMonitoring(account)
+            .then(() => {
+              this.isRestarting.delete(account.id);
+              // Reset drop count on successful restart
+              const health = this.connectionHealth.get(account.id);
+              if (health) {
+                health.consecutiveDrops = 0;
+                health.lastCheck = Date.now();
+                health.establishedAt = Date.now();
+                this.connectionHealth.set(account.id, health);
+              }
+            })
+            .catch(err => {
+              this.isRestarting.delete(account.id);
+              console.error(`[IDLE] ❌ Failed to restart IDLE:`, err.message);
+            });
+        }, backoffDelay);
+        
+        this.restartTimeouts.set(account.id, timeoutId);
+      });
+      
+      // ✅ Handle close event
+      connection.imap.on('close', () => {
+        console.log(`[IDLE] Connection closed for ${account.email}`);
+        this.stopIdleMonitoring(account.id);
+      });
+      
+      // ✅ NEW: Periodic health check (every 2 minutes)
+      const healthCheckInterval = setInterval(() => {
+        const health = this.connectionHealth.get(account.id);
+        if (!health) {
+          clearInterval(healthCheckInterval);
+        return;
+      }
+        
+        const connectionData = this.activeConnections.get(account.id);
+        if (!connectionData || !connectionData.connection) {
+          clearInterval(healthCheckInterval);
+          return;
+        }
+        
+        const connection = connectionData.connection;
+        const isAlive = connection.imap && connection.imap.state === 'authenticated';
+        
+        health.lastCheck = Date.now();
+        this.connectionHealth.set(account.id, health);
+        
+        if (!isAlive) {
+          console.warn(`[IDLE] ⚠️  Health check: Connection for ${account.email} is not authenticated (state: ${connection.imap?.state || 'unknown'})`);
+        } else {
+          const uptime = Math.round((Date.now() - health.establishedAt) / 1000);
+          console.log(`[IDLE] ✅ Health check: ${account.email} connection healthy (uptime: ${uptime}s, drops: ${health.consecutiveDrops})`);
+        }
+      }, 120000); // Every 2 minutes
+      
+      // Store health check interval for cleanup
+      this.healthCheckIntervals.set(account.id, healthCheckInterval);
+
+      console.log(`[IDLE] ✅ IDLE monitoring active for ${account.email}`);
+    } catch (error) {
+      // ❌ DON'T mark account as needs_reconnection for IDLE errors
+      console.error(`[IDLE] ❌ Failed to start IDLE for ${account?.email || 'unknown'}:`, error.message);
+      console.log(`[IDLE] Will retry on next scheduled check`);
     }
   }
 
@@ -146,6 +505,23 @@ class ImapIdleManager {
 
       console.log(`[IDLE] Stopping IDLE monitoring for account ${accountId}`);
 
+      // ✅ Clear restart timeout if exists
+      if (this.restartTimeouts && this.restartTimeouts.has(accountId)) {
+        clearTimeout(this.restartTimeouts.get(accountId));
+        this.restartTimeouts.delete(accountId);
+      }
+      
+      // ✅ Clear health check interval
+      if (this.healthCheckIntervals && this.healthCheckIntervals.has(accountId)) {
+        clearInterval(this.healthCheckIntervals.get(accountId));
+        this.healthCheckIntervals.delete(accountId);
+      }
+      
+      // ✅ Remove from restart tracking
+      if (this.isRestarting) {
+        this.isRestarting.delete(accountId);
+      }
+
       // Clear monitoring interval
       if (this.monitoringIntervals.has(accountId)) {
         clearInterval(this.monitoringIntervals.get(accountId));
@@ -156,8 +532,25 @@ class ImapIdleManager {
       this.connectionFailureCount.delete(accountId);
       this.lastFailureTime.delete(accountId);
 
-      // Close connection
+      // ✅ FIX: Stop IDLE mode before closing connection
       connectionData.monitoring = false;
+      
+      try {
+        const nodeImap = connectionData.connection?.imap;
+        if (nodeImap && connectionData.idleStarted && typeof nodeImap.idleStop === 'function') {
+          console.log(`[IDLE] Stopping IDLE mode for account ${accountId}...`);
+          try {
+            nodeImap.idleStop();
+            connectionData.idleStarted = false;
+            console.log(`[IDLE] ✅ IDLE mode stopped for account ${accountId}`);
+          } catch (idleStopError) {
+            console.warn(`[IDLE] Error stopping IDLE mode:`, idleStopError.message);
+          }
+        }
+      } catch (idleCheckError) {
+        // Ignore errors when checking for IDLE
+      }
+      
       try {
         connectionData.connection.end();
       } catch (e) {
@@ -195,16 +588,41 @@ class ImapIdleManager {
 
         try {
           // ✅ Check if account needs reconnection before attempting sync
-          const { data: accountCheck } = await supabaseAdmin
+          // Use maybeSingle() to avoid errors if account was just deleted
+          const { data: accountCheck, error: checkError } = await supabaseAdmin
             .from('email_accounts')
-            .select('id, needs_reconnection')
+            .select('id, needs_reconnection, is_active')
             .eq('id', accountId)
-            .eq('is_active', true)
-            .single();
+            .maybeSingle();
 
-          if (!accountCheck || accountCheck.needs_reconnection) {
-            console.log(`[IDLE] ⏭️  Skipping check for ${accountId} - account needs reconnection`);
+          if (checkError) {
+            console.warn(`[IDLE] ⚠️  Error checking account ${accountId}:`, checkError.message);
             return;
+          }
+
+          if (!accountCheck) {
+            console.log(`[IDLE] ⏭️  Skipping check for ${accountId} - account not found`);
+            // Stop monitoring if account was deleted
+            if (this.activeConnections.has(accountId)) {
+              console.log(`[IDLE] Stopping monitoring for deleted account ${accountId}`);
+              await this.stopIdleMonitoring(accountId);
+            }
+            return;
+          }
+          
+          if (!accountCheck.is_active) {
+            console.log(`[IDLE] ⏭️  Skipping check for ${accountId} - account is inactive`);
+            // Stop monitoring if account was deactivated
+            if (this.activeConnections.has(accountId)) {
+              console.log(`[IDLE] Stopping monitoring for inactive account ${accountId}`);
+              await this.stopIdleMonitoring(accountId);
+            }
+            return;
+          }
+          
+          // ✅ FIX: Attempt sync even if needs_reconnection is set (to clear the flag)
+          if (accountCheck.needs_reconnection) {
+            console.log(`[IDLE] ⚠️  Account ${accountId} marked as needs_reconnection, but attempting sync to clear flag`);
           }
 
           // Check if connection is still valid before checking for emails
@@ -419,7 +837,7 @@ class ImapIdleManager {
     if (!connectionData) return;
 
     try {
-      // ✅ CRITICAL: Check if account needs reconnection before syncing
+      // ✅ FIX: Check account status but don't skip if needs_reconnection (to clear the flag)
       const { data: accountCheck } = await supabaseAdmin
         .from('email_accounts')
         .select('id, needs_reconnection')
@@ -433,9 +851,9 @@ class ImapIdleManager {
         return;
       }
 
+      // ✅ FIX: Attempt sync even if needs_reconnection is set (to clear the flag)
       if (accountCheck.needs_reconnection) {
-        console.log(`[IDLE] ⏭️  Skipping check for ${accountId} - account needs reconnection`);
-        return;
+        console.log(`[IDLE] ⚠️  Account ${accountId} marked as needs_reconnection, but attempting sync to clear flag`);
       }
 
       const { account, folders } = connectionData;
@@ -535,10 +953,19 @@ class ImapIdleManager {
         return false;
       }
 
+      // ✅ FIX: Add delay before reconnection to avoid conflicts with sync jobs
+      // Wait a bit to let any ongoing sync operations complete
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
       // Create new connection with retry (but limit retries to avoid spam)
       const newConnection = await retryWithBackoff(
         async () => {
-          return await connectToImap(account);
+          // ✅ Verify connection is actually authenticated before returning
+          const conn = await connectToImap(account);
+          if (!conn || !conn.imap || conn.imap.state !== 'authenticated') {
+            throw new Error(`Connection established but not authenticated (state: ${conn?.imap?.state || 'unknown'})`);
+          }
+          return conn;
         },
         {
           maxRetries: 2, // Reduced from 3 to avoid spam
@@ -648,10 +1075,9 @@ class ImapIdleManager {
         return;
       }
 
-      // ✅ CRITICAL: Skip sync if account needs reconnection (prevents endless retry loops)
+      // ✅ FIX: Attempt sync even if needs_reconnection is set (to clear the flag)
       if (accountCheck.needs_reconnection) {
-        console.log(`[IDLE] ⏭️  Skipping sync for ${accountId}/${folderName} - account needs reconnection`);
-        return;
+        console.log(`[IDLE] ⚠️  Account ${accountId}/${folderName} marked as needs_reconnection, but attempting sync to clear flag`);
       }
       
       const connectionData = this.activeConnections.get(accountId);
@@ -919,19 +1345,15 @@ class ImapIdleManager {
         }
       }
     } catch (error) {
-      // ✅ Handle "Connection ended unexpectedly" - stop retrying immediately
+      // ✅ Handle "Connection ended unexpectedly" - don't mark as needs_reconnection
+      // This is likely rate limiting or network issues, not a real auth failure
       if (error.message?.includes('Connection ended unexpectedly') || 
           error.message?.includes('ended unexpectedly')) {
-        console.error(`[IDLE] ❌ Connection ended unexpectedly for ${folderName}. Likely rate limiting. Stopping IDLE monitoring.`);
+        console.warn(`[IDLE] ⚠️  Connection ended unexpectedly for ${folderName}. Likely rate limiting. Will retry.`);
+        
+        // ❌ DON'T mark account as needs_reconnection for transient connection issues
+        // Just stop IDLE monitoring temporarily, will restart on next check
         await this.stopIdleMonitoring(accountId);
-        await supabaseAdmin
-          .from('email_accounts')
-          .update({
-            needs_reconnection: true,
-            last_error: `Connection ended unexpectedly - possible rate limiting. Please wait and reconnect.`,
-            last_connection_attempt: new Date().toISOString()
-          })
-          .eq('id', accountId);
         return;
       }
       

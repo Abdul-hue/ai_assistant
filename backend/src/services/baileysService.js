@@ -31,6 +31,8 @@ let audioBucketName = process.env.AUDIO_BUCKET || DEFAULT_AUDIO_BUCKET;
 const DEFAULT_AUDIO_SIGNED_URL_TTL = 60 * 60 * 24 * 7; // 7 days
 let audioBucketChecked = false;
 const QR_EXPIRY_MS = 3 * 60 * 1000; // 3 minutes - WhatsApp QR code validity
+const QR_EXPIRATION_MS = 60 * 1000; // 60 seconds - QR expiration for cleanup
+const MAX_QR_PENDING_MS = 5 * 60 * 1000; // 5 minutes - Max time in qr_pending before reset
 
 // SECURITY: Generate unique instance ID for multi-instance prevention
 const os = require('os');
@@ -96,7 +98,64 @@ function getInboundMessageWebhook() {
   return testSpecific || prodSpecific || DEFAULT_MESSAGE_WEBHOOK_TEST;
 }
 
+/**
+ * Check if an incoming WhatsApp message is a duplicate of a recent dashboard message
+ * This prevents webhook spam when dashboard messages echo back via WhatsApp
+ * @param {Object} params - Message parameters
+ * @param {string} params.content - Message text content
+ * @param {string} params.fromNumber - Sender phone number (sanitized)
+ * @param {string} params.timestamp - Message timestamp (ISO string)
+ * @param {number} params.timeWindow - Time window in ms (default 5000ms = 5s)
+ * @param {string} params.agentId - Agent ID for filtering
+ * @returns {Promise<boolean>} - True if duplicate found
+ */
+async function checkIfRecentDashboardMessage({ content, fromNumber, timestamp, timeWindow = 5000, agentId }) {
+  if (!content || !fromNumber || !timestamp || !agentId) {
+    return false; // Missing required params, allow webhook (fail open)
+  }
+
+  try {
+    const timestampDate = new Date(timestamp);
+    const windowStart = new Date(timestampDate.getTime() - timeWindow);
+    const windowEnd = new Date(timestampDate.getTime() + timeWindow);
+    
+    // Query database for matching dashboard message within time window
+    // The index on (source, sender_phone, received_at) will be used first,
+    // then we filter by message_text in the WHERE clause
+    const { data: recentMessage, error } = await supabaseAdmin
+      .from('message_log')
+      .select('id, message_text, received_at, source')
+      .eq('agent_id', agentId)
+      .eq('source', 'dashboard')
+      .eq('sender_phone', fromNumber)
+      .gte('received_at', windowStart.toISOString())
+      .lte('received_at', windowEnd.toISOString())
+      .eq('message_text', content.trim()) // Filter by content after index lookup
+      .order('received_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    
+    if (error && error.code !== 'PGRST116') {
+      // PGRST116 = no rows returned, which is fine
+      console.error('[BAILEYS][DUPLICATE-CHECK] Error checking for duplicate message:', error.message);
+      return false; // On error, allow webhook to be sent (fail open)
+    }
+    
+    if (recentMessage) {
+      console.log(`[BAILEYS][DUPLICATE-CHECK] ✅ Duplicate detected: WhatsApp echo of dashboard message ${recentMessage.id}`);
+      console.log(`[BAILEYS][DUPLICATE-CHECK] Dashboard message: ${recentMessage.received_at}, WhatsApp echo: ${timestamp}`);
+      return true;
+    }
+    
+    return false;
+  } catch (error) {
+    console.error('[BAILEYS][DUPLICATE-CHECK] Exception in checkIfRecentDashboardMessage:', error.message);
+    return false; // On exception, allow webhook to be sent (fail open)
+  }
+}
+
 async function forwardMessageToWebhook(agentId, messagePayload) {
+  const webhookService = require('./webhookService');
   const webhookUrl = getInboundMessageWebhook();
 
   if (!webhookUrl) {
@@ -128,41 +187,42 @@ async function forwardMessageToWebhook(agentId, messagePayload) {
       // Continue without user_id rather than failing completely
     }
 
-    // Construct webhook payload with user_id (snake_case to match database field)
+    // Construct standardized webhook payload
+    // Ensure source is always included (defaults to 'whatsapp' if not set)
     const webhookPayload = {
-      agentId,
+      source: messagePayload.source || 'whatsapp', // Default to 'whatsapp' for backward compatibility
+      messageId: messagePayload.messageId || messagePayload.id,
+      from: messagePayload.from,
+      to: messagePayload.to,
+      body: messagePayload.content || messagePayload.body || messagePayload.message_text || '',
+      timestamp: messagePayload.timestamp || messagePayload.received_at || new Date().toISOString(),
+      isFromMe: messagePayload.isFromMe !== undefined ? messagePayload.isFromMe : (messagePayload.fromMe || false),
+      agentId: agentId,
       ...(userId && { user_id: userId }), // Include user_id only if it exists
-      ...messagePayload,
+      metadata: {
+        ...(messagePayload.metadata || {}),
+        messageType: messagePayload.messageType || messagePayload.type || 'text',
+        conversationId: messagePayload.conversationId || messagePayload.remoteJid || null,
+        senderName: messagePayload.senderName || null,
+        mediaUrl: messagePayload.mediaUrl || null,
+        mimetype: messagePayload.mimetype || null,
+      }
     };
 
-    await axios.post(
-      webhookUrl,
-      webhookPayload,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'X-WhatsApp-Agent': agentId,
-          'X-WhatsApp-RemoteJid': messagePayload.from,
-        },
-        timeout: MESSAGE_FORWARD_TIMEOUT_MS,
-      }
-    );
+    // Use centralized webhook service with retry logic
+    await webhookService.sendWebhook(webhookUrl, webhookPayload);
 
     const label = messagePayload.messageType || messagePayload.type || 'message';
     console.log(
-      `[BAILEYS][WEBHOOK] ✅ Forwarded ${label} ${messagePayload.messageId || messagePayload.id} from ${messagePayload.from}${userId ? ` (user_id: ${userId})` : ''}`
+      `[BAILEYS][WEBHOOK] ✅ Forwarded ${label} ${webhookPayload.messageId} from ${webhookPayload.from} (source: ${webhookPayload.source})${userId ? ` (user_id: ${userId})` : ''}`
     );
   } catch (error) {
-    const status = error.response?.status;
-    const responseData = error.response?.data;
-    const messageHint = responseData || error.message;
-
+    // Webhook service handles retries and logging, so we just log here
     console.error(
-      `[BAILEYS][WEBHOOK] ❌ Failed to forward ${messagePayload.messageType || messagePayload.type || 'message'} ${
-        messagePayload.messageId || messagePayload.id
-      } to ${webhookUrl}. Status: ${status || 'n/a'}`,
-      messageHint
+      `[BAILEYS][WEBHOOK] ❌ Error in forwardMessageToWebhook:`,
+      error.message
     );
+    // Don't throw - webhook failures shouldn't block message processing
   }
 }
 
@@ -1132,6 +1192,69 @@ async function diagnoseNetworkIssue(agentId) {
 }
 
 // Initialize WhatsApp connection
+/**
+ * Clear expired QR codes from session
+ * @param {string} agentId - Agent ID
+ */
+function clearExpiredQR(agentId) {
+  const session = activeSessions.get(agentId);
+  if (!session) return;
+  
+  if (session.qrCode && session.qrGeneratedAt) {
+    const qrAge = Date.now() - session.qrGeneratedAt;
+    if (qrAge > QR_EXPIRATION_MS) {
+      console.log(`[BAILEYS] 🧹 Clearing expired QR for agent ${agentId.substring(0, 8)}... (${Math.round(qrAge/1000)}s old)`);
+      session.qrCode = null;
+      session.qrGeneratedAt = null;
+      activeSessions.set(agentId, session);
+    }
+  }
+}
+
+/**
+ * Cleanup stale QR states (qr_pending for >5 minutes)
+ * @param {string} agentId - Agent ID
+ */
+async function cleanupStaleQRState(agentId) {
+  try {
+    const { data: dbState } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status, updated_at, qr_code')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    if (dbState?.status === 'qr_pending') {
+      const stateAge = Date.now() - new Date(dbState.updated_at).getTime();
+      
+      if (stateAge > MAX_QR_PENDING_MS) {
+        console.log(`[BAILEYS] 🧹 Cleaning up stale QR state (>5 min old, ${Math.round(stateAge/1000)}s)`);
+        
+        // Reset in-memory state
+        const session = activeSessions.get(agentId);
+        if (session) {
+          session.qrCode = null;
+          session.qrGeneratedAt = null;
+          session.connectionState = 'disconnected';
+        }
+        qrGenerationTracker.delete(agentId);
+        
+        // Update database
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({ 
+            status: 'disconnected',
+            qr_code: null,
+            updated_at: new Date().toISOString()
+          })
+          .eq('agent_id', agentId);
+      }
+    }
+  } catch (error) {
+    console.error(`[BAILEYS] Error in cleanupStaleQRState:`, error.message);
+    // Don't throw - cleanup failures shouldn't block initialization
+  }
+}
+
 async function initializeWhatsApp(agentId, userId = null) {
   console.log(`\n[BAILEYS] ==================== INITIALIZATION START ====================`);
   console.log(`[BAILEYS] Initializing WhatsApp for agent: ${agentId.substring(0, 40)}`);
@@ -1158,19 +1281,44 @@ async function initializeWhatsApp(agentId, userId = null) {
   }
   
   try {
+    // CRITICAL FIX: Cleanup stale QR states before checking
+    await cleanupStaleQRState(agentId);
+    
     // Prevent multiple initializations
     if (activeSessions.has(agentId)) {
       const existingSession = activeSessions.get(agentId);
       
+      // CRITICAL FIX: Check if there's BOTH a recent QR generation AND an active QR code
       const qrGenTime = qrGenerationTracker.get(agentId);
-      if (qrGenTime && (Date.now() - qrGenTime) < 120000) {
-        console.log(`[BAILEYS] ⏸️ QR already generated recently`);
-      return {
+      let hasActiveQR = existingSession?.qrCode !== null;
+      const QR_COOLDOWN_MS = 120000; // 2 minutes
+      const isWithinCooldown = qrGenTime && (Date.now() - qrGenTime) < QR_COOLDOWN_MS;
+      
+      // Clear expired QR codes before checking
+      clearExpiredQR(agentId);
+      hasActiveQR = existingSession?.qrCode !== null; // Re-check after clearing
+      
+      if (isWithinCooldown && hasActiveQR) {
+        console.log(`[BAILEYS] ⏸️ QR already generated recently and still active`);
+        console.log(`[BAILEYS] 📊 QR State:`, {
+          hasQRInMemory: !!existingSession.qrCode,
+          qrGeneratedAt: existingSession.qrGeneratedAt ? new Date(existingSession.qrGeneratedAt).toISOString() : null,
+          cooldownRemaining: Math.round((QR_COOLDOWN_MS - (Date.now() - qrGenTime)) / 1000) + 's',
+          socketState: existingSession.socket?.ws?.readyState
+        });
+        return {
           success: true,
           status: 'qr_pending',
+          qrCode: existingSession.qrCode,
           phoneNumber: existingSession.phoneNumber,
           isActive: existingSession.isConnected
         };
+      }
+      
+      // If cooldown active but QR expired/missing, force new generation
+      if (isWithinCooldown && !hasActiveQR) {
+        console.log(`[BAILEYS] ⚠️ Cooldown active but QR expired/missing - forcing new generation`);
+        qrGenerationTracker.delete(agentId); // Clear cooldown to allow generation
       }
       
       if (existingSession.socket && existingSession.isConnected) {
@@ -1192,14 +1340,25 @@ async function initializeWhatsApp(agentId, userId = null) {
       qrGenerationTracker.delete(agentId);
     }
 
-    // CRITICAL FIX B: Check database status FIRST before checking local files
-    // This prevents using stale credentials from manual disconnects
+    // CRITICAL FIX: Check database status and force QR if needed
+    // If database says qr_pending but we have no QR in memory, force generation
     console.log(`[BAILEYS] 🔍 Checking database status FIRST (before local files)...`);
     const { data: dbSessionStatus, error: dbStatusError } = await supabaseAdmin
       .from('whatsapp_sessions')
-      .select('status, is_active, disconnected_at, session_data')
+      .select('status, is_active, disconnected_at, session_data, qr_code, updated_at')
       .eq('agent_id', agentId)
       .maybeSingle();
+    
+    const currentState = activeSessions.get(agentId);
+    if (dbSessionStatus?.status === 'qr_pending' && (!currentState || !currentState.qrCode)) {
+      console.log(`[BAILEYS] 🔄 QR pending but missing - forcing new generation`);
+      // Reset cooldown to allow immediate generation
+      qrGenerationTracker.delete(agentId);
+      // Clear any stale session
+      if (currentState) {
+        activeSessions.delete(agentId);
+      }
+    }
     
     if (dbStatusError) {
       console.warn(`[BAILEYS] ⚠️ Error checking database status:`, dbStatusError);
@@ -1775,27 +1934,21 @@ async function initializeWhatsApp(agentId, userId = null) {
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr, isNewLogin } = update;
       
-      console.log(`\n[BAILEYS] ========== CONNECTION UPDATE ==========`);
-      console.log(`[BAILEYS] Status: ${connection || 'undefined'}`);
-      console.log(`[BAILEYS] Has QR: ${!!qr}`);
-      console.log(`[BAILEYS] Is New Login: ${isNewLogin}`);
-      
-      // REMOVED: Connecting state logging - causes false disconnects during pairing
-      
       if (connection === 'close' && lastDisconnect) {
         const session = activeSessions.get(agentId);
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const hasQR = !!session?.qrCode;
         const wasPairing = hasQR && !session?.isConnected;
+        const errorMessage = lastDisconnect?.error?.message || '';
         
-        console.log(`[BAILEYS] ❌ CONNECTION STATE: close`);
-        console.log(`[BAILEYS] Status Code: ${statusCode}`);
-        console.log(`[BAILEYS] Was Pairing: ${wasPairing ? 'YES (QR was active)' : 'NO'}`);
-        console.log(`[BAILEYS] Socket State: ${session?.socket?.ws?.readyState || 'unknown'}`);
+        // Only log significant close events (not normal QR timeout)
+        if (statusCode && statusCode !== 515) { // 515 = QR timeout, expected
+          console.log(`[BAILEYS] ❌ Connection closed: ${statusCode} - ${errorMessage || 'unknown'}`);
+        }
         
-        if (wasPairing) {
-          console.log(`[BAILEYS] ⚠️ CRITICAL: Connection closed DURING pairing phase!`);
-          console.log(`[BAILEYS] This indicates: network issue, timeout, or server rejection during QR scan`);
+        if (wasPairing && statusCode && statusCode !== 515) {
+          // Connection closed during pairing (not QR timeout)
+          console.log(`[BAILEYS] ⚠️ Connection closed during pairing - network issue or server rejection`);
         }
       }
 
@@ -1813,63 +1966,33 @@ async function initializeWhatsApp(agentId, userId = null) {
           session.connectionState = 'qr_pending';
         }
         
-        console.log(`[BAILEYS] 🎯 QR CODE RECEIVED! (Attempt #${qrAttempt})`);
-        console.log(`[BAILEYS] 🎯 AgentId: ${agentId.substring(0, 40)}`);
-        console.log(`[BAILEYS] 🎯 QR Length: ${qr.length} chars`);
-        console.log(`[BAILEYS] 🎯 Socket age: ${session ? Math.round((Date.now() - session.socketCreatedAt)/1000) : 0}s`);
+        // Log QR generation concisely
+        console.log(`[BAILEYS] 📱 QR Code #${qrAttempt} generated for agent ${agentId.substring(0, 8)}... - scan within 60s`);
         
         const existingQR = qrGenerationTracker.get(agentId);
         const QR_COOLDOWN_MS = 120000; // 2 minutes
         
-        // MODIFIED: Only apply cooldown if QR is recent AND still valid (not expired)
+        // Only apply cooldown if QR is recent AND still valid (not expired)
         if (existingQR && (Date.now() - existingQR) < QR_COOLDOWN_MS) {
-          const qrAge = Math.round((Date.now() - existingQR)/1000);
-          
-          // CRITICAL: If existing QR is expired (>3 min) OR this is attempt >1, allow new QR
           const qrExpired = (Date.now() - existingQR) > QR_EXPIRY_MS;
           const isRetryAfterFailure = qrAttempt > 1;
           
           if (!qrExpired && !isRetryAfterFailure) {
-            console.log(`[BAILEYS] ⏭️ Ignoring new QR - existing valid (${qrAge}s old)`);
-            return;
-          } else if (qrExpired) {
-            console.log(`[BAILEYS] 🔄 Existing QR expired (${qrAge}s old) - accepting new QR`);
-          } else if (isRetryAfterFailure) {
-            console.log(`[BAILEYS] 🔄 Retry attempt #${qrAttempt} - accepting new QR`);
+            return; // Skip - valid QR exists
           }
         }
         
-        // If existing QR is expired (>3 minutes), allow new QR generation
+        // Clear expired QR tracker
         if (existingQR && (Date.now() - existingQR) > QR_EXPIRY_MS) {
-          console.log(`[BAILEYS] 🔄 Existing QR expired (${Math.round((Date.now() - existingQR)/1000)}s old), generating new QR...`);
-          qrGenerationTracker.delete(agentId); // Clear expired QR tracker
+          qrGenerationTracker.delete(agentId);
         }
         
-        // ADD: Validate QR format
-        console.log(`[BAILEYS] 🔍 Validating QR code format...`);
-        
-        try {
-          // WhatsApp QR codes should be comma-separated base64 strings
-          const qrParts = qr.split(',');
-          if (qrParts.length !== 4) {
-            console.error(`[BAILEYS] ❌ Invalid QR format: expected 4 parts, got ${qrParts.length}`);
-            console.error(`[BAILEYS] This may indicate Baileys library issue or WA protocol change`);
-          } else {
-            console.log(`[BAILEYS] ✅ QR format valid (4 parts: ref, noiseKey, identityKey, advKey)`);
-          }
-          
-          // Validate each part is base64
-          for (let i = 0; i < qrParts.length; i++) {
-            const part = qrParts[i];
-            if (!/^[A-Za-z0-9+/=]+$/.test(part)) {
-              console.error(`[BAILEYS] ❌ QR part ${i+1} is not valid base64`);
-            }
-          }
-        } catch (validationError) {
-          console.error(`[BAILEYS] ⚠️ QR validation error:`, validationError.message);
+        // Quick QR format check (4 comma-separated parts)
+        // Note: First part intentionally has "2@" prefix (WhatsApp version indicator) - this is normal
+        const qrParts = qr.split(',');
+        if (qrParts.length !== 4) {
+          console.error(`[BAILEYS] ❌ Invalid QR format: expected 4 parts, got ${qrParts.length}`);
         }
-        
-        console.log(`[BAILEYS] ✅ NEW QR CODE - Saving to database and memory (generated at ${new Date().toISOString()})`);
         
         qrGenerationTracker.set(agentId, Date.now());
         
@@ -1887,8 +2010,6 @@ async function initializeWhatsApp(agentId, userId = null) {
               onConflict: 'agent_id'
             });
           
-          console.log(`[BAILEYS] ✅ QR saved to database (attempt #${qrAttempt})`);
-          
           if (session) {
             session.qrCode = qr;
             session.qrGeneratedAt = Date.now();
@@ -1900,9 +2021,6 @@ async function initializeWhatsApp(agentId, userId = null) {
             attempt: qrAttempt,
             generatedAt: new Date().toISOString()
           });
-          
-          console.log(`[BAILEYS] ✅ QR valid for 3 minutes - please scan immediately`);
-          console.log(`[BAILEYS] ℹ️ Socket will maintain connection with keepalive every 15s`);
         } catch (error) {
           console.error(`[BAILEYS] ❌ Error saving QR:`, error);
         }
@@ -2585,11 +2703,8 @@ async function initializeWhatsApp(agentId, userId = null) {
             updated_at: new Date().toISOString()
           })
           .eq('agent_id', agentId);
-        
-        console.log(`[BAILEYS] ========== CLOSE COMPLETE ==========\n`);
       }
       
-      console.log(`[BAILEYS] ========== UPDATE PROCESSED ==========\n`);
     });
 
     // Handle messages
@@ -2728,10 +2843,26 @@ async function initializeWhatsApp(agentId, userId = null) {
         const fromNumber = fromMe ? agentNumber : contactNumber;
         const toNumber = fromMe ? contactNumber : agentNumber;
 
+        // ✅ TASK 4: Handle button response messages
         let messageText = null;
-
+        let buttonResponse = null;
+        
         if (msg.message) {
-          if (msg.message.conversation) {
+          // Check for button response first
+          if (msg.message.buttonsResponseMessage) {
+            const buttonMsg = msg.message.buttonsResponseMessage;
+            buttonResponse = {
+              selectedButtonId: buttonMsg.selectedButtonId || buttonMsg.selectedId,
+              selectedButtonText: buttonMsg.selectedButtonText || buttonMsg.selectedDisplayText || null,
+              contextInfo: buttonMsg.contextInfo || null
+            };
+            messageText = buttonResponse.selectedButtonText || `[Button: ${buttonResponse.selectedButtonId}]`;
+            console.log(`[BAILEYS] 🔘 Button response received:`, {
+              buttonId: buttonResponse.selectedButtonId,
+              buttonText: buttonResponse.selectedButtonText,
+              from: sanitizedFromNumber
+            });
+          } else if (msg.message.conversation) {
             messageText = msg.message.conversation;
           } else if (msg.message.extendedTextMessage?.text) {
             messageText = msg.message.extendedTextMessage.text;
@@ -3058,7 +3189,8 @@ async function initializeWhatsApp(agentId, userId = null) {
 
         const timestampIso = new Date(timestampRaw * 1000).toISOString();
 
-        let messageType = 'TEXT';
+        // ✅ TASK 4: Set messageType based on button response or default to TEXT
+        let messageType = buttonResponse ? 'BUTTON_RESPONSE' : 'TEXT';
         // Use messageText (already extracted and validated) as primary source, fallback to textContent
         // messageText is more comprehensive and handles more message types
         let content = messageText && messageText !== '[No message content]' && !messageText.startsWith('[Unknown message type:') 
@@ -3237,6 +3369,59 @@ async function initializeWhatsApp(agentId, userId = null) {
           continue; // Skip to next message
         }
 
+        // ✅ CRITICAL FIX: Check if there's a recent dashboard message for button messages
+        // WhatsApp echoes back button messages as plain text (without button patterns)
+        // This prevents the WhatsApp echo from overwriting the dashboard message with buttons
+        // Check for dashboard messages even if fromMe is false (WhatsApp might not set it correctly)
+        if (content) {
+          // Check if there's a recent dashboard message with source='dashboard' and sender_type='agent'
+          // The dashboard message might have button patterns (*1 Option 1*) that WhatsApp echo doesn't have
+          // Use a wider time window (30 seconds) to catch messages that arrive slightly before/after
+          const widerTimeWindow = 30000; // 30 seconds
+          const widerStart = new Date(new Date(timestampIso).getTime() - widerTimeWindow).toISOString();
+          const widerEnd = new Date(new Date(timestampIso).getTime() + widerTimeWindow).toISOString();
+          
+          const { data: recentDashboardMessage } = await supabaseAdmin
+            .from('message_log')
+            .select('id, message_id, message_text, message, received_at, source, sender_type')
+            .eq('agent_id', agentId)
+            .eq('source', 'dashboard')
+            .eq('sender_type', 'agent')
+            .eq('conversation_id', remoteJid)
+            .eq('sender_phone', sanitizedFromNumber)
+            .gte('received_at', widerStart)
+            .lte('received_at', widerEnd)
+            .order('received_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (recentDashboardMessage) {
+            // Check if the dashboard message text contains this content (button messages have extra text)
+            const dashboardText = (recentDashboardMessage.message_text || recentDashboardMessage.message || '').trim();
+            const echoContent = content.trim();
+            
+            // Match if:
+            // 1. Dashboard message contains the echo content (button messages have extra text)
+            // 2. Echo content contains the first part of dashboard message (for button messages)
+            // 3. They're similar enough (for button messages, echo is just the text part)
+            const dashboardContainsEcho = dashboardText.includes(echoContent);
+            const echoContainsDashboardStart = echoContent.includes(dashboardText.substring(0, Math.min(50, dashboardText.length)));
+            const isSimilar = dashboardText.substring(0, 50) === echoContent.substring(0, 50);
+            
+            if (dashboardContainsEcho || echoContainsDashboardStart || isSimilar) {
+              const timeDiff = Math.abs(new Date(timestampIso).getTime() - new Date(recentDashboardMessage.received_at).getTime());
+              console.log(`[BAILEYS][DB] ⚠️ WhatsApp echo detected for dashboard message: ${messageId}`, {
+                dashboardId: recentDashboardMessage.message_id,
+                timeDiff: `${timeDiff}ms`,
+                dashboardText: dashboardText.substring(0, 100),
+                echoContent: echoContent.substring(0, 100),
+                reason: 'Skipping insert to preserve dashboard message with buttons'
+              });
+              continue; // Skip storing WhatsApp echo - keep the dashboard message with buttons
+            }
+          }
+        }
+
         const dbPayload = {
           message_id: messageId,
           agent_id: agentId, // CRITICAL: Include agent_id
@@ -3251,6 +3436,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           metadata: cleanedMetadata,
           received_at: timestampIso,
           created_at: timestampIso,
+          source: 'whatsapp', // All messages from Baileys are WhatsApp source
         };
 
         try {
@@ -3322,6 +3508,9 @@ async function initializeWhatsApp(agentId, userId = null) {
           mediaUrl,
           mimetype: mediaMimetype || null,
           timestamp: timestampIso,
+          fromMe: fromMe, // Include fromMe flag for webhook
+          // ✅ TASK 4: Include button response data if available
+          buttonResponse: buttonResponse || null,
           metadata: {
             ...cleanedMetadata,
             senderName: senderName,
@@ -3338,25 +3527,52 @@ async function initializeWhatsApp(agentId, userId = null) {
 
         // Forward message if:
         // 1. TEXT message with content (even if it's a placeholder like [Image], [Video], etc.)
-        // 2. AUDIO message with mediaUrl
+        // 2. BUTTON_RESPONSE message (user clicked a button)
+        // 3. AUDIO message with mediaUrl
         // Note: We forward TEXT messages even with placeholder content so webhook can handle all message types
         const shouldForward =
           (messageType === 'TEXT' && content && content.trim().length > 0) ||
+          (messageType === 'BUTTON_RESPONSE' && buttonResponse) ||
           (messageType === 'AUDIO' && Boolean(mediaUrl));
 
         if (shouldForward) {
-          console.log(`[BAILEYS][WEBHOOK] 📤 Forwarding ${messageType} message to webhook:`, {
-            messageId,
-            from: sanitizedFromNumber,
-            to: sanitizedToNumber,
-            senderName: senderName,
-            hasContent: Boolean(content),
-            contentLength: content?.length || 0,
-            hasMediaUrl: Boolean(mediaUrl),
-            contentPreview: content ? content.substring(0, 50) : null,
-            remoteJid: actualSenderJid,
-          });
-          await forwardMessageToWebhook(agentId, webhookPayload);
+          // CRITICAL: Check if this is a duplicate (echo of dashboard message)
+          // Only check for incoming messages (not fromMe) to avoid blocking legitimate outgoing messages
+          let isDuplicate = false;
+          if (!fromMe && content) {
+            isDuplicate = await checkIfRecentDashboardMessage({
+              content: content.trim(),
+              fromNumber: sanitizedFromNumber,
+              timestamp: timestampIso,
+              timeWindow: 5000, // 5 second window
+              agentId: agentId
+            });
+          }
+
+          if (isDuplicate) {
+            console.log(`[BAILEYS][WEBHOOK] ⏭️ Skipping webhook for duplicate dashboard message echo:`, {
+              messageId,
+              from: sanitizedFromNumber,
+              contentPreview: content ? content.substring(0, 50) : null,
+            });
+          } else {
+            // Add source to webhook payload
+            webhookPayload.source = 'whatsapp';
+            
+            console.log(`[BAILEYS][WEBHOOK] 📤 Forwarding ${messageType} message to webhook:`, {
+              messageId,
+              from: sanitizedFromNumber,
+              to: sanitizedToNumber,
+              senderName: senderName,
+              source: 'whatsapp',
+              hasContent: Boolean(content),
+              contentLength: content?.length || 0,
+              hasMediaUrl: Boolean(mediaUrl),
+              contentPreview: content ? content.substring(0, 50) : null,
+              remoteJid: actualSenderJid,
+            });
+            await forwardMessageToWebhook(agentId, webhookPayload);
+          }
         } else {
           console.log(`[BAILEYS] ⚠️ Skipping webhook forwarding:`, {
             messageId,
@@ -3881,8 +4097,23 @@ async function getWhatsAppStatus(agentId) {
         response.status = 'connected';
         response.qr_code = null;
       } else if (session.qrCode) {
-        response.status = 'qr_pending';
-        response.qr_code = session.qrCode;
+        // CRITICAL: Check if QR is expired before returning it
+        if (session.qrGeneratedAt) {
+          const qrAge = Date.now() - session.qrGeneratedAt;
+          if (qrAge > QR_EXPIRATION_MS) {
+            console.log(`[BAILEYS] ⚠️ QR in memory is expired (${Math.round(qrAge/1000)}s old), clearing`);
+            session.qrCode = null;
+            session.qrGeneratedAt = null;
+            response.status = 'disconnected';
+            response.qr_code = null;
+          } else {
+            response.status = 'qr_pending';
+            response.qr_code = session.qrCode;
+          }
+        } else {
+          response.status = 'qr_pending';
+          response.qr_code = session.qrCode;
+        }
       } else if (session.connectionState) {
         response.status = session.connectionState;
       }
@@ -3925,8 +4156,31 @@ async function getWhatsAppStatus(agentId) {
             response.status = 'conflict';
           }
         } else if (data.qr_code) {
-          response.qr_code = data.qr_code;
-          response.status = 'qr_pending';
+          // CRITICAL: Check if database QR is expired
+          const { data: qrData } = await supabaseAdmin
+            .from('whatsapp_sessions')
+            .select('qr_generated_at')
+            .eq('agent_id', agentId)
+            .maybeSingle();
+          
+          if (qrData?.qr_generated_at) {
+            const qrAge = Date.now() - new Date(qrData.qr_generated_at).getTime();
+            if (qrAge > QR_EXPIRATION_MS) {
+              console.log(`[BAILEYS] ⚠️ QR in database is expired (${Math.round(qrAge/1000)}s old), clearing`);
+              await supabaseAdmin
+                .from('whatsapp_sessions')
+                .update({ qr_code: null, status: 'disconnected' })
+                .eq('agent_id', agentId);
+              response.status = 'disconnected';
+              response.qr_code = null;
+            } else {
+              response.qr_code = data.qr_code;
+              response.status = 'qr_pending';
+            }
+          } else {
+            response.qr_code = data.qr_code;
+            response.status = 'qr_pending';
+          }
         } else if (data.status) {
           response.status = data.status;
           // If status is conflict, ensure is_active is false
@@ -3949,6 +4203,22 @@ async function getWhatsAppStatus(agentId) {
       response.message = 'No active WhatsApp session';
       response.source = 'fallback';
     }
+    
+    // CRITICAL: Add detailed QR state logging
+    if (response.status === 'qr_pending') {
+      const session = activeSessions.get(agentId);
+      const qrGenTime = qrGenerationTracker.get(agentId);
+      console.log(`[BAILEYS] 📊 QR State Check:`, {
+        agentId: agentId.substring(0, 8) + '...',
+        hasQRInMemory: !!session?.qrCode,
+        hasQRInDatabase: !!data?.qr_code,
+        qrCodeInResponse: !!response.qr_code,
+        qrGeneratedAt: session?.qrGeneratedAt ? new Date(session.qrGeneratedAt).toISOString() : null,
+        cooldownRemaining: qrGenTime ? Math.max(0, Math.round((120000 - (Date.now() - qrGenTime)) / 1000)) + 's' : 'none',
+        dbStatus: data?.status,
+        socketState: session?.socket?.ws?.readyState
+      });
+    }
 
     return response;
   } catch (error) {
@@ -3970,17 +4240,119 @@ async function getWhatsAppStatus(agentId) {
 }
 
 // Send message
-async function sendMessage(agentId, to, message) {
-    const session = activeSessions.get(agentId);
+/**
+ * ✅ TASK 2: Send message with button support
+ * @param {string} agentId - Agent ID
+ * @param {string} to - Recipient phone number
+ * @param {string|object} message - Plain text string or button message object
+ * @param {boolean} isButtonMessage - Whether message is a button message (optional, auto-detected)
+ * @returns {Promise<void>}
+ */
+async function sendMessage(agentId, to, message, isButtonMessage = false) {
+  const session = activeSessions.get(agentId);
   
   if (!session || !session.isConnected) {
     throw new Error('WhatsApp not connected');
   }
   
   const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-  await session.socket.sendMessage(jid, { text: message });
   
-  console.log(`[BAILEYS] ✅ Message sent to ${to}`);
+  // ✅ TASK 2: Handle button messages
+  if (isButtonMessage || (message && typeof message === 'object' && message.buttons)) {
+    // Button message format
+    const buttonMessage = typeof message === 'object' ? message : JSON.parse(message);
+    
+    if (!buttonMessage.text || !Array.isArray(buttonMessage.buttons) || buttonMessage.buttons.length === 0) {
+      throw new Error('Invalid button message format. Must have text and buttons array.');
+    }
+    
+    // ✅ FIX: Use Baileys buttonsMessage format (the format that actually works)
+    // Based on Baileys GitHub examples and documentation, the working format is:
+    // { text, footer, buttons: [{ buttonId, buttonText: { displayText }, type: 1 }], headerType: 1 }
+    // This is the standard format that Baileys supports, even if WhatsApp has restrictions
+    
+    const baileysButtons = buttonMessage.buttons.slice(0, 3).map((btn, index) => {
+      const buttonText = btn.text.substring(0, 20); // Max 20 chars per WhatsApp
+      const buttonId = btn.id || `btn_${index + 1}`;
+      
+      return {
+        buttonId: buttonId,
+        buttonText: { 
+          displayText: buttonText
+        },
+        type: 1 // REPLY button type (1 = quick reply button)
+      };
+    });
+    
+    // Build buttonsMessage in the format Baileys expects (from official examples)
+    const baileysMessage = {
+      text: buttonMessage.text,
+      buttons: baileysButtons,
+      headerType: 1 // TEXT header type
+    };
+    
+    // Add optional footer if provided
+    if (buttonMessage.footer) {
+      baileysMessage.footer = buttonMessage.footer.substring(0, 60);
+    }
+    
+    console.log(`[BAILEYS] 📤 Sending buttonsMessage to ${to}`, {
+      textLength: buttonMessage.text.length,
+      buttonCount: baileysButtons.length,
+      buttonIds: baileysButtons.map(b => b.buttonId),
+      buttonTexts: baileysButtons.map(b => b.buttonText.displayText),
+      hasFooter: !!buttonMessage.footer,
+      jid: jid,
+      messageFormat: JSON.stringify(baileysMessage, null, 2)
+    });
+    
+    try {
+      const result = await session.socket.sendMessage(jid, baileysMessage);
+      console.log(`[BAILEYS] ✅ buttonsMessage sent successfully to ${to}`, {
+        messageId: result?.key?.id,
+        status: result?.status,
+        hasButtons: baileysButtons.length > 0
+      });
+    } catch (sendError) {
+      console.error(`[BAILEYS] ❌ Failed to send buttonsMessage:`, sendError.message);
+      console.error(`[BAILEYS] Error stack:`, sendError.stack);
+      
+      // Log full error details for debugging
+      const errorDetails = {
+        message: sendError.message,
+        name: sendError.name,
+        code: sendError.code,
+        status: sendError.status,
+        statusCode: sendError.statusCode
+      };
+      
+      if (sendError.response) {
+        errorDetails.response = sendError.response;
+      }
+      if (sendError.data) {
+        errorDetails.data = sendError.data;
+      }
+      
+      console.error(`[BAILEYS] Error details:`, JSON.stringify(errorDetails, null, 2));
+      
+      // Final fallback: plain text
+      console.log(`[BAILEYS] ⚠️ Falling back to plain text message`);
+      try {
+        await session.socket.sendMessage(jid, { text: buttonMessage.text });
+        console.log(`[BAILEYS] ✅ Plain text fallback sent to ${to}`);
+      } catch (textError) {
+        console.error(`[BAILEYS] ❌ Even plain text failed:`, textError.message);
+        throw textError;
+      }
+      
+      throw new Error(`buttonsMessage failed: ${sendError.message}. Sent as plain text instead.`);
+    }
+  } else {
+    // Plain text message
+    const textMessage = typeof message === 'string' ? message : String(message);
+    await session.socket.sendMessage(jid, { text: textMessage });
+    console.log(`[BAILEYS] ✅ Text message sent to ${to}`);
+  }
 }
 
 // Cleanup expired QR codes
