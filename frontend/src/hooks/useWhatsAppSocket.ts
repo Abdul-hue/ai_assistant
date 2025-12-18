@@ -128,18 +128,19 @@ export function useWhatsAppSocket(
   });
   
   const socketRef = useRef<Socket | null>(null);
+  // Store options in a ref to avoid re-creating the socket on every render
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+  
   const queryClient = useQueryClient();
   const { toast } = useToast();
   
   // Connect to Socket.IO
   useEffect(() => {
     if (!agentId || !userId) {
-      setState(prev => ({
-        ...prev,
-        status: 'error',
-        message: 'Agent ID or User ID not provided',
-        error: 'Missing required parameters'
-      }));
+      // Don't set error state - this is often a transient condition while data loads
+      // Just return early and wait for valid params
+      console.log('[WhatsApp Socket] Waiting for agentId and userId...', { agentId: !!agentId, userId: !!userId });
       return;
     }
     
@@ -194,7 +195,7 @@ export function useWhatsAppSocket(
           lastUpdate: data.timestamp
         }));
         
-        options.onQRCode?.(data.qr);
+        optionsRef.current.onQRCode?.(data.qr);
       }
     });
     
@@ -251,7 +252,7 @@ export function useWhatsAppSocket(
           description: data.message || 'WhatsApp connected successfully!',
         });
         
-        options.onConnected?.(data.phoneNumber || null);
+        optionsRef.current.onConnected?.(data.phoneNumber || null);
       }
     });
     
@@ -272,7 +273,7 @@ export function useWhatsAppSocket(
         // Invalidate queries
         queryClient.invalidateQueries({ queryKey: ['agent-details', agentId] });
         
-        options.onDisconnected?.(data.reason || null);
+        optionsRef.current.onDisconnected?.(data.reason || null);
       }
     });
     
@@ -297,7 +298,7 @@ export function useWhatsAppSocket(
         // Invalidate queries
         queryClient.invalidateQueries({ queryKey: ['agent-details', agentId] });
         
-        options.onReconnected?.();
+        optionsRef.current.onReconnected?.();
       }
     });
     
@@ -344,7 +345,7 @@ export function useWhatsAppSocket(
           variant: 'destructive',
         });
         
-        options.onError?.(data.message);
+        optionsRef.current.onError?.(data.message);
       }
     });
     
@@ -358,7 +359,7 @@ export function useWhatsAppSocket(
         error: data.message
       }));
       
-      options.onError?.(data.message);
+      optionsRef.current.onError?.(data.message);
     });
     
     // Cleanup
@@ -380,7 +381,7 @@ export function useWhatsAppSocket(
         socketRef.current = null;
       }
     };
-  }, [agentId, userId, queryClient, toast, options]);
+  }, [agentId, userId, queryClient, toast]); // Note: options is stored in ref to avoid infinite loops
   
   // Manual reconnect function
   const reconnect = useCallback(async () => {

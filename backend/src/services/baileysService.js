@@ -746,9 +746,9 @@ function startHealthPingMonitor(sock, agentId) {
         console.log(`[HEALTH] ${agentId.substring(0, 8)}... Session not connected, stopping health check`);
         clearInterval(healthInterval);
         healthCheckIntervals.delete(agentId);
-        return;
-      }
-      
+      return;
+    }
+    
       const startTime = Date.now();
       
       // Send a lightweight query to test connection
@@ -779,7 +779,7 @@ function startHealthPingMonitor(sock, agentId) {
         // Ignore DB errors for health check
       }
       
-    } catch (error) {
+        } catch (error) {
       console.error(`[HEALTH] ${agentId.substring(0, 8)}... ❌ Health check FAILED:`, error.message);
       
       const session = activeSessions.get(agentId);
@@ -2229,7 +2229,7 @@ async function initializeWhatsApp(agentId, userId = null) {
         // QR should only be generated when there are NO valid credentials
         if (state.creds?.me?.id && state.creds?.registered !== false) {
           console.log(`[BAILEYS] ⚠️ QR ignored - have valid paired credentials, expecting direct connection`);
-          return;
+            return;
         }
         
         if (session) {
@@ -2270,8 +2270,8 @@ async function initializeWhatsApp(agentId, userId = null) {
             if (io) {
               io.to(`whatsapp:${agentId}`).emit('whatsapp:qr', {
                 agentId,
-                qr,
-                attempt: qrAttempt,
+            qr,
+            attempt: qrAttempt,
                 timestamp: new Date().toISOString()
               });
               console.log(`[BAILEYS] 📡 QR emitted via Socket.IO to whatsapp:${agentId.substring(0, 8)}...`);
@@ -3053,32 +3053,56 @@ async function initializeWhatsApp(agentId, userId = null) {
 
         // ✅ CRITICAL: Message routing logic for dashboard vs WhatsApp
         // 
-        // Dashboard flow (SAVE to DB + CALL webhook):
-        // - Agent sends message to its OWN number via dashboard
-        // - This is: fromMe=true AND contactNumber === agentNumber
-        // - source = 'dashboard' (shown in agent chat UI)
+        // Self-conversations (contact === agent) can be EITHER dashboard OR whatsapp:
+        // - Dashboard: User initiated conversation via Dashboard UI
+        // - WhatsApp: User initiated conversation via WhatsApp app directly
         //
-        // Incoming WhatsApp messages (SAVE to DB + CALL webhook with source=whatsapp):
-        // - Another contact sends message TO the agent
-        // - This is: fromMe=false (ANY contact can send to agent)
-        // - source = 'whatsapp' (NOT shown in agent chat UI)
+        // To determine which: Check the most recent OUTGOING message in this self-conversation
+        // - If last outgoing message was source='dashboard' → this is a dashboard conversation
+        // - Otherwise → this is a WhatsApp app conversation
         //
-        // Outgoing to OTHER contacts (SAVE to DB + CALL webhook with source=whatsapp):
-        // - Agent sends message to family/friends/work contacts on WhatsApp
-        // - This is: fromMe=true AND contactNumber !== agentNumber
-        // - source = 'whatsapp' (NOT shown in agent chat UI)
+        // Non-self conversations (contact !== agent) are always 'whatsapp'
         //
-        const isDashboardMessage = fromMe && contactNumber && agentNumber && contactNumber === agentNumber;
-        const isIncomingWhatsApp = !fromMe; // Any incoming message from any contact
-        const isOutgoingToOther = fromMe && contactNumber && agentNumber && contactNumber !== agentNumber;
+        const isSelfConversation = contactNumber && agentNumber && contactNumber === agentNumber;
+        
+        // For self-conversations, determine if this is dashboard or whatsapp context
+        let isDashboardConversation = false;
+        if (isSelfConversation) {
+          try {
+            // Check the most recent outgoing message to determine conversation context
+            const { data: recentOutgoing } = await supabaseAdmin
+              .from('message_log')
+              .select('source')
+              .eq('agent_id', agentId)
+              .eq('is_from_me', true)
+              .or(`sender_phone.eq.${agentNumber},contact_id.eq.${agentNumber}`)
+              .order('received_at', { ascending: false })
+              .limit(1);
+            
+            // If recent outgoing was from dashboard, this is a dashboard conversation
+            isDashboardConversation = recentOutgoing?.[0]?.source === 'dashboard';
+          } catch (err) {
+            console.log(`[BAILEYS] ⚠️ Could not check conversation context: ${err.message}`);
+            // Default to whatsapp if we can't determine
+            isDashboardConversation = false;
+          }
+        }
+        
+        const isDashboardMessage = isSelfConversation && isDashboardConversation;
+        const isIncomingWhatsApp = !fromMe && !isDashboardMessage;
+        const isOutgoingToOther = fromMe && !isSelfConversation;
 
         // Log what type of message we're processing
         if (isDashboardMessage) {
-          console.log(`[BAILEYS] 📊 Processing DASHBOARD message (agent to self): ${agentNumber}`);
+          const direction = fromMe ? 'outgoing (user→bot)' : 'incoming (bot→user)';
+          console.log(`[BAILEYS] 📊 Processing DASHBOARD message (${direction}): self-conversation on ${agentNumber}`);
+        } else if (isSelfConversation && !isDashboardConversation) {
+          const direction = fromMe ? 'outgoing' : 'incoming (bot→user)';
+          console.log(`[BAILEYS] 📱 Processing WHATSAPP self-chat (${direction}): ${agentNumber} (not from dashboard)`);
         } else if (isIncomingWhatsApp) {
           console.log(`[BAILEYS] 📱 Processing INCOMING WhatsApp message from: ${contactNumber} to agent: ${agentNumber}`);
         } else if (isOutgoingToOther) {
-          console.log(`[BAILEYS] 📤 Processing OUTGOING message to contact: ${contactNumber} (no webhook)`);
+          console.log(`[BAILEYS] 📤 Processing OUTGOING WhatsApp message to contact: ${contactNumber}`);
         }
 
         // ✅ TASK 4: Handle button response messages
@@ -3879,11 +3903,11 @@ async function safeInitializeWhatsApp(agentId, userId = null) {
     // If lock is less than 90 seconds old, it's still active
     if (typeof lockValue === 'number' && lockAge < 90000) {
       console.log(`[BAILEYS] ⏳ Connection already in progress (${Math.round(lockAge/1000)}s ago)`);
-      return {
-        success: false,
-        status: 'connecting',
-        error: 'Connection already in progress'
-      };
+    return {
+      success: false,
+      status: 'connecting',
+      error: 'Connection already in progress'
+    };
     }
     // Otherwise, lock is stale and will be cleared by initializeWhatsApp
   }
@@ -3981,9 +4005,9 @@ async function safeInitializeWhatsApp(agentId, userId = null) {
 
   // Note: Lock is now managed inside initializeWhatsApp to prevent race conditions
   lastConnectionAttempt.set(agentId, now);
-  
+
   // Call initializeWhatsApp directly - it handles its own locking
-  return await initializeWhatsApp(agentId, userId);
+    return await initializeWhatsApp(agentId, userId);
 }
 
 // Disconnect

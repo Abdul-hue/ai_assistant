@@ -467,7 +467,16 @@ interface MessageItemProps {
 }
 
 const MessageItem: React.FC<MessageItemProps> = ({ message, agentName, agentAvatar, onButtonClick }) => {
-  const isUser = message.is_from_me || message.sender_type === 'user';
+  // Determine if this is a user message (outgoing from dashboard)
+  // Check multiple indicators since data may vary:
+  // 1. is_from_me = true or "true" (handle string/boolean)
+  // 2. sender_type = 'user' (user type)
+  // 3. For dashboard messages: if from agent's own number AND outgoing
+  const isFromMe = message.is_from_me === true || message.is_from_me === 'true' || String(message.is_from_me).toLowerCase() === 'true';
+  const isUser = isFromMe || message.sender_type === 'user';
+  
+  // Debug logging (remove in production)
+  // console.log('[MessageItem] Message:', { id: message.id, is_from_me: message.is_from_me, sender_type: message.sender_type, isUser, message: message.message?.substring(0, 30) });
   
   // Parse buttons for agent messages
   const buttons = React.useMemo(() => {
@@ -538,8 +547,8 @@ const MessageItem: React.FC<MessageItemProps> = ({ message, agentName, agentAvat
       </div>
 
       {/* Message Content */}
-      <div className={cn("flex-1 space-y-1", isUser ? "items-end" : "items-start")}>
-        <div className="flex items-center gap-2 mb-1">
+      <div className={cn("flex-1 flex flex-col", isUser ? "items-end" : "items-start")}>
+        <div className={cn("flex items-center gap-2 mb-1", isUser ? "flex-row-reverse" : "flex-row")}>
           <span className="text-xs font-medium text-gray-400">
             {isUser ? 'You' : agentName}
           </span>
@@ -550,10 +559,10 @@ const MessageItem: React.FC<MessageItemProps> = ({ message, agentName, agentAvat
         
         <div
           className={cn(
-            "rounded-2xl px-4 py-3 max-w-[85%] inline-block",
+            "rounded-2xl px-4 py-3 max-w-[85%]",
             isUser
-              ? "bg-violet-600 text-white rounded-tr-md"
-              : "bg-[#1a1a1a] text-gray-100 border border-white/5 rounded-tl-md"
+              ? "bg-gradient-to-r from-violet-600 to-purple-600 text-white rounded-tr-sm"
+              : "bg-[#1a1a1a] text-gray-100 border border-white/5 rounded-tl-sm"
           )}
         >
           <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">
@@ -580,7 +589,7 @@ const MessageItem: React.FC<MessageItemProps> = ({ message, agentName, agentAvat
         </div>
         
         {isUser && (
-          <div className="flex items-center gap-1 mt-1">
+          <div className="flex items-center gap-1 mt-1 justify-end">
             <StatusIcon />
           </div>
         )}

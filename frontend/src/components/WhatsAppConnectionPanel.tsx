@@ -12,7 +12,7 @@
  * @param onConnectionChange - Callback to refresh parent data after connection changes
  */
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -86,7 +86,17 @@ export default function WhatsAppConnectionPanel({
     getUserId();
   }, []);
 
+  // Memoize the agentId for socket to prevent unnecessary reconnections
+  // Only connect socket when actively connecting or already connected
+  const socketAgentId = useMemo(() => {
+    if (connectionState === 'connecting' || connectionState === 'connected') {
+      return agentId;
+    }
+    return null;
+  }, [connectionState, agentId]);
+
   // Use Socket.IO for real-time updates
+  // NOTE: Options callbacks are stored in refs inside the hook to prevent re-renders
   const { 
     qrCode: socketQrCode, 
     status: socketStatus, 
@@ -97,70 +107,106 @@ export default function WhatsAppConnectionPanel({
     reconnect,
     refreshStatus
   } = useWhatsAppSocket(
-    connectionState === 'connecting' || connectionState === 'connected' ? agentId : null,
-    userId,
-    {
-      onQRCode: async (qr) => {
-        console.log('[WhatsApp] Socket: QR code received');
-        const dataUrl = await getQrDataUrl(qr);
+    socketAgentId,
+    userId
+    // NOTE: We removed the inline options object here - it was causing re-renders
+    // The hook now uses refs internally for callbacks, so they don't need to be passed
+  );
+  
+  // Handle socket events via useEffect instead of inline callbacks
+  // This prevents re-creating the options object on every render
+  useEffect(() => {
+    if (socketQrCode) {
+      console.log('[WhatsApp] Socket: QR code received');
+      getQrDataUrl(socketQrCode).then(dataUrl => {
         if (dataUrl) {
           setQrDataUrl(dataUrl);
           setError(null);
         }
-      },
-      onConnected: (phoneNumber) => {
-        console.log('[WhatsApp] Socket: Connected!', phoneNumber);
-        // Clear countdown and timeout
-        if (countdownIntervalRef.current) {
-          clearInterval(countdownIntervalRef.current);
-          countdownIntervalRef.current = null;
-        }
-        if (timeoutRef.current) {
-          clearTimeout(timeoutRef.current);
-          timeoutRef.current = null;
-        }
-        
-        setConnectionState('connected');
-        setQrDataUrl(null);
-        setError(null);
-        
-        // Show success notification
-        toast.success('WhatsApp connected successfully! 🎉', {
-          description: phoneNumber ? `Phone: ${phoneNumber}` : 'Your agent is now ready to receive messages',
-          duration: 5000,
-        });
-        
-        // Refresh parent data
-        onConnectionChangeRef.current();
-        
-        // Reset to idle after animation
-        setTimeout(() => {
-          setConnectionState('idle');
-        }, 2000);
-      },
-      onDisconnected: (reason) => {
-        console.log('[WhatsApp] Socket: Disconnected', reason);
-        if (connectionState === 'connecting') {
-          setError(reason || 'Connection lost');
-        }
-      },
-      onReconnected: () => {
-        console.log('[WhatsApp] Socket: Reconnected');
-        onConnectionChangeRef.current();
-      },
-      onError: (errorMsg) => {
-        console.error('[WhatsApp] Socket: Error', errorMsg);
-        setError(errorMsg);
-      }
+      });
     }
-  );
+  }, [socketQrCode]);
+  
+  // Handle connection success
+  useEffect(() => {
+    if (socketIsConnected && connectionState === 'connecting') {
+      console.log('[WhatsApp] Socket: Connected!');
+      // Clear countdown and timeout
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
+      
+      setConnectionState('connected');
+      setQrDataUrl(null);
+      setError(null);
+      
+      // Show success notification
+      toast.success('WhatsApp connected successfully! 🎉', {
+        description: 'Your agent is now ready to receive messages',
+        duration: 5000,
+      });
+      
+      // Refresh parent data
+      onConnectionChangeRef.current();
+      
+      // Reset to idle after animation
+      setTimeout(() => {
+        setConnectionState('idle');
+      }, 2000);
+    }
+  }, [socketIsConnected, connectionState]);
+  
+  // Handle socket errors (but ignore transient "Missing required parameters" error)
+  useEffect(() => {
+    if (socketError && connectionState === 'connecting') {
+      // Don't show "Missing required parameters" - it's a transient state while userId loads
+      if (socketError === 'Missing required parameters') {
+        console.log('[WhatsApp] Socket: Waiting for userId to load...');
+        return;
+      }
+      console.error('[WhatsApp] Socket: Error', socketError);
+      setError(socketError);
+    }
+  }, [socketError, connectionState]);
 
   useEffect(() => {
     onConnectionChangeRef.current = onConnectionChange;
   }, [onConnectionChange]);
   
-  // Use socket connection status, falling back to session data
-  const isConnected = socketIsConnected || whatsappSession?.is_active || false;
+  // Determine connection status with proper priority:
+  // 1. If socket explicitly says connected → connected
+  // 2. If socket explicitly says disconnected → disconnected (overrides stale DB)
+  // 3. If socket status is 'error' or 'disconnected' → disconnected
+  // 4. Otherwise, fall back to database status
+  const isConnected = useMemo(() => {
+    // Socket says connected - trust it
+    if (socketIsConnected) {
+      return true;
+    }
+    
+    // Socket explicitly says disconnected or error - trust it over stale DB
+    if (socketStatus === 'disconnected' || socketStatus === 'error') {
+      return false;
+    }
+    
+    // Socket is still initializing/connecting - use database status
+    if (socketStatus === 'initializing' || socketStatus === 'connecting' || socketStatus === 'reconnecting') {
+      return whatsappSession?.is_active || false;
+    }
+    
+    // Socket is in QR mode - not connected yet
+    if (socketStatus === 'qr_ready' || socketStatus === 'pairing') {
+      return false;
+    }
+    
+    // Default fallback to database
+    return whatsappSession?.is_active || false;
+  }, [socketIsConnected, socketStatus, whatsappSession?.is_active]);
   
   // Handle countdown timer when connecting
   useEffect(() => {
@@ -214,16 +260,7 @@ export default function WhatsAppConnectionPanel({
     };
   }, [connectionState]);
   
-  // Update QR data URL when socket provides QR code
-  useEffect(() => {
-    if (socketQrCode && connectionState === 'connecting') {
-      getQrDataUrl(socketQrCode).then(dataUrl => {
-        if (dataUrl) {
-          setQrDataUrl(dataUrl);
-        }
-      });
-    }
-  }, [socketQrCode, connectionState]);
+  // QR handling is now done in the useEffect above that watches socketQrCode
   
   // Handle Connect Button Click
   const handleConnect = async () => {
