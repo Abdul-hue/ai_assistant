@@ -3,9 +3,9 @@
  * 
  * Manages WhatsApp connection lifecycle for an agent:
  * - Displays connection status
- * - Handles QR code generation and polling
+ * - Real-time QR code via Socket.IO
  * - Manages connect/disconnect operations
- * - Real-time status updates via polling
+ * - Real-time status updates via Socket.IO (no polling)
  * 
  * @param agentId - Agent UUID
  * @param whatsappSession - Current WhatsApp session data (if exists)
@@ -28,10 +28,11 @@ import {
   AlertDialogTitle 
 } from '@/components/ui/alert-dialog';
 import { useConnectWhatsApp, useDisconnectWhatsApp } from '@/hooks';
+import { useWhatsAppSocket } from '@/hooks/useWhatsAppSocket';
 import type { WhatsAppSession } from '@/types/agent.types';
 import { supabase } from '@/integrations/supabase/client';
 import { formatDistanceToNow } from 'date-fns';
-import { Smartphone, QrCode, Loader2, AlertCircle, CheckCircle2, XCircle } from 'lucide-react';
+import { Smartphone, QrCode, Loader2, AlertCircle, CheckCircle2, XCircle, RefreshCw, Wifi, WifiOff } from 'lucide-react';
 import { toast } from 'sonner';
 import QRCode from 'qrcode';
 
@@ -44,8 +45,6 @@ interface WhatsAppConnectionPanelProps {
 
 type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnecting';
 
-import { API_URL } from '@/config';
-
 async function getQrDataUrl(value: string | null): Promise<string | null> {
   if (!value) return null;
   if (value.startsWith('data:image')) return value;
@@ -57,51 +56,6 @@ async function getQrDataUrl(value: string | null): Promise<string | null> {
   }
 }
 
-/**
- * Get Supabase auth token for API requests
- * 🔧 FIX: Fetch from backend endpoint to ensure token is available even after page refresh
- */
-async function getAuthToken(): Promise<string | null> {
-  try {
-    // First, try to get from Supabase client (fast path if session is in memory)
-    const { data: { session } } = await supabase.auth.getSession();
-    if (session?.access_token) {
-      return session.access_token;
-    }
-
-    // Fallback: Fetch from backend endpoint (works even after page refresh)
-    try {
-      const { API_URL } = await import('@/config');
-      const response = await fetch(`${API_URL}/api/auth/session-token`, {
-        credentials: 'include', // Send HttpOnly cookies
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        if (data.access_token) {
-          // Optionally restore the session in Supabase client for future use
-          await supabase.auth.setSession({
-            access_token: data.access_token,
-            refresh_token: data.refresh_token || '',
-          });
-          return data.access_token;
-        }
-      } else if (response.status === 404) {
-        // Endpoint not found - server might need restart, but continue anyway
-        console.warn('⚠️  /api/auth/session-token endpoint not found (404). Backend may need restart.');
-      }
-    } catch (fetchError) {
-      // Network error or endpoint not available - non-critical, continue
-      console.warn('⚠️  Failed to fetch session token from backend:', fetchError);
-    }
-
-    return null;
-  } catch (error) {
-    console.error('Failed to get auth token:', error);
-    return null;
-  }
-}
-
 export default function WhatsAppConnectionPanel({ 
   agentId, 
   whatsappSession, 
@@ -109,183 +63,146 @@ export default function WhatsAppConnectionPanel({
   autoConnect = false,
 }: WhatsAppConnectionPanelProps) {
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
-  const [qrCode, setQrCode] = useState<string | null>(null);
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showDisconnectDialog, setShowDisconnectDialog] = useState(false);
   const [countdown, setCountdown] = useState(60);
+  const [userId, setUserId] = useState<string | null>(null);
   
   const connectMutation = useConnectWhatsApp();
   const disconnectMutation = useDisconnectWhatsApp();
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const timeoutRef = useRef<NodeJS.Timeout | null>(null);
   const onConnectionChangeRef = useRef(onConnectionChange);
+
+  // Get user ID on mount
+  useEffect(() => {
+    const getUserId = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.user?.id) {
+        setUserId(session.user.id);
+      }
+    };
+    getUserId();
+  }, []);
+
+  // Use Socket.IO for real-time updates
+  const { 
+    qrCode: socketQrCode, 
+    status: socketStatus, 
+    isConnected: socketIsConnected,
+    message: socketMessage,
+    error: socketError,
+    socketConnected,
+    reconnect,
+    refreshStatus
+  } = useWhatsAppSocket(
+    connectionState === 'connecting' || connectionState === 'connected' ? agentId : null,
+    userId,
+    {
+      onQRCode: async (qr) => {
+        console.log('[WhatsApp] Socket: QR code received');
+        const dataUrl = await getQrDataUrl(qr);
+        if (dataUrl) {
+          setQrDataUrl(dataUrl);
+          setError(null);
+        }
+      },
+      onConnected: (phoneNumber) => {
+        console.log('[WhatsApp] Socket: Connected!', phoneNumber);
+        // Clear countdown and timeout
+        if (countdownIntervalRef.current) {
+          clearInterval(countdownIntervalRef.current);
+          countdownIntervalRef.current = null;
+        }
+        if (timeoutRef.current) {
+          clearTimeout(timeoutRef.current);
+          timeoutRef.current = null;
+        }
+        
+        setConnectionState('connected');
+        setQrDataUrl(null);
+        setError(null);
+        
+        // Show success notification
+        toast.success('WhatsApp connected successfully! 🎉', {
+          description: phoneNumber ? `Phone: ${phoneNumber}` : 'Your agent is now ready to receive messages',
+          duration: 5000,
+        });
+        
+        // Refresh parent data
+        onConnectionChangeRef.current();
+        
+        // Reset to idle after animation
+        setTimeout(() => {
+          setConnectionState('idle');
+        }, 2000);
+      },
+      onDisconnected: (reason) => {
+        console.log('[WhatsApp] Socket: Disconnected', reason);
+        if (connectionState === 'connecting') {
+          setError(reason || 'Connection lost');
+        }
+      },
+      onReconnected: () => {
+        console.log('[WhatsApp] Socket: Reconnected');
+        onConnectionChangeRef.current();
+      },
+      onError: (errorMsg) => {
+        console.error('[WhatsApp] Socket: Error', errorMsg);
+        setError(errorMsg);
+      }
+    }
+  );
 
   useEffect(() => {
     onConnectionChangeRef.current = onConnectionChange;
   }, [onConnectionChange]);
   
-  const isConnected = whatsappSession?.is_active || false;
+  // Use socket connection status, falling back to session data
+  const isConnected = socketIsConnected || whatsappSession?.is_active || false;
   
-  // QR Code Polling Effect
+  // Handle countdown timer when connecting
   useEffect(() => {
     if (connectionState !== 'connecting') {
+      // Clear timers when not connecting
+      if (countdownIntervalRef.current) {
+        clearInterval(countdownIntervalRef.current);
+        countdownIntervalRef.current = null;
+      }
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+        timeoutRef.current = null;
+      }
       return;
     }
 
-    if (pollIntervalRef.current) {
-      console.log('[WhatsApp] Poll already active, skipping duplicate start');
-      return;
-    }
-
-      console.log('[WhatsApp] Starting QR code polling for agent:', agentId);
-      
-      // Reset countdown
-      setCountdown(60);
-      
-      // Start countdown timer
+    // Start countdown
+    setCountdown(60);
+    
     countdownIntervalRef.current = setInterval(() => {
-        setCountdown(prev => {
-          if (prev <= 1) return 0;
-          return prev - 1;
-        });
-      }, 1000);
-      
-      // Start polling for connection status
-    pollIntervalRef.current = setInterval(async () => {
-        try {
-          // Get auth token for request
-          const token = await getAuthToken();
-          
-          const headers: Record<string, string> = {};
-          if (token) {
-            headers['Authorization'] = `Bearer ${token}`;
-          }
-          
-          const response = await fetch(`${API_URL}/api/agents/${agentId}/whatsapp-status`, {
-            credentials: 'include', // SECURITY: Send HttpOnly cookies
-            headers,
-          });
-          
-          if (!response.ok) {
-            console.error('[WhatsApp] Status check failed:', response.status);
-            return; // Don't stop polling, just log error
-          }
-          
-          const statusData = await response.json();
-          console.log('[WhatsApp] Status update:', JSON.stringify(statusData, null, 2));
-          
-          // Update QR code if available
-          if (statusData.qr_code) {
-            console.log('[WhatsApp] QR code received, displaying...');
-            const normalizedQr = await getQrDataUrl(statusData.qr_code);
-            if (normalizedQr) {
-              setQrCode(normalizedQr);
-              setError(null);
-            } else {
-              console.warn('[WhatsApp] Unable to render QR code (conversion failed)');
-            }
-          }
-          
-          // ✅ CRITICAL FIX: Only consider connected when ALL conditions are met
-          // - Must have is_active === true (not just status field)
-          // - Must have phone_number (actual connection established)
-          // - Status should be 'connected' or 'authenticated'
-          // 
-          // PROBLEM: Old logic used OR which treated historical data as active connection
-          // SOLUTION: Use AND to require active connection with phone number
-          const isActuallyConnected = (
-            statusData.is_active === true &&
-            statusData.phone_number &&
-            (statusData.status === 'connected' || statusData.status === 'authenticated')
-          );
-          
-          const isWaitingForScan = (
-            statusData.qr_code &&
-            statusData.status === 'qr_pending'
-          );
-          
-          console.log('[WhatsApp] Connection check:', {
-            is_active: statusData.is_active,
-            status: statusData.status,
-            phone_number: statusData.phone_number,
-            has_qr: !!statusData.qr_code,
-            isActuallyConnected,
-            isWaitingForScan
-          });
-          
-          if (isActuallyConnected) {
-            console.log('[WhatsApp] ✅ CONNECTION DETECTED! Stopping polling...');
-            
-            // Stop all intervals and timeouts IMMEDIATELY
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current);
-            pollIntervalRef.current = null;
-            console.log('[WhatsApp] Cleared poll interval');
-          }
-          if (countdownIntervalRef.current) {
-            clearInterval(countdownIntervalRef.current);
-            countdownIntervalRef.current = null;
-            console.log('[WhatsApp] Cleared countdown interval');
-          }
-          if (timeoutRef.current) {
-            clearTimeout(timeoutRef.current);
-            timeoutRef.current = null;
-            console.log('[WhatsApp] Cleared timeout');
-          }
-            
-            // Update state
-            setConnectionState('connected');
-            setQrCode(null);
-            setError(null);
-            
-            // Show success notification with phone number
-            toast.success('WhatsApp connected successfully! 🎉', {
-              description: statusData.phone_number ? `Phone: ${statusData.phone_number}` : 'Your agent is now ready to receive messages',
-              duration: 5000,
-            });
-            
-            // Refresh parent data to show updated connection
-            console.log('[WhatsApp] Triggering data refresh...');
-          onConnectionChangeRef.current();
-            
-            // Reset to idle after showing success animation for 2 seconds
-            setTimeout(() => {
-              console.log('[WhatsApp] Resetting to idle state');
-              setConnectionState('idle');
-            }, 2000);
-          }
-        } catch (err) {
-          console.error('[WhatsApp] Polling error:', err);
-          // Don't stop polling on individual errors
-        }
-      }, 3000); // Poll every 3 seconds
-      
+      setCountdown(prev => {
+        if (prev <= 1) return 0;
+        return prev - 1;
+      });
+    }, 1000);
+    
     // Timeout after 60 seconds
     timeoutRef.current = setTimeout(() => {
       console.log('[WhatsApp] Connection timeout reached');
       
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = null;
-      }
       if (countdownIntervalRef.current) {
         clearInterval(countdownIntervalRef.current);
         countdownIntervalRef.current = null;
       }
       
       setConnectionState('idle');
-      setQrCode(null);
+      setQrDataUrl(null);
       setError('Connection timeout. QR code expired. Please try again.');
       toast.error('Connection timeout - please try again');
     }, 60000);
     
     return () => {
-      if (pollIntervalRef.current) {
-        console.log('[WhatsApp] Cleaning up polling interval');
-        clearInterval(pollIntervalRef.current);
-        pollIntervalRef.current = null;
-      }
       if (countdownIntervalRef.current) {
         clearInterval(countdownIntervalRef.current);
         countdownIntervalRef.current = null;
@@ -295,30 +212,39 @@ export default function WhatsAppConnectionPanel({
         timeoutRef.current = null;
       }
     };
-  }, [connectionState, agentId]);
+  }, [connectionState]);
+  
+  // Update QR data URL when socket provides QR code
+  useEffect(() => {
+    if (socketQrCode && connectionState === 'connecting') {
+      getQrDataUrl(socketQrCode).then(dataUrl => {
+        if (dataUrl) {
+          setQrDataUrl(dataUrl);
+        }
+      });
+    }
+  }, [socketQrCode, connectionState]);
   
   // Handle Connect Button Click
   const handleConnect = async () => {
     console.log('[WhatsApp] Initiating connection for agent:', agentId);
     setError(null);
+    setQrDataUrl(null);
     setConnectionState('connecting');
     
     try {
       const result = await connectMutation.mutateAsync(agentId);
       console.log('[WhatsApp] Init result:', JSON.stringify(result, null, 2));
-      console.log('[WhatsApp] Init result.success:', result.success);
-      console.log('[WhatsApp] Init result.qrCode:', result.qrCode ? 'HAS QR' : 'NO QR');
-      console.log('[WhatsApp] Init result.error:', result.error);
       
       // If QR code returned immediately, set it
       if (result.qrCode) {
         const normalizedQr = await getQrDataUrl(result.qrCode);
         if (normalizedQr) {
-          setQrCode(normalizedQr);
+          setQrDataUrl(normalizedQr);
         }
       }
       
-      // Polling will handle the rest
+      // Socket.IO will handle real-time updates from here
     } catch (err: any) {
       console.error('[WhatsApp] Connection failed:', err);
       setConnectionState('idle');
@@ -347,11 +273,21 @@ export default function WhatsAppConnectionPanel({
     }
   };
   
+  // Handle manual reconnect
+  const handleReconnect = () => {
+    console.log('[WhatsApp] Manual reconnect requested');
+    reconnect();
+    toast.info('Reconnection initiated...');
+  };
+  
   useEffect(() => {
     if (autoConnect && connectionState === 'idle' && !isConnected) {
       handleConnect();
     }
   }, [autoConnect, connectionState, isConnected]);
+
+  // Determine display QR (from socket or local state)
+  const displayQr = qrDataUrl;
 
   return (
     <Card>
@@ -362,8 +298,15 @@ export default function WhatsAppConnectionPanel({
               <Smartphone className="h-5 w-5" />
               WhatsApp Connection
             </CardTitle>
-            <CardDescription>
+            <CardDescription className="flex items-center gap-2 mt-1">
               Manage your WhatsApp integration
+              {/* Socket connection indicator */}
+              {userId && (
+                <span className={`inline-flex items-center gap-1 text-xs ${socketConnected ? 'text-green-600' : 'text-gray-400'}`}>
+                  {socketConnected ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
+                  {socketConnected ? 'Live' : 'Offline'}
+                </span>
+              )}
             </CardDescription>
           </div>
           {/* Status Badge */}
@@ -382,15 +325,15 @@ export default function WhatsAppConnectionPanel({
       
       <CardContent className="space-y-4">
         {/* Error Display */}
-        {error && (
+        {(error || socketError) && (
           <Alert variant="destructive">
             <AlertCircle className="h-4 w-4" />
-            <AlertDescription>{error}</AlertDescription>
+            <AlertDescription>{error || socketError}</AlertDescription>
           </Alert>
         )}
         
         {/* CONNECTED STATE */}
-        {isConnected && connectionState !== 'disconnecting' && (
+        {isConnected && connectionState !== 'disconnecting' && connectionState !== 'connected' && (
           <div className="space-y-4">
             <div className="p-4 bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded-lg">
               <div className="flex items-center gap-3">
@@ -411,14 +354,25 @@ export default function WhatsAppConnectionPanel({
               </div>
             </div>
             
-            <Button 
-              variant="destructive" 
-              onClick={() => setShowDisconnectDialog(true)}
-              className="w-full"
-              disabled={connectionState === 'disconnecting'}
-            >
-              Disconnect WhatsApp
-            </Button>
+            <div className="flex gap-2">
+              <Button 
+                variant="outline" 
+                onClick={handleReconnect}
+                className="flex-1"
+                size="sm"
+              >
+                <RefreshCw className="h-4 w-4 mr-2" />
+                Reconnect
+              </Button>
+              <Button 
+                variant="destructive" 
+                onClick={() => setShowDisconnectDialog(true)}
+                className="flex-1"
+                disabled={connectionState === 'disconnecting'}
+              >
+                Disconnect
+              </Button>
+            </div>
           </div>
         )}
         
@@ -426,23 +380,40 @@ export default function WhatsAppConnectionPanel({
         {connectionState === 'connecting' && (
           <div className="space-y-4">
             <div className="flex flex-col items-center justify-center p-6 border-2 border-dashed border-primary rounded-lg bg-muted/50">
-              {qrCode ? (
+              {displayQr ? (
                 <>
-                  <QrCode className="h-8 w-8 text-primary mb-4" />
+                  <div className="flex items-center gap-2 mb-4">
+                    <QrCode className="h-6 w-6 text-primary" />
+                    {socketConnected && (
+                      <Badge variant="outline" className="text-green-600 border-green-600">
+                        <Wifi className="h-3 w-3 mr-1" />
+                        Real-time
+                      </Badge>
+                    )}
+                  </div>
                   <img 
-                    src={qrCode}
+                    src={displayQr}
                     alt="WhatsApp QR Code"
                     className="w-72 h-72 md:w-96 md:h-96 border-4 border-primary rounded-lg shadow-lg"
                   />
                   <p className="text-sm text-muted-foreground mt-4">
                     QR code expires in <span className="font-bold text-destructive">{countdown}s</span>
                   </p>
+                  {socketMessage && socketStatus === 'qr_ready' && (
+                    <p className="text-xs text-muted-foreground mt-1">{socketMessage}</p>
+                  )}
                 </>
               ) : (
                 <>
                   <Loader2 className="h-12 w-12 animate-spin text-primary mb-4" />
                   <p className="text-sm text-muted-foreground">Generating QR code...</p>
                   <p className="text-xs text-muted-foreground">This may take a few seconds</p>
+                  {socketConnected && (
+                    <Badge variant="outline" className="mt-2 text-green-600 border-green-600">
+                      <Wifi className="h-3 w-3 mr-1" />
+                      Waiting for QR...
+                    </Badge>
+                  )}
                 </>
               )}
             </div>
@@ -457,16 +428,17 @@ export default function WhatsAppConnectionPanel({
                 <li>Tap <strong>"Link a Device"</strong></li>
                 <li>Point your camera at the QR code above</li>
               </ol>
-              <p className="text-xs text-muted-foreground mt-3 pt-3 border-t">
-                💡 <strong>Tip:</strong> Keep this window open until your phone scans the code
-              </p>
+              <div className="flex items-center gap-2 text-xs text-green-600 mt-3 pt-3 border-t">
+                <Wifi className="h-4 w-4" />
+                <span>Real-time connection via Socket.IO - instant pairing confirmation!</span>
+              </div>
             </div>
             
             <Button 
               variant="outline" 
               onClick={() => {
                 setConnectionState('idle');
-                setQrCode(null);
+                setQrDataUrl(null);
                 setError(null);
               }}
               className="w-full"
@@ -527,7 +499,7 @@ export default function WhatsAppConnectionPanel({
                 Your WhatsApp is now active and ready to receive messages
               </p>
               <p className="text-sm text-green-600 dark:text-green-400 font-medium">
-                🎉 Connection established!
+                🎉 Connection established instantly via real-time socket!
               </p>
             </div>
           </div>
@@ -557,4 +529,3 @@ export default function WhatsAppConnectionPanel({
     </Card>
   );
 }
-

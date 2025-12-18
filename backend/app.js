@@ -746,6 +746,132 @@ io.on('connection', (socket) => {
     console.log(`[WebSocket] User ${requestUserId} joined room`);
     socket.join(requestUserId);
   });
+  
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // WHATSAPP SOCKET.IO EVENT HANDLERS
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  
+  // Subscribe to WhatsApp events for a specific agent
+  socket.on('whatsapp:subscribe', async (agentId) => {
+    try {
+      if (!agentId) {
+        socket.emit('whatsapp:error', { message: 'Agent ID required' });
+        return;
+      }
+      
+      // Verify user owns this agent
+      const { data: agent, error } = await supabaseAdmin
+        .from('agents')
+        .select('id, agent_name, user_id')
+        .eq('id', agentId)
+        .maybeSingle();
+      
+      if (error || !agent) {
+        socket.emit('whatsapp:error', { 
+          message: 'Agent not found',
+          agentId 
+        });
+        return;
+      }
+      
+      // Security check: Only allow owner to subscribe
+      if (agent.user_id !== socket.userId) {
+        socket.emit('whatsapp:error', { 
+          message: 'Unauthorized: You do not own this agent',
+          agentId 
+        });
+        return;
+      }
+      
+      // Join agent-specific room
+      socket.join(`whatsapp:${agentId}`);
+      console.log(`[WhatsApp WS] User ${socket.userId} subscribed to whatsapp:${agentId}`);
+      
+      // Send current connection status
+      const { data: session } = await supabaseAdmin
+        .from('whatsapp_sessions')
+        .select('status, is_active, phone_number, last_heartbeat, qr_code')
+        .eq('agent_id', agentId)
+        .maybeSingle();
+      
+      socket.emit('whatsapp:status', {
+        agentId,
+        agentName: agent.agent_name,
+        status: session?.status || 'disconnected',
+        isActive: session?.is_active || false,
+        phoneNumber: session?.phone_number || null,
+        hasQRCode: !!session?.qr_code,
+        lastHeartbeat: session?.last_heartbeat || null,
+        timestamp: new Date().toISOString()
+      });
+      
+      // If QR code exists and session not active, send QR code
+      if (session?.qr_code && !session?.is_active) {
+        socket.emit('whatsapp:qr', {
+          agentId,
+          qr: session.qr_code,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+    } catch (error) {
+      console.error('[WhatsApp WS] Subscribe error:', error);
+      socket.emit('whatsapp:error', { 
+        message: 'Subscription failed',
+        error: error.message 
+      });
+    }
+  });
+  
+  // Unsubscribe from agent events
+  socket.on('whatsapp:unsubscribe', (agentId) => {
+    if (agentId) {
+      socket.leave(`whatsapp:${agentId}`);
+      console.log(`[WhatsApp WS] User ${socket.userId} unsubscribed from whatsapp:${agentId}`);
+    }
+  });
+  
+  // Request manual reconnection
+  socket.on('whatsapp:reconnect', async (agentId) => {
+    try {
+      if (!agentId) {
+        socket.emit('whatsapp:error', { message: 'Agent ID required' });
+        return;
+      }
+      
+      // Verify ownership
+      const { data: agent, error } = await supabaseAdmin
+        .from('agents')
+        .select('id, user_id')
+        .eq('id', agentId)
+        .maybeSingle();
+      
+      if (error || !agent || agent.user_id !== socket.userId) {
+        socket.emit('whatsapp:error', { message: 'Unauthorized' });
+        return;
+      }
+      
+      console.log(`[WhatsApp WS] Manual reconnection requested for agent ${agentId}`);
+      
+      const { handleSmartReconnection } = require('./src/utils/reconnectionManager');
+      
+      socket.emit('whatsapp:status', {
+        agentId,
+        status: 'reconnecting',
+        message: 'Manual reconnection initiated...',
+        timestamp: new Date().toISOString()
+      });
+      
+      await handleSmartReconnection(agentId, 'manual_reconnect', 1);
+      
+    } catch (error) {
+      console.error('[WhatsApp WS] Reconnect error:', error);
+      socket.emit('whatsapp:error', { 
+        message: 'Reconnection failed',
+        error: error.message 
+      });
+    }
+  });
 
   // Gmail socket handlers removed - using IMAP/SMTP only
   // Request initial emails handler removed
@@ -1079,6 +1205,8 @@ server.listen(PORT, '0.0.0.0', async () => {
   }, 3000); // Wait 3 seconds for database to be ready
   
   // Also call reconnectAllAgents as a backup (handles edge cases)
+  // ⚠️ IMPORTANT: Wait long enough for initializeExistingSessions to complete
+  // Each session init takes 3-10 seconds, so wait 20 seconds for multi-agent scenarios
   setTimeout(async () => {
     try {
       const { reconnectAllAgents } = require('./src/services/baileysService');
@@ -1088,7 +1216,7 @@ server.listen(PORT, '0.0.0.0', async () => {
     } catch (error) {
       console.error('[STARTUP] ❌ Error in backup reconnection:', error);
     }
-  }, 5000); // Wait 5 seconds after initializeExistingSessions
+  }, 20000); // Wait 20 seconds after initializeExistingSessions starts
   
   // Start connection monitoring
   setTimeout(() => {

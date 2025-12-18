@@ -1,5 +1,5 @@
 const { supabaseAdmin } = require('../config/supabase');
-const { initializeWhatsApp, activeSessions } = require('./baileysService');
+const { initializeWhatsApp, activeSessions, connectionLocks } = require('./baileysService');
 
 /**
  * Monitor connections and auto-reconnect if needed
@@ -48,6 +48,12 @@ async function monitorConnections() {
           continue;
         }
         
+        // Skip if initialization is already in progress (prevents race conditions)
+        if (connectionLocks.has(agent_id)) {
+          console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - initialization already in progress`);
+          continue;
+        }
+        
         console.log(`[CONNECTION-MONITOR] ⚠️  Agent ${agent_id.substring(0, 8)}... is active in DB but not in memory - reconnecting`);
         
         try {
@@ -77,6 +83,12 @@ async function monitorConnections() {
         // Skip if already retrying
         if (status === 'retrying') {
           console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - already retrying`);
+          continue;
+        }
+        
+        // Skip if initialization is already in progress (prevents race conditions)
+        if (connectionLocks.has(agent_id)) {
+          console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - initialization already in progress`);
           continue;
         }
         
@@ -110,6 +122,12 @@ async function monitorConnections() {
             continue;
           }
           
+          // Skip if initialization is already in progress (prevents race conditions)
+          if (connectionLocks.has(agent_id)) {
+            console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - initialization already in progress`);
+            continue;
+          }
+          
           console.log(`[CONNECTION-MONITOR] ⚠️  Agent ${agent_id.substring(0, 8)}... has stale heartbeat (${Math.floor(minutesSinceHeartbeat)} min) - reconnecting`);
           
           try {
@@ -136,8 +154,14 @@ function startMonitoring() {
     clearInterval(monitoringInterval);
   }
   
-  // Run immediately on startup
-  monitorConnections();
+  // ⚠️ CRITICAL: Don't run immediately on startup!
+  // Wait 30 seconds to let startup scripts (initializeExistingSessions, reconnectAllAgents) finish first
+  // This prevents race conditions where monitor sees sessions as "not connected" during init
+  console.log('[CONNECTION-MONITOR] ⏳ Waiting 30s before first health check (letting startup complete)...');
+  
+  setTimeout(() => {
+    monitorConnections();
+  }, 30000); // 30 second delay
   
   // Then run every 5 minutes
   monitoringInterval = setInterval(monitorConnections, 5 * 60 * 1000);

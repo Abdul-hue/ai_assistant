@@ -690,61 +690,220 @@ function validateCredentialIntegrity(creds) {
   return { valid: true };
 }
 
-// SIMPLIFIED CONNECTION MONITOR - Trust Baileys' internal keepalive
-function startConnectionMonitor(agentId, sock, session, userId) {
-  console.log(`[BAILEYS] 🔍 Starting simplified connection monitor for ${agentId.substring(0, 40)}`);
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// MULTI-LAYER CONNECTION MONITORING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// Storage for monitoring intervals
+const connectionMonitors = new Map();
+const healthCheckIntervals = new Map();
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 1: WebSocket State Monitor - DISABLED
+// 
+// ⚠️ CRITICAL: This monitor has been DISABLED because it causes FALSE POSITIVES.
+// 
+// Problem: In Baileys, `sock.ws?.readyState` returns `undefined` because:
+// - Baileys wraps the WebSocket in a nested structure
+// - The path `sock.ws.readyState` doesn't exist as expected
+// - This causes the monitor to think the connection is dead (undefined !== 1)
+// - Result: Unnecessary reconnection every 30 seconds even when connection is WORKING
+//
+// Solution: Use these alternatives instead (which work correctly):
+// 1. Health ping monitor (60s) - Actively tests connection with query, detects real issues
+// 2. Connection events (immediate) - Baileys fires 'close' event on actual disconnection
+// 3. Database heartbeat (60s) - For multi-instance coordination
+//
+// The health ping monitor at 60s intervals is sufficient for detecting real disconnections
+// while avoiding false positives from WebSocket state checks.
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function startConnectionStateMonitor(sock, agentId) {
+  // DISABLED: Do not start any interval - just log that we're using better alternatives
+  console.log(`[MONITOR] ${agentId.substring(0, 8)}... ℹ️ WebSocket state monitor DISABLED (causes false positives)`);
+  console.log(`[MONITOR] ${agentId.substring(0, 8)}... ✅ Using: Health pings (60s) + Connection events + DB heartbeat`);
   
-  // Track last successful connection.update event
-  let lastConnectionEvent = Date.now();
+  // Clean up any existing monitor if it was somehow started
+  if (connectionMonitors.has(agentId)) {
+    clearInterval(connectionMonitors.get(agentId));
+    connectionMonitors.delete(agentId);
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 2: Health Check with Ping (every 60 seconds)
+// Actively tests connection by sending a query
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function startHealthPingMonitor(sock, agentId) {
+  // Clear existing health check if any
+  if (healthCheckIntervals.has(agentId)) {
+    clearInterval(healthCheckIntervals.get(agentId));
+  }
   
-  // Simple monitor - only check if we're receiving connection.update events
-  const monitor = setInterval(() => {
-      const currentSession = activeSessions.get(agentId);
+  const healthInterval = setInterval(async () => {
+    try {
+      const session = activeSessions.get(agentId);
+      if (!session || !session.isConnected) {
+        console.log(`[HEALTH] ${agentId.substring(0, 8)}... Session not connected, stopping health check`);
+        clearInterval(healthInterval);
+        healthCheckIntervals.delete(agentId);
+        return;
+      }
+      
+      const startTime = Date.now();
+      
+      // Send a lightweight query to test connection
+      // This uses Baileys internal mechanism to verify connection is alive
+      await sock.query({
+        tag: 'iq',
+        attrs: {
+          to: '@s.whatsapp.net',
+          type: 'get',
+          xmlns: 'w:p'
+        },
+        content: [{ tag: 'ping', attrs: {} }]
+      });
+      
+      const latency = Date.now() - startTime;
+      console.log(`[HEALTH] ${agentId.substring(0, 8)}... ✅ Health check PASSED (${latency}ms)`);
+      
+      // Update connection quality in database (silently)
+      try {
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({
+            last_heartbeat: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          })
+          .eq('agent_id', agentId);
+      } catch (dbError) {
+        // Ignore DB errors for health check
+      }
+      
+    } catch (error) {
+      console.error(`[HEALTH] ${agentId.substring(0, 8)}... ❌ Health check FAILED:`, error.message);
+      
+      const session = activeSessions.get(agentId);
+      if (session) {
+        // Only trigger reconnection if session thinks it's connected
+        if (session.isConnected) {
+          clearInterval(healthInterval);
+          healthCheckIntervals.delete(agentId);
+          
+          session.isConnected = false;
+          
+          const { handleSmartReconnection } = require('../utils/reconnectionManager');
+          await handleSmartReconnection(agentId, 'health_check_failed', 1);
+        }
+      }
+    }
+  }, 60000); // 60 seconds
+  
+  healthCheckIntervals.set(agentId, healthInterval);
+  console.log(`[HEALTH] ${agentId.substring(0, 8)}... ✅ Health ping monitor started (60s interval)`);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// LAYER 3: Database Heartbeat (every 60 seconds) - PASSIVE
+// Updates last_heartbeat in database for multi-instance coordination
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function startHeartbeat(agentId, session) {
+  // Simple heartbeat - just update database every 60 seconds
+  // This is PASSIVE monitoring only - no connection interference
+  const heartbeat = setInterval(async () => {
+    const currentSession = activeSessions.get(agentId);
     
-    // Stop if session removed or in conflict
-    if (!currentSession || currentSession.connectionState === 'conflict') {
-      console.log(`[BAILEYS] 🛑 Stopping monitor (session ${!currentSession ? 'removed' : 'in conflict'})`);
-      clearInterval(monitor);
+    // Stop if session removed or not connected
+    if (!currentSession || !currentSession.isConnected) {
+      clearInterval(heartbeat);
       return;
     }
     
-    const now = Date.now();
-    const timeSinceLastEvent = now - lastConnectionEvent;
-    
-    // Only reconnect if no connection events for 5 minutes (very conservative)
-    // Baileys handles keepalive internally, we just detect total silence
-    if (timeSinceLastEvent > 300000 && currentSession.isConnected) {
-      console.error(`[BAILEYS] ❌ No connection events for 5 minutes - connection may be dead`);
-      console.log(`[BAILEYS] 🔄 Triggering reconnection...`);
-      
-        clearInterval(monitor);
-        
-      // Graceful reconnect
-      setTimeout(async () => {
-        try {
-          await disconnectWhatsApp(agentId);
-          await new Promise(resolve => setTimeout(resolve, 3000));
-          await initializeWhatsApp(agentId, userId);
-        } catch (error) {
-          console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
-        }
-      }, 1000);
+    // Just update heartbeat in database - no reconnection logic
+    try {
+      await supabaseAdmin
+        .from('whatsapp_sessions')
+        .update({
+          last_heartbeat: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+        .eq('agent_id', agentId);
+    } catch (error) {
+      // Silently ignore heartbeat errors - not critical
     }
-    
-  }, 60000); // Check every 60 seconds (not 15)
-  
-  // Update lastConnectionEvent whenever we get ANY connection.update
-  if (sock.ev) {
-    sock.ev.on('connection.update', () => {
-      lastConnectionEvent = Date.now();
-    });
-  }
+  }, 60000); // Every 60 seconds
   
   if (session) {
-    session.connectionMonitor = monitor;
+    session.heartbeatInterval = heartbeat;
   }
   
-  return monitor;
+  return heartbeat;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Cleanup all monitoring for an agent
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function cleanupMonitoring(agentId) {
+  console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Cleaning up all monitoring...`);
+  
+  // Clear connection state monitor
+  const monitor = connectionMonitors.get(agentId);
+  if (monitor) {
+    clearInterval(monitor);
+    connectionMonitors.delete(agentId);
+    console.log(`[CLEANUP] ${agentId.substring(0, 8)}... WebSocket monitor cleared`);
+  }
+  
+  // Clear health check
+  const health = healthCheckIntervals.get(agentId);
+  if (health) {
+    clearInterval(health);
+    healthCheckIntervals.delete(agentId);
+    console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Health check cleared`);
+  }
+  
+  // Clear heartbeat from session
+  const session = activeSessions.get(agentId);
+  if (session?.heartbeatInterval) {
+    clearInterval(session.heartbeatInterval);
+    session.heartbeatInterval = null;
+    console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Heartbeat cleared`);
+  }
+  
+  // Close socket if exists
+  if (session?.socket) {
+    try {
+      session.socket.ev?.removeAllListeners();
+      session.socket.ws?.close();
+    } catch (err) {
+      console.error(`[CLEANUP] ${agentId.substring(0, 8)}... Error closing socket:`, err.message);
+    }
+  }
+  
+  console.log(`[CLEANUP] ${agentId.substring(0, 8)}... ✅ Cleanup complete`);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Start all monitoring for an agent (called after connection.open)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function startAllMonitoring(sock, agentId, session) {
+  console.log(`[MONITOR] ${agentId.substring(0, 8)}... 🔍 Starting monitoring layers...`);
+  
+  // Layer 1: Event-based monitoring (via connection.update listener - already active)
+  // Baileys fires 'connection': 'close' immediately when socket disconnects
+  console.log(`[MONITOR] ${agentId.substring(0, 8)}... ✅ Event-based monitoring active (connection.update listener)`);
+  
+  // Layer 2: Health ping monitor (60s) - Actively tests connection quality
+  // This is the PRIMARY disconnection detection mechanism
+  startHealthPingMonitor(sock, agentId);
+  
+  // Layer 3: Database heartbeat (60s) - For multi-instance coordination
+  startHeartbeat(agentId, session);
+  
+  // NOTE: WebSocket state monitor is DISABLED - it caused false reconnections
+  // See startConnectionStateMonitor() comments for full explanation
+  // startConnectionStateMonitor(sock, agentId);  // ← DISABLED
+  
+  console.log(`[MONITOR] ${agentId.substring(0, 8)}... ✅ Monitoring active: Health pings (60s) + DB heartbeat (60s) + Connection events`);
 }
 
 // CRITICAL: Backup credentials to prevent data loss
@@ -1020,9 +1179,33 @@ async function ensureAgentIsolation(agentId) {
   try {
     // Step 1: Check if agent already has active session IN THIS INSTANCE
     const existingSession = activeSessions.get(agentId);
-    if (existingSession && existingSession.isConnected) {
-      console.log(`[BAILEYS] ⚠️ Agent already has active connection in this instance - disconnecting old one`);
-      await disconnectWhatsApp(agentId);
+    if (existingSession) {
+      // CRITICAL FIX: Don't do full logout - just clean up the socket
+      // Full logout deletes credentials which breaks reconnection!
+      console.log(`[BAILEYS] ⚠️ Agent already has session in this instance - cleaning up socket only`);
+      
+      // Stop intervals
+      if (existingSession.heartbeatInterval) {
+        clearInterval(existingSession.heartbeatInterval);
+        existingSession.heartbeatInterval = null;
+      }
+      
+      // Close socket without logout (preserves credentials)
+      if (existingSession.socket) {
+        try {
+          existingSession.socket.ev?.removeAllListeners();
+          existingSession.socket.end?.();
+        } catch (e) {
+          // Ignore socket cleanup errors
+        }
+        existingSession.socket = null;
+      }
+      
+      // Clear from memory but DON'T clear database credentials
+      activeSessions.delete(agentId);
+      qrGenerationTracker.delete(agentId);
+      
+      console.log(`[BAILEYS] ✅ Socket cleaned up - credentials preserved`);
     }
     
     // Step 2: Check database for OTHER instances using this agent
@@ -1057,8 +1240,8 @@ async function ensureAgentIsolation(agentId) {
           console.log(`[BAILEYS] ⚠️ Taking over session from dead instance`);
           console.log(`[BAILEYS] Previous Instance: ${dbSession.instance_hostname} (${dbSession.instance_id})`);
           console.log(`[BAILEYS] New Instance: ${INSTANCE_HOSTNAME} (${INSTANCE_ID})`);
-        } else if (timeSinceHeartbeat && timeSinceHeartbeat < 5 * 60 * 1000) {
-          // PID exists or unknown, and heartbeat is recent - real conflict
+        } else if (timeSinceHeartbeat && timeSinceHeartbeat < 2 * 60 * 1000) {
+          // PID exists or unknown, and heartbeat is recent (< 2 min) - real conflict
           console.error(`[BAILEYS] ❌ MULTI-INSTANCE CONFLICT DETECTED!`);
           console.error(`[BAILEYS] ❌ Agent ${agentId.substring(0, 40)} is ALREADY ACTIVE on another instance:`);
           console.error(`[BAILEYS] ❌ Other Instance ID: ${dbSession.instance_id}`);
@@ -1259,6 +1442,60 @@ async function initializeWhatsApp(agentId, userId = null) {
   console.log(`\n[BAILEYS] ==================== INITIALIZATION START ====================`);
   console.log(`[BAILEYS] Initializing WhatsApp for agent: ${agentId.substring(0, 40)}`);
   console.log(`[BAILEYS] Node: ${process.version}, Platform: ${process.platform}`);
+  
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // CRITICAL: Prevent race condition - only ONE initialization at a time per agent
+  // This prevents startup, reconnectAllAgents, and connectionMonitor from competing
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  const lockValue = connectionLocks.get(agentId);
+  if (lockValue) {
+    // Check if it's a timestamp (new format) or boolean (old format from safeInitializeWhatsApp)
+    const lockAge = typeof lockValue === 'number' ? Date.now() - lockValue : 0;
+    
+    // If lock is older than 90 seconds, consider it stale and clear it
+    if (typeof lockValue === 'number' && lockAge > 90000) {
+      console.log(`[BAILEYS] ⚠️ Clearing stale initialization lock (${Math.round(lockAge/1000)}s old)`);
+      connectionLocks.delete(agentId);
+    } else {
+      console.log(`[BAILEYS] ⏸️ Initialization already in progress, checking session state...`);
+      
+      // Return current session state if exists and is valid
+      const existingSession = activeSessions.get(agentId);
+      if (existingSession?.isConnected) {
+        console.log(`[BAILEYS] ✅ Session already connected, returning existing state`);
+        return {
+          success: true,
+          status: 'connected',
+          qrCode: null,
+          phoneNumber: existingSession.phoneNumber,
+          isActive: true
+        };
+      }
+      
+      if (existingSession?.qrCode) {
+        console.log(`[BAILEYS] ✅ QR already pending, returning existing state`);
+        return {
+          success: true,
+          status: 'qr_pending',
+          qrCode: existingSession.qrCode,
+          phoneNumber: null,
+          isActive: false
+        };
+      }
+      
+      console.log(`[BAILEYS] ⏸️ No valid session state, waiting for current init to complete...`);
+      return {
+        success: false,
+        error: 'Initialization already in progress',
+        status: 'initializing'
+      };
+    }
+  }
+  
+  // Set initialization lock with timestamp
+  connectionLocks.set(agentId, Date.now());
+  console.log(`[BAILEYS] 🔒 Initialization lock acquired`);
+  
   emitAgentEvent(agentId, 'status', { status: 'initializing' });
   
   // CRITICAL: Check network connectivity first
@@ -1509,7 +1746,9 @@ async function initializeWhatsApp(agentId, userId = null) {
         hasCreds: !!state.creds,
         registered: state.creds?.registered,
         hasMe: !!state.creds?.me,
-        hasDeviceId: !!state.creds?.me?.id
+        hasDeviceId: !!state.creds?.me?.id,
+        hasNoiseKey: !!state.creds?.noiseKey,
+        hasSignedIdentityKey: !!state.creds?.signedIdentityKey
       });
     }
     
@@ -1643,6 +1882,29 @@ async function initializeWhatsApp(agentId, userId = null) {
 
     const credStatus = state.creds ? `🔑 Loaded credentials (registered: ${state.creds.registered})` : '🆕 No credentials - will generate QR';
     console.log(`[BAILEYS] ${credStatus}`);
+    
+    // CRITICAL FIX: Determine connection strategy based on ACTUAL paired device indicators
+    // The `registered` flag is NOT reliable after restart - it stays false even for valid sessions
+    // Instead, check for: me.id (device ID) + signal keys (noiseKey, signedIdentityKey)
+    const hasDeviceId = !!state.creds?.me?.id;
+    const hasSignalKeys = !!(state.creds?.noiseKey && state.creds?.signedIdentityKey);
+    const hasPairedDevice = hasDeviceId && hasSignalKeys;
+    const shouldGenerateQR = !hasPairedDevice;
+    
+    console.log('[BAILEYS] 🔍 Connection Strategy:', {
+      hasDeviceId,
+      hasSignalKeys,
+      hasPairedDevice,
+      willUseCredentials: hasPairedDevice,
+      willGenerateQR: shouldGenerateQR,
+      deviceId: hasDeviceId ? state.creds.me.id.split(':')[0] : null
+    });
+    
+    // If we have paired device, clear QR trackers - expect direct connection
+    if (hasPairedDevice) {
+      console.log('[BAILEYS] ✅ Using existing credentials - expecting direct connection (no QR)');
+      qrGenerationTracker.delete(agentId);
+    }
     
     // CRITICAL: Fetch latest Baileys version for compatibility
     console.log(`[BAILEYS] 🔍 Fetching latest Baileys version...`);
@@ -1952,13 +2214,21 @@ async function initializeWhatsApp(agentId, userId = null) {
         }
       }
 
-      // Handle QR code
+      // Handle QR code - ONLY process if we don't have valid paired credentials
       if (qr) {
         const session = activeSessions.get(agentId);
         const qrAttempt = session ? session.qrAttempts + 1 : 1;
 
+        // CRITICAL: Skip QR if already connected
         if (session?.isConnected) {
-          console.log(`[BAILEYS] ⚠️ QR event received for already connected agent ${agentId.substring(0, 40)} – ignoring`);
+          console.log(`[BAILEYS] ⚠️ QR ignored - already connected`);
+          return;
+        }
+        
+        // CRITICAL: Skip QR if we have paired device credentials
+        // QR should only be generated when there are NO valid credentials
+        if (state.creds?.me?.id && state.creds?.registered !== false) {
+          console.log(`[BAILEYS] ⚠️ QR ignored - have valid paired credentials, expecting direct connection`);
           return;
         }
         
@@ -1967,32 +2237,7 @@ async function initializeWhatsApp(agentId, userId = null) {
         }
         
         // Log QR generation concisely
-        console.log(`[BAILEYS] 📱 QR Code #${qrAttempt} generated for agent ${agentId.substring(0, 8)}... - scan within 60s`);
-        
-        const existingQR = qrGenerationTracker.get(agentId);
-        const QR_COOLDOWN_MS = 120000; // 2 minutes
-        
-        // Only apply cooldown if QR is recent AND still valid (not expired)
-        if (existingQR && (Date.now() - existingQR) < QR_COOLDOWN_MS) {
-          const qrExpired = (Date.now() - existingQR) > QR_EXPIRY_MS;
-          const isRetryAfterFailure = qrAttempt > 1;
-          
-          if (!qrExpired && !isRetryAfterFailure) {
-            return; // Skip - valid QR exists
-          }
-        }
-        
-        // Clear expired QR tracker
-        if (existingQR && (Date.now() - existingQR) > QR_EXPIRY_MS) {
-          qrGenerationTracker.delete(agentId);
-        }
-        
-        // Quick QR format check (4 comma-separated parts)
-        // Note: First part intentionally has "2@" prefix (WhatsApp version indicator) - this is normal
-        const qrParts = qr.split(',');
-        if (qrParts.length !== 4) {
-          console.error(`[BAILEYS] ❌ Invalid QR format: expected 4 parts, got ${qrParts.length}`);
-        }
+        console.log(`[BAILEYS] 📱 QR Code #${qrAttempt} - scan within 60s`);
         
         qrGenerationTracker.set(agentId, Date.now());
         
@@ -2003,7 +2248,7 @@ async function initializeWhatsApp(agentId, userId = null) {
               agent_id: agentId,
               qr_code: qr,
               is_active: false,
-              status: 'qr_pending', // CRITICAL: Set status to qr_pending
+              status: 'qr_pending',
               qr_generated_at: new Date().toISOString(),
               updated_at: new Date().toISOString()
             }, {
@@ -2016,11 +2261,24 @@ async function initializeWhatsApp(agentId, userId = null) {
             session.qrAttempts = qrAttempt;
           }
           
-          emitAgentEvent(agentId, 'qr', {
-            qr,
-            attempt: qrAttempt,
-            generatedAt: new Date().toISOString()
-          });
+          emitAgentEvent(agentId, 'qr', { qr, attempt: qrAttempt });
+          
+          // ━━━ SOCKET.IO EMISSION FOR REAL-TIME QR ━━━
+          try {
+            const app = require('../../app');
+            const io = app.get('io');
+            if (io) {
+              io.to(`whatsapp:${agentId}`).emit('whatsapp:qr', {
+                agentId,
+                qr,
+                attempt: qrAttempt,
+                timestamp: new Date().toISOString()
+              });
+              console.log(`[BAILEYS] 📡 QR emitted via Socket.IO to whatsapp:${agentId.substring(0, 8)}...`);
+            }
+          } catch (socketError) {
+            // Socket.IO not critical - frontend can still poll
+          }
         } catch (error) {
           console.error(`[BAILEYS] ❌ Error saving QR:`, error);
         }
@@ -2097,12 +2355,39 @@ async function initializeWhatsApp(agentId, userId = null) {
             phoneNumber: cleanPhone
           });
           
+          // ━━━ SOCKET.IO EMISSION FOR CONNECTION SUCCESS ━━━
+          try {
+            const app = require('../../app');
+            const io = app.get('io');
+            if (io) {
+              io.to(`whatsapp:${agentId}`).emit('whatsapp:connected', {
+                agentId,
+                status: 'connected',
+                phoneNumber: cleanPhone,
+                message: 'WhatsApp connected successfully!',
+                timestamp: new Date().toISOString()
+              });
+              console.log(`[BAILEYS] 📡 Connection success emitted via Socket.IO`);
+            }
+          } catch (socketError) {
+            console.error(`[BAILEYS] Socket.IO emit error:`, socketError.message);
+          }
+          
           console.log(`[BAILEYS] 🎊 WhatsApp fully connected`);
           console.log(`[BAILEYS] ========== CONNECTION COMPLETE ==========\n`);
           
-          // CRITICAL: Start connection monitor for auto-reconnect
-          if (session && session.socket) {
-            startConnectionMonitor(agentId, session.socket, session, userId);
+          // CRITICAL: Release initialization lock now that connection is established
+          connectionLocks.delete(agentId);
+          console.log(`[BAILEYS] 🔓 Initialization lock released (connected)`);
+          
+          // ━━━ START MONITORING ━━━
+          // Disconnection detection via:
+          // 1. Connection events (immediate) - Baileys fires 'close' on disconnect
+          // 2. Health ping monitor (60s) - Actively tests connection
+          // 3. Database heartbeat (60s) - Multi-instance coordination
+          // NOTE: WebSocket state monitor DISABLED (caused false reconnections)
+          if (session) {
+            startAllMonitoring(sock, agentId, session);
           }
           
         } catch (error) {
@@ -2146,6 +2431,26 @@ async function initializeWhatsApp(agentId, userId = null) {
           statusCode
         });
         
+        // ━━━ CLEANUP ALL MONITORING ON DISCONNECT ━━━
+        cleanupMonitoring(agentId);
+        
+        // ━━━ SOCKET.IO EMISSION FOR DISCONNECTION ━━━
+        try {
+          const app = require('../../app');
+          const io = app.get('io');
+          if (io) {
+            io.to(`whatsapp:${agentId}`).emit('whatsapp:disconnected', {
+              agentId,
+              statusCode,
+              reason,
+              timestamp: new Date().toISOString()
+            });
+            console.log(`[BAILEYS] 📡 Disconnection emitted via Socket.IO`);
+          }
+        } catch (socketError) {
+          // Socket.IO not critical
+        }
+        
         // CRITICAL: Handle 405 error specifically (Connection Failure before QR)
         if (statusCode === 405) {
           console.log(`[BAILEYS] ⚠️ Error 405 - Connection Failure (likely before QR generation)`);
@@ -2164,6 +2469,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           // Clear from active sessions but don't delete from DB (let user retry)
           activeSessions.delete(agentId);
           qrGenerationTracker.delete(agentId);
+          connectionLocks.delete(agentId); // Release lock
           
           console.log(`[BAILEYS] ✅ Cleared for retry. User should click "Connect" again.`);
           return; // Don't continue processing
@@ -2235,42 +2541,26 @@ async function initializeWhatsApp(agentId, userId = null) {
           return; // Don't continue processing
         }
         
-        // CRITICAL: Handle error 428 - Connection Lost
+        // CRITICAL: Handle error 428 - Connection Lost (AUTO-RECONNECT)
         if (statusCode === 428) {
           console.log(`[BAILEYS] 🔄 428 - Connection Lost (network issue)`);
           
-          // Stop all intervals
-          // REMOVED: healthCheckInterval - no longer used
-          if (session?.connectionMonitor) clearInterval(session.connectionMonitor);
-          if (session?.heartbeatInterval) clearInterval(session.heartbeatInterval);
+          // Release lock before reconnect attempt
+          connectionLocks.delete(agentId);
           
-          // Clean up socket
-            if (session?.socket) {
-              try {
-                session.socket.ev.removeAllListeners();
-                session.socket.end();
-              } catch (err) {
-                console.log('[BAILEYS] Socket cleanup:', err.message);
+          // Use smart reconnection with exponential backoff
+          const { handleSmartReconnection } = require('../utils/reconnectionManager');
+          
+          // Async reconnection - don't await to avoid blocking
+          handleSmartReconnection(agentId, 'disconnect_428', 1)
+            .then(result => {
+              if (result) {
+                console.log(`[BAILEYS] ✅ Smart reconnection successful after 428`);
               }
-            }
-            
-          // Remove from memory
-                activeSessions.delete(agentId);
-                
-          // Calculate backoff (max 30 seconds)
-          const reconnectAttempt = session?.reconnectAttempts || 0;
-          const backoffDelay = Math.min(3000 * Math.pow(1.5, reconnectAttempt), 30000);
-          
-          console.log(`[BAILEYS] 🔄 Reconnecting in ${backoffDelay/1000}s (attempt ${reconnectAttempt + 1})`);
-          
-          setTimeout(async () => {
-            try {
-              await initializeWhatsApp(agentId, userId);
-              console.log(`[BAILEYS] ✅ Reconnected after 428`);
-            } catch (error) {
-              console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
-            }
-          }, backoffDelay);
+            })
+            .catch(error => {
+              console.error(`[BAILEYS] ❌ Smart reconnection failed:`, error.message);
+            });
           
           return;
         }
@@ -2279,37 +2569,23 @@ async function initializeWhatsApp(agentId, userId = null) {
         if (statusCode === 515) {
           console.log(`[BAILEYS] 🔄 Error 515 - Restart required (EXPECTED after QR pairing)`);
           
-          // Stop all intervals to prevent interference
-          // REMOVED: healthCheckInterval - no longer used
-          if (session?.connectionMonitor) {
-            clearInterval(session.connectionMonitor);
-            session.connectionMonitor = null;
-          }
-          
-          // Clean up socket
-          if (session?.socket) {
-            try {
-              session.socket.ev.removeAllListeners();
-              session.socket.end();
-            } catch (e) {
-              console.log(`[BAILEYS] Socket cleanup: ${e.message}`);
-            }
-          }
-          
           // Remove from memory to force clean restart
           activeSessions.delete(agentId);
           qrGenerationTracker.delete(agentId);
+          connectionLocks.delete(agentId); // Release lock before reconnect
           
-          // Wait 5 seconds then restart (give WhatsApp time to register credentials)
+          // Use smart reconnection (515 is expected, so start with attempt 1)
+          const { handleSmartReconnection } = require('../utils/reconnectionManager');
+          
+          // Wait 3 seconds then reconnect (give WhatsApp time to register credentials)
           setTimeout(async () => {
             console.log(`[BAILEYS] 🔄 Reconnecting after 515...`);
             try {
-              await initializeWhatsApp(agentId, userId);
-              console.log(`[BAILEYS] ✅ Reconnected successfully after 515`);
+              await handleSmartReconnection(agentId, 'disconnect_515_restart', 1);
             } catch (error) {
-              console.error(`[BAILEYS] ❌ Reconnection failed:`, error.message);
+              console.error(`[BAILEYS] ❌ Reconnection failed after 515:`, error.message);
             }
-          }, 5000); // Increased from 2s to 5s
+          }, 3000);
           
           return;
         }
@@ -2355,11 +2631,6 @@ async function initializeWhatsApp(agentId, userId = null) {
             clearInterval(session.heartbeatInterval);
             session.heartbeatInterval = null;
           }
-          if (session?.connectionMonitor) {
-            clearInterval(session.connectionMonitor);
-            session.connectionMonitor = null;
-          }
-          
           // Close socket
           if (session?.socket) {
             try {
@@ -2587,71 +2858,25 @@ async function initializeWhatsApp(agentId, userId = null) {
           return;
         }
 
-        // CRITICAL: Handle errors 408/500/503 - Recoverable (Retry with Backoff)
+        // CRITICAL: Handle errors 408/500/503 - Recoverable (Smart Reconnection)
         if ([408, 500, 503].includes(statusCode)) {
           const errorName = statusCode === 408 ? 'Timeout' : 
                            statusCode === 500 ? 'Server Error' : 'Service Unavailable';
-          console.log(`[BAILEYS] 🟡 ${statusCode} - ${errorName} - RECOVERABLE (will retry with backoff)`);
+          console.log(`[BAILEYS] 🟡 ${statusCode} - ${errorName} - RECOVERABLE (smart reconnection)`);
           console.log(`[BAILEYS] Auth state: PRESERVED - credentials still valid`);
           
-          // Initialize retry counter if not exists
-          if (!session.retryCount) {
-            session.retryCount = 0;
-          }
+          // Use smart reconnection with exponential backoff
+          const { handleSmartReconnection } = require('../utils/reconnectionManager');
           
-          session.retryCount++;
-          const maxRetries = statusCode === 408 ? 20 : 10; // More retries for timeouts
-          
-          if (session.retryCount > maxRetries) {
-            console.error(`[BAILEYS] ❌ Max retries (${maxRetries}) reached for ${statusCode} - giving up`);
-            
-            // Mark as failed in database
-            await supabaseAdmin
-              .from('whatsapp_sessions')
-              .update({
-                is_active: false,
-                status: 'error',
-                updated_at: new Date().toISOString()
-              })
-              .eq('agent_id', agentId);
-            
-            // Clean up session but KEEP auth directory (credentials still valid)
-            activeSessions.delete(agentId);
-            console.log(`[BAILEYS] ℹ️  Auth directory preserved - user can retry manually`);
-            return;
-          }
-          
-          // Calculate exponential backoff delay
-          const baseDelay = statusCode === 408 ? 1000 : 5000; // 1s for timeout, 5s for server errors
-          const delay = Math.min(
-            baseDelay * Math.pow(2, session.retryCount - 1),
-            60000 // Cap at 60 seconds
-          );
-          
-          console.log(`[BAILEYS] 🔄 Retry ${session.retryCount}/${maxRetries} scheduled in ${delay}ms (${Math.round(delay/1000)}s)`);
-          console.log(`[BAILEYS] Retry progression: 1s → 2s → 4s → 8s → 16s → 32s → 60s (capped)`);
-          
-          // Update status to retrying
-          await supabaseAdmin
-            .from('whatsapp_sessions')
-            .update({
-              is_active: false,
-              status: 'retrying',
-              updated_at: new Date().toISOString()
+          handleSmartReconnection(agentId, `disconnect_${statusCode}`, 1)
+            .then(result => {
+              if (result) {
+                console.log(`[BAILEYS] ✅ Smart reconnection successful after ${statusCode}`);
+              }
             })
-            .eq('agent_id', agentId);
-          
-          // Schedule retry with exponential backoff
-          setTimeout(async () => {
-            try {
-              console.log(`[BAILEYS] 🔄 Executing retry ${session.retryCount}/${maxRetries} for ${agentId.substring(0, 20)}...`);
-              await initializeWhatsApp(agentId, userId);
-              console.log(`[BAILEYS] ✅ Retry successful`);
-            } catch (error) {
-              console.error(`[BAILEYS] ❌ Retry failed:`, error.message);
-              // Next disconnect will trigger another retry if under max
-            }
-          }, delay);
+            .catch(error => {
+              console.error(`[BAILEYS] ❌ Smart reconnection failed after ${statusCode}:`, error.message);
+            });
           
           return;
         }
@@ -2659,35 +2884,18 @@ async function initializeWhatsApp(agentId, userId = null) {
         // CRITICAL: Handle error 410 - Restart Required (Protocol Update)
         if (statusCode === 410) {
           console.log(`[BAILEYS] 🔄 410 - Restart required (protocol update)`);
-          console.log(`[BAILEYS] This usually means WhatsApp protocol was updated`);
           console.log(`[BAILEYS] Auth state: PRESERVED - credentials still valid`);
-          console.log(`[BAILEYS] Action: Restarting connection with same credentials...`);
-          
-          // Clean up old socket
-          if (session?.socket) {
-            try {
-              session.socket.ev.removeAllListeners();
-              session.socket.end();
-              console.log(`[BAILEYS] ✅ Old socket cleaned up`);
-            } catch (e) {
-              console.log(`[BAILEYS] Socket already ended:`, e.message);
-            }
-          }
-          
-          // Reset retry counter for fresh start
-          if (session) {
-            session.retryCount = 0;
-          }
           
           // Clear QR tracker to allow restart
           qrGenerationTracker.delete(agentId);
           
-          // Wait 2 seconds then restart with saved credentials
+          // Use smart reconnection
+          const { handleSmartReconnection } = require('../utils/reconnectionManager');
+          
           setTimeout(async () => {
-            console.log(`[BAILEYS] 🔄 Reconnecting with saved credentials after protocol update...`);
+            console.log(`[BAILEYS] 🔄 Smart reconnection after protocol update...`);
             try {
-              await initializeWhatsApp(agentId, userId);
-              console.log(`[BAILEYS] ✅ Restart complete after 410 - connection restored`);
+              await handleSmartReconnection(agentId, 'disconnect_410_protocol_update', 1);
             } catch (error) {
               console.error(`[BAILEYS] ❌ Restart failed after 410:`, error.message);
             }
@@ -2842,6 +3050,36 @@ async function initializeWhatsApp(agentId, userId = null) {
         const contactNumber = sanitizeNumberFromJid(contactCandidateJid);
         const fromNumber = fromMe ? agentNumber : contactNumber;
         const toNumber = fromMe ? contactNumber : agentNumber;
+
+        // ✅ CRITICAL: Message routing logic for dashboard vs WhatsApp
+        // 
+        // Dashboard flow (SAVE to DB + CALL webhook):
+        // - Agent sends message to its OWN number via dashboard
+        // - This is: fromMe=true AND contactNumber === agentNumber
+        // - source = 'dashboard' (shown in agent chat UI)
+        //
+        // Incoming WhatsApp messages (SAVE to DB + CALL webhook with source=whatsapp):
+        // - Another contact sends message TO the agent
+        // - This is: fromMe=false (ANY contact can send to agent)
+        // - source = 'whatsapp' (NOT shown in agent chat UI)
+        //
+        // Outgoing to OTHER contacts (SAVE to DB + CALL webhook with source=whatsapp):
+        // - Agent sends message to family/friends/work contacts on WhatsApp
+        // - This is: fromMe=true AND contactNumber !== agentNumber
+        // - source = 'whatsapp' (NOT shown in agent chat UI)
+        //
+        const isDashboardMessage = fromMe && contactNumber && agentNumber && contactNumber === agentNumber;
+        const isIncomingWhatsApp = !fromMe; // Any incoming message from any contact
+        const isOutgoingToOther = fromMe && contactNumber && agentNumber && contactNumber !== agentNumber;
+
+        // Log what type of message we're processing
+        if (isDashboardMessage) {
+          console.log(`[BAILEYS] 📊 Processing DASHBOARD message (agent to self): ${agentNumber}`);
+        } else if (isIncomingWhatsApp) {
+          console.log(`[BAILEYS] 📱 Processing INCOMING WhatsApp message from: ${contactNumber} to agent: ${agentNumber}`);
+        } else if (isOutgoingToOther) {
+          console.log(`[BAILEYS] 📤 Processing OUTGOING message to contact: ${contactNumber} (no webhook)`);
+        }
 
         // ✅ TASK 4: Handle button response messages
         let messageText = null;
@@ -3422,6 +3660,11 @@ async function initializeWhatsApp(agentId, userId = null) {
           }
         }
 
+        // Determine source based on message routing logic (defined earlier in loop)
+        // - isDashboardMessage: agent sends to self via dashboard → source = 'dashboard'
+        // - isIncomingWhatsApp: contact sends to agent → source = 'whatsapp'
+        const messageSource = isDashboardMessage ? 'dashboard' : 'whatsapp';
+
         const dbPayload = {
           message_id: messageId,
           agent_id: agentId, // CRITICAL: Include agent_id
@@ -3436,7 +3679,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           metadata: cleanedMetadata,
           received_at: timestampIso,
           created_at: timestampIso,
-          source: 'whatsapp', // All messages from Baileys are WhatsApp source
+          source: messageSource, // Set based on isDashboardMessage or isIncomingWhatsApp
         };
 
         try {
@@ -3556,15 +3799,21 @@ async function initializeWhatsApp(agentId, userId = null) {
               contentPreview: content ? content.substring(0, 50) : null,
             });
           } else {
-            // Add source to webhook payload
-            webhookPayload.source = 'whatsapp';
+            // Add source to webhook payload based on message type
+            // - Dashboard messages (agent to self): source = 'dashboard'
+            // - Incoming/Outgoing WhatsApp messages: source = 'whatsapp'
+            webhookPayload.source = isDashboardMessage ? 'dashboard' : 'whatsapp';
             
-            console.log(`[BAILEYS][WEBHOOK] 📤 Forwarding ${messageType} message to webhook:`, {
+            const messageSource = isDashboardMessage ? 'DASHBOARD' : 'WHATSAPP';
+            console.log(`[BAILEYS][WEBHOOK] 📤 Forwarding ${messageType} message to webhook (${messageSource}):`, {
               messageId,
               from: sanitizedFromNumber,
               to: sanitizedToNumber,
               senderName: senderName,
-              source: 'whatsapp',
+              source: webhookPayload.source,
+              isDashboardMessage,
+              isIncomingWhatsApp,
+              isOutgoingToOther,
               hasContent: Boolean(content),
               contentLength: content?.length || 0,
               hasMediaUrl: Boolean(mediaUrl),
@@ -3592,6 +3841,9 @@ async function initializeWhatsApp(agentId, userId = null) {
 
     console.log(`[BAILEYS] ==================== INIT COMPLETE ====================\n`);
     
+    // Note: Lock is NOT released here - connection setup is complete but QR scan is pending
+    // Lock will be released when connection succeeds or fails via connection.update handler
+    
     // Return success response with proper state
     return {
       success: true,
@@ -3602,6 +3854,11 @@ async function initializeWhatsApp(agentId, userId = null) {
 
   } catch (error) {
     console.error(`[BAILEYS] ❌ Error initializing:`, error);
+    
+    // Release lock on error
+    connectionLocks.delete(agentId);
+    console.log(`[BAILEYS] 🔓 Initialization lock released (error)`);
+    
     return {
       success: false,
       error: error.message,
@@ -3614,13 +3871,21 @@ async function initializeWhatsApp(agentId, userId = null) {
 async function safeInitializeWhatsApp(agentId, userId = null) {
   const now = Date.now();
 
-  if (connectionLocks.get(agentId)) {
-    console.log(`[BAILEYS] ⏳ Connection already in progress for agent ${agentId.substring(0, 40)}`);
-    return {
-      success: false,
-      status: 'connecting',
-      error: 'Connection already in progress'
-    };
+  // Check if initialization is already in progress (with stale lock detection)
+  const lockValue = connectionLocks.get(agentId);
+  if (lockValue) {
+    const lockAge = typeof lockValue === 'number' ? now - lockValue : 0;
+    
+    // If lock is less than 90 seconds old, it's still active
+    if (typeof lockValue === 'number' && lockAge < 90000) {
+      console.log(`[BAILEYS] ⏳ Connection already in progress (${Math.round(lockAge/1000)}s ago)`);
+      return {
+        success: false,
+        status: 'connecting',
+        error: 'Connection already in progress'
+      };
+    }
+    // Otherwise, lock is stale and will be cleared by initializeWhatsApp
   }
 
   // PHASE 2 FIX: Check database status FIRST to differentiate manual disconnect from error
@@ -3714,14 +3979,11 @@ async function safeInitializeWhatsApp(agentId, userId = null) {
     console.log(`[BAILEYS] ✅ Manual disconnect detected - bypassing general connection cooldown`);
   }
 
-  connectionLocks.set(agentId, true);
+  // Note: Lock is now managed inside initializeWhatsApp to prevent race conditions
   lastConnectionAttempt.set(agentId, now);
-
-  try {
-    return await initializeWhatsApp(agentId, userId);
-  } finally {
-    connectionLocks.delete(agentId);
-  }
+  
+  // Call initializeWhatsApp directly - it handles its own locking
+  return await initializeWhatsApp(agentId, userId);
 }
 
 // Disconnect
@@ -3783,10 +4045,6 @@ async function disconnectWhatsApp(agentId) {
         if (session.heartbeatInterval) {
           clearInterval(session.heartbeatInterval);
           session.heartbeatInterval = null;
-        }
-        if (session.connectionMonitor) {
-          clearInterval(session.connectionMonitor);
-          session.connectionMonitor = null;
         }
         if (session.backupInterval) {
           clearInterval(session.backupInterval);
@@ -4579,11 +4837,13 @@ async function initializeExistingSessions() {
     
     // CRITICAL: Don't auto-reconnect sessions with conflict status (401 errors)
     // These require manual user intervention
+    // ALSO: Include sessions with credentials (session_data not null) even if is_active is false
+    // This handles cases where server restarted during reconnection
     const { data: activeSessionsData, error } = await supabaseAdmin
       .from('whatsapp_sessions')
-      .select('agent_id, phone_number, status')
-      .eq('is_active', true)
-      .neq('status', 'conflict') // Exclude conflict status sessions
+      .select('agent_id, phone_number, status, session_data')
+      .or('is_active.eq.true,session_data.not.is.null') // Active OR has credentials
+      .not('status', 'in', '("conflict","disconnected")') // Exclude conflict and manually disconnected
       .limit(20); // Support up to 20 concurrent connections
     
     if (error) {
@@ -4621,20 +4881,37 @@ async function initializeExistingSessions() {
       return;
     }
     
-    console.log(`[BAILEYS] ✅ Found ${activeSessionsData.length} active session(s) to auto-reconnect:`);
-    activeSessionsData.forEach((session, index) => {
-      console.log(`[BAILEYS]    ${index + 1}. Agent: ${session.agent_id.substring(0, 20)}... Phone: ${session.phone_number || 'Unknown'}`);
+    // Filter to only sessions with credentials for actual reconnection
+    const sessionsWithCreds = activeSessionsData.filter(s => s.session_data?.creds);
+    const sessionsWithoutCreds = activeSessionsData.filter(s => !s.session_data?.creds);
+    
+    console.log(`[BAILEYS] ✅ Found ${activeSessionsData.length} session(s) to check:`);
+    console.log(`[BAILEYS]    - With credentials (will reconnect): ${sessionsWithCreds.length}`);
+    console.log(`[BAILEYS]    - Without credentials (need QR scan): ${sessionsWithoutCreds.length}`);
+    
+    sessionsWithCreds.forEach((session, index) => {
+      console.log(`[BAILEYS]    ${index + 1}. Agent: ${session.agent_id.substring(0, 20)}... Phone: ${session.phone_number || 'Unknown'} [HAS CREDS]`);
     });
     
-    console.log(`\n[BAILEYS] 🔄 AUTO-RECONNECTING ${activeSessionsData.length} session(s)...`);
-    console.log('[BAILEYS] This ensures WhatsApp connections persist across server restarts.');
-    console.log('[BAILEYS] ⚠️  Note: Sessions with conflict status are excluded and require manual reconnection.\n');
+    // Use sessions with credentials for reconnection
+    const sessionsToReconnect = sessionsWithCreds;
     
-    // Auto-reconnect each active session
+    if (sessionsToReconnect.length === 0) {
+      console.log(`[BAILEYS] ℹ️  No sessions with valid credentials to auto-reconnect`);
+      console.log('[BAILEYS] 📝 Users will need to scan QR code to connect their agents');
+      console.log('[BAILEYS] ========== STARTUP CHECK COMPLETE ==========\n');
+      return;
+    }
+    
+    console.log(`\n[BAILEYS] 🔄 AUTO-RECONNECTING ${sessionsToReconnect.length} session(s) with credentials...`);
+    console.log('[BAILEYS] This ensures WhatsApp connections persist across server restarts.');
+    console.log('[BAILEYS] ⚠️  Note: Sessions with conflict/disconnected status are excluded.\n');
+    
+    // Auto-reconnect each session with credentials
     let successCount = 0;
     let failCount = 0;
     
-    for (const sessionData of activeSessionsData) {
+    for (const sessionData of sessionsToReconnect) {
       try {
         console.log(`[BAILEYS] 🔄 Restoring session for agent: ${sessionData.agent_id.substring(0, 20)}...`);
         
@@ -4745,7 +5022,13 @@ module.exports = {
   deleteAgentFile,
   updateIntegrationEndpoints,
   activeSessions,
+  connectionLocks, // Expose for connection monitor to check
   initializeExistingSessions,
   subscribeToAgentEvents,
-  reconnectAllAgents
+  reconnectAllAgents,
+  // Multi-layer monitoring exports
+  cleanupMonitoring,
+  startAllMonitoring,
+  connectionMonitors,
+  healthCheckIntervals
 };

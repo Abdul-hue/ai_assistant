@@ -168,10 +168,14 @@ router.get('/:agentId/messages', authMiddleware, async (req, res) => {
     }
 
     // Build query - use received_at (existing column) - timestamp will be populated by trigger
+    // ✅ CRITICAL: Only fetch dashboard messages (source = 'dashboard')
+    // WhatsApp messages (contact conversations) are NOT shown in the agent chat UI
+    // Dashboard = agent sends to self via dashboard interface
     let query = supabaseAdmin
       .from('message_log')
       .select('*')
       .eq('agent_id', agentId)
+      .eq('source', 'dashboard') // Only show dashboard messages, not whatsapp
       .order('received_at', { ascending: false })
       .limit(parseInt(limit));
 
