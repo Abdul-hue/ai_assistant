@@ -2,8 +2,8 @@
  * MessageBubble Component - WhatsApp Style
  * 
  * Displays individual messages in WhatsApp-style bubbles
- * - User messages: Right-aligned, green background with tail
- * - Agent messages: Left-aligned, white background with tail
+ * - User messages: Left-aligned, white background with tail
+ * - Agent messages: Right-aligned, green background with tail
  * - WhatsApp-style status indicators
  * - Interactive buttons for dashboard agent messages
  */
@@ -96,17 +96,17 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onButtonC
     
     switch (message.status) {
       case 'sending':
-        return <Clock className="w-3 h-3 text-white/70" />;
+        return <Clock className="w-3 h-3 text-gray-500" />;
       case 'sent':
-        return <Check className="w-3 h-3 text-white/70" />;
+        return <Check className="w-3 h-3 text-gray-500" />;
       case 'delivered':
-        return <CheckCheck className="w-3 h-3 text-white/70" />;
+        return <CheckCheck className="w-3 h-3 text-gray-500" />;
       case 'read':
         return <CheckCheck className="w-3 h-3 text-[#53bdeb]" />;
       case 'failed':
-        return <AlertCircle className="w-3 h-3 text-white" />;
+        return <AlertCircle className="w-3 h-3 text-red-500" />;
       default:
-        return <Check className="w-3 h-3 text-white/70" />;
+        return <Check className="w-3 h-3 text-gray-500" />;
     }
   };
 
@@ -117,12 +117,12 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onButtonC
   };
 
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-1 px-1`}>
+    <div className={`flex ${isUser ? 'justify-start' : 'justify-end'} mb-1 px-1`}>
       <div
         className={`max-w-[70%] sm:max-w-[65%] rounded-lg px-2 py-1.5 ${
           isUser
-            ? 'bg-[#d9fdd3] rounded-tr-none'
-            : 'bg-white rounded-tl-none shadow-sm'
+            ? 'bg-white rounded-tl-none shadow-sm'
+            : 'bg-[#d9fdd3] rounded-tr-none'
         }`}
         style={{
           ...(isUser ? {} : {}),
@@ -139,9 +139,9 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message, onButtonC
           <MessageButtons buttons={buttons} onButtonClick={handleButtonClick} />
         )}
         
-        <div className={`flex items-center gap-1 mt-0.5 ${isUser ? 'justify-end' : 'justify-start'}`}>
+        <div className={`flex items-center gap-1 mt-0.5 ${isUser ? 'justify-start' : 'justify-end'}`}>
           <span className={`text-[10px] ${
-            isUser ? 'text-white/70' : 'text-gray-500'
+            isUser ? 'text-gray-500' : 'text-white/70'
           }`}>
             {new Date(message.timestamp).toLocaleTimeString('en-US', { 
               hour: 'numeric', 

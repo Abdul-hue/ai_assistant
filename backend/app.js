@@ -36,6 +36,7 @@ const whatsappRoutes = require('./src/routes/whatsapp');
 const agentRoutes = require('./src/routes/agents');
 const webhookUploadRoute = require('./src/routes/webhookUpload');
 const webhookSendMessageRoute = require('./src/routes/webhookSendMessage');
+const webhookSendEmailRoute = require('./src/routes/webhookSendEmail');
 const extractPdfRoute = require('./src/routes/extractPdf');
 const processAgentFileRoute = require('./src/routes/processAgentFile');
 const agentDocumentsRoute = require('./src/routes/agentDocuments');
@@ -439,6 +440,9 @@ app.use('/webhookupload-documents', webhookUploadRoute);
 
 // Webhook for N8N to send WhatsApp messages (public endpoint)
 app.use('/api/webhooks/send-message', webhookSendMessageRoute);
+
+// Webhook for N8N to send emails (public endpoint)
+app.use('/api/webhooks/send-email', webhookSendEmailRoute);
 
 // Document extraction endpoint (used by frontend after file upload)
 app.use('/extract-pdf', extractPdfRoute);

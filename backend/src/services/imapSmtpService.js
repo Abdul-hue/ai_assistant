@@ -907,7 +907,7 @@ async function fetchEmails(accountId, folder = 'INBOX', limitOrOptions = 10, opt
 /**
  * Send email via SMTP
  */
-async function sendEmail(accountId, { to, subject, body, html, attachments = [] }) {
+async function sendEmail(accountId, { to, subject, body, html, attachments = [], cc, bcc, replyTo }) {
   try {
     // Get account from database
     const { data: account, error } = await supabaseAdmin
@@ -942,15 +942,29 @@ async function sendEmail(accountId, { to, subject, body, html, attachments = [] 
       }
     });
     
-    // Send email
-    const info = await transporter.sendMail({
+    // Prepare email options
+    const mailOptions = {
       from: account.email || account.smtp_username,
       to: to,
       subject: subject,
       text: body,
       html: html || body,
       attachments: attachments
-    });
+    };
+    
+    // Add optional fields if provided
+    if (cc) {
+      mailOptions.cc = cc;
+    }
+    if (bcc) {
+      mailOptions.bcc = bcc;
+    }
+    if (replyTo) {
+      mailOptions.replyTo = replyTo;
+    }
+    
+    // Send email
+    const info = await transporter.sendMail(mailOptions);
     
     return {
       success: true,

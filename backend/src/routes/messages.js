@@ -171,11 +171,16 @@ router.get('/:agentId/messages', authMiddleware, async (req, res) => {
     // ✅ CRITICAL: Only fetch dashboard messages (source = 'dashboard')
     // WhatsApp messages (contact conversations) are NOT shown in the agent chat UI
     // Dashboard = agent sends to self via dashboard interface
+    // 
+    // IMPORTANT: Exclude all WhatsApp messages, especially:
+    // - Outgoing messages from agent to other numbers (source='whatsapp', is_from_me=true)
+    // - Incoming messages from contacts to agent (source='whatsapp', is_from_me=false)
+    // Only show messages where source='dashboard' (user-agent conversations via dashboard UI)
     let query = supabaseAdmin
       .from('message_log')
       .select('*')
       .eq('agent_id', agentId)
-      .eq('source', 'dashboard') // Only show dashboard messages, not whatsapp
+      .eq('source', 'dashboard') // Only show dashboard messages, explicitly exclude whatsapp
       .order('received_at', { ascending: false })
       .limit(parseInt(limit));
 
@@ -191,8 +196,28 @@ router.get('/:agentId/messages', authMiddleware, async (req, res) => {
       throw messagesError;
     }
 
+    // ✅ CRITICAL: Additional safety filter to exclude WhatsApp messages
+    // Even if source='dashboard', exclude messages that are clearly WhatsApp:
+    // - Messages where source is explicitly 'whatsapp' (shouldn't happen due to query filter, but safety check)
+    // - Outgoing messages to other numbers (is_from_me=true and not a self-conversation)
+    // This ensures that messages sent from agent to other numbers never appear in dashboard
+    const filteredMessages = (messages || []).filter(msg => {
+      // Exclude if source is explicitly 'whatsapp' (shouldn't happen, but safety check)
+      if (msg.source === 'whatsapp') {
+        return false;
+      }
+      
+      // Exclude if this is an outgoing message (is_from_me=true) and source is not explicitly 'dashboard'
+      // This catches edge cases where messages might not have source set correctly
+      if (msg.is_from_me === true && msg.source !== 'dashboard') {
+        return false;
+      }
+      
+      return true;
+    });
+
     // Normalize messages to match expected format
-    const normalizedMessages = (messages || []).map(msg => {
+    const normalizedMessages = (filteredMessages || []).map(msg => {
       // Handle id: prefer uuid_id if id is integer, otherwise use id or message_id
       const messageId = msg.uuid_id || 
                         (typeof msg.id === 'string' ? msg.id : null) ||
