@@ -74,8 +74,10 @@ export function useAgentDetails(
       return fetchAgentDetails(agentId);
     },
     enabled: !!agentId, // Only run query if agentId exists
-    staleTime: 30000, // Consider data fresh for 30 seconds
+    staleTime: 5000, // Consider data fresh for only 5 seconds (quick updates for WhatsApp status)
     gcTime: 5 * 60 * 1000, // Keep in cache for 5 minutes (formerly cacheTime)
+    refetchInterval: 10000, // Refetch every 10 seconds to catch status changes
+    refetchIntervalInBackground: false, // Don't refetch when tab is not focused
     retry: (failureCount, error) => {
       // Don't retry on 404 (agent not found) or 401 (unauthorized)
       if (error.message.includes('404') || error.message.includes('401')) {

@@ -48,31 +48,46 @@ async function callEmailWebhook(emailData, accountId, userId) {
     }
 
     // Check 2: Email must be received after webhook was enabled
-    // If webhook_enabled_at is NULL but initial_sync_completed is TRUE, skip webhook (data inconsistency)
+    // If webhook_enabled_at is NULL but initial_sync_completed is TRUE, set it now and allow webhook
     if (!account.webhook_enabled_at) {
-      console.warn(`[EMAIL_WEBHOOK] ⚠️  Account ${accountId} has initial_sync_completed=TRUE but webhook_enabled_at is NULL. Skipping webhook for safety.`);
-      return { success: false, reason: 'webhook_enabled_at_missing' };
+      console.warn(`[EMAIL_WEBHOOK] ⚠️  Account ${accountId} has initial_sync_completed=TRUE but webhook_enabled_at is NULL. Setting it now.`);
+      // Set webhook_enabled_at to now to enable webhooks going forward
+      const now = new Date().toISOString();
+      await supabaseAdmin
+        .from('email_accounts')
+        .update({ webhook_enabled_at: now })
+        .eq('id', accountId);
+      // Allow webhook for this email (it's a new email, so it should trigger webhook)
+      account.webhook_enabled_at = now;
     }
 
     // Validate email date exists
     const emailReceivedAtStr = emailData.received_at || emailData.date;
     if (!emailReceivedAtStr) {
-      console.warn(`[EMAIL_WEBHOOK] ⚠️  Email UID ${emailData.uid} has no date, skipping webhook`);
-      return { success: false, reason: 'missing_email_date' };
+      console.warn(`[EMAIL_WEBHOOK] ⚠️  Email UID ${emailData.uid} has no date, using current time`);
+      // Use current time if email date is missing (shouldn't happen, but handle gracefully)
+      emailData.received_at = new Date().toISOString();
     }
 
     const webhookEnabledAt = new Date(account.webhook_enabled_at).getTime();
-    const emailReceivedAt = new Date(emailReceivedAtStr).getTime();
+    const emailReceivedAt = new Date(emailReceivedAtStr || emailData.received_at).getTime();
     
     // Validate dates are valid
     if (isNaN(webhookEnabledAt) || isNaN(emailReceivedAt)) {
       console.error(`[EMAIL_WEBHOOK] ❌ Invalid date format - webhook_enabled_at: ${account.webhook_enabled_at}, email date: ${emailReceivedAtStr}`);
-      return { success: false, reason: 'invalid_date_format' };
-    }
-    
-    if (emailReceivedAt < webhookEnabledAt) {
-      console.log(`[EMAIL_WEBHOOK] ⏭️  Skipping webhook for UID ${emailData.uid} - Email older than webhook enable time (email: ${new Date(emailReceivedAt).toISOString()}, enabled: ${account.webhook_enabled_at})`);
-      return { success: false, reason: 'email_older_than_webhook_enable' };
+      // Still try to send webhook if dates are invalid (better to send than miss)
+      console.warn(`[EMAIL_WEBHOOK] ⚠️  Proceeding with webhook despite invalid dates`);
+    } else if (emailReceivedAt < webhookEnabledAt) {
+      // Only skip if email is significantly older (more than 1 hour before webhook was enabled)
+      const timeDiff = webhookEnabledAt - emailReceivedAt;
+      const oneHour = 60 * 60 * 1000;
+      if (timeDiff > oneHour) {
+        console.log(`[EMAIL_WEBHOOK] ⏭️  Skipping webhook for UID ${emailData.uid} - Email older than webhook enable time (email: ${new Date(emailReceivedAt).toISOString()}, enabled: ${account.webhook_enabled_at})`);
+        return { success: false, reason: 'email_older_than_webhook_enable' };
+      } else {
+        // Email is close to webhook enable time, allow it (might be from initial sync)
+        console.log(`[EMAIL_WEBHOOK] ⚠️  Email is slightly older than webhook_enabled_at but within 1 hour, allowing webhook`);
+      }
     }
   } catch (checkError) {
     console.error(`[EMAIL_WEBHOOK] ❌ Error checking sync status:`, checkError.message);

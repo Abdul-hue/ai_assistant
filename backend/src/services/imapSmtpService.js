@@ -19,7 +19,7 @@ function getProviderSettings(email) {
     'gmail.com': {
       imap: { host: 'imap.gmail.com', port: 993, ssl: true },
       smtp: { host: 'smtp.gmail.com', port: 587, tls: true },
-      note: 'Gmail requires OAuth2 or App Password. Password login may not work.'
+      note: 'Gmail requires an App Password (not your regular password). Enable 2-Step Verification, then create an App Password in Google Account → Security → App passwords.'
     },
     'outlook.com': {
       imap: { host: 'outlook.office365.com', port: 993, ssl: true },
@@ -68,10 +68,18 @@ async function testImapConnection(config) {
   const { validateImap } = require('../utils/connectToImap');
   let connection = null;
   try {
+    // ✅ FIX: Trim password to remove any accidental spaces
+    const trimmedPassword = config.password?.trim() || config.password;
+    
+    // ✅ FIX: Increase timeouts for Gmail (can be slow)
+    const isGmail = config.host?.includes('gmail.com') || config.username?.includes('@gmail.com');
+    const authTimeout = isGmail ? 20000 : 15000; // 20s for Gmail, 15s for others
+    const connTimeout = isGmail ? 30000 : 20000; // 30s for Gmail, 20s for others
+    
     // First validate the connection using the centralized validation
     await validateImap({
       email: config.username,
-      password: config.password,
+      password: trimmedPassword,
       host: config.host,
       port: config.port || 993,
       useSsl: config.useTls !== false
@@ -81,13 +89,22 @@ async function testImapConnection(config) {
     connection = await imaps.connect({
       imap: {
         user: config.username,
-        password: config.password,
+        password: trimmedPassword, // ✅ Use trimmed password
         host: config.host,
         port: config.port || 993,
         tls: config.useTls !== false,
-        tlsOptions: { rejectUnauthorized: false },
-        authTimeout: 10000,
-        connTimeout: 10000
+        tlsOptions: { 
+          rejectUnauthorized: false,
+          minVersion: 'TLSv1.2' // ✅ Require TLS 1.2+ for Gmail
+        },
+        authTimeout: authTimeout, // ✅ Increased timeout
+        connTimeout: connTimeout, // ✅ Increased timeout
+        // ✅ Add keepalive for Gmail to prevent premature disconnection
+        keepalive: isGmail ? {
+          interval: 10000,
+          idleInterval: 300000,
+          forceNoop: true
+        } : false
       }
     });
     
@@ -136,25 +153,88 @@ async function testImapConnection(config) {
       }
     }
     
+    // Detect Gmail
+    const isGmail = config.host?.includes('gmail.com') || config.username?.includes('@gmail.com');
+    
     // Provide more helpful error messages
     let errorMessage = error.message;
+    let suggestion = null;
+    
     if (error.message?.includes('ECONNREFUSED')) {
       errorMessage = 'Connection refused. Please check the IMAP host and port.';
     } else if (error.message?.includes('ETIMEDOUT') || error.message?.includes('timeout')) {
       errorMessage = 'Connection timeout. Please check your network connection and IMAP settings.';
     } else if (error.message?.includes('authentication') || error.message?.includes('credentials') || error.message?.includes('LOGIN') || error.message?.includes('AUTHENTICATIONFAILED')) {
-      errorMessage = 'Authentication failed. Please check your email and password.';
+      if (isGmail) {
+        errorMessage = 'Gmail authentication failed. Gmail requires an App Password, not your regular account password.';
+        suggestion = 'To create a Gmail App Password: 1) Enable 2-Step Verification in your Google Account, 2) Go to Security → App passwords, 3) Create a new app password for "Mail", 4) Use that 16-character password here.';
+      } else {
+        errorMessage = 'Authentication failed. Please check your email and password.';
+      }
     } else if (error.message?.includes('Connection ended unexpectedly') || error.message?.includes('connection closed')) {
-      errorMessage = 'Connection closed unexpectedly. This usually means invalid credentials or the server rejected the connection. Please verify your email and app password.';
+      if (isGmail) {
+        // ✅ FIX: Provide more specific troubleshooting steps
+        errorMessage = 'Gmail rejected the connection. Please check the following:';
+        suggestion = `🔍 STEP-BY-STEP TROUBLESHOOTING:
+
+1️⃣  ENABLE IMAP IN GMAIL (MOST COMMON ISSUE):
+   - Go to: https://mail.google.com/mail/u/0/#settings/general
+   - Scroll down to "Forwarding and POP/IMAP" section
+   - Make sure "Enable IMAP" is CHECKED ✅
+   - Click "Save Changes" at the bottom
+   - Wait 1-2 minutes for changes to take effect
+
+2️⃣  VERIFY 2-STEP VERIFICATION IS ENABLED:
+   - Go to: https://myaccount.google.com/security
+   - Under "Signing in to Google", verify "2-Step Verification" is ON
+   - If not enabled, enable it first (required for App Passwords)
+
+3️⃣  CREATE A NEW APP PASSWORD:
+   - Go to: https://myaccount.google.com/apppasswords
+   - Select "Mail" from the app dropdown
+   - Select "Other (Custom name)" and type "IMAP Client"
+   - Click "Generate"
+   - Copy the 16-character password (shown as: xxxx xxxx xxxx xxxx)
+   - Enter it WITHOUT spaces in the password field
+
+4️⃣  VERIFY PASSWORD FORMAT:
+   - App Password should be exactly 16 characters
+   - Remove ALL spaces when entering
+   - Example: "abcd efgh ijkl mnop" → enter as "abcdefghijklmnop"
+
+5️⃣  WAIT IF RATE LIMITED:
+   - If you've made multiple attempts, wait 5-10 minutes
+   - Gmail may temporarily block rapid connection attempts
+
+6️⃣  CHECK ACCOUNT STATUS:
+   - Try logging into Gmail web interface
+   - Make sure account is active and not suspended
+
+If all steps are correct and it still fails, try generating a completely new App Password.`;
+      } else {
+        errorMessage = 'Connection closed unexpectedly. This usually means invalid credentials or the server rejected the connection. Please verify your email and app password.';
+        suggestion = 'Please check: 1) Your email address is correct, 2) Your app password is correct (no spaces), 3) IMAP is enabled in your email settings';
+      }
     }
     
     console.error(`[TEST IMAP] ❌ Connection failed: ${errorMessage}`);
     
-    return {
+    const result = {
       success: false,
       error: errorMessage,
       details: error.toString()
     };
+    
+    if (suggestion) {
+      result.suggestion = suggestion;
+    }
+    
+    if (isGmail) {
+      result.isGmail = true;
+      result.helpUrl = 'https://support.google.com/accounts/answer/185833';
+    }
+    
+    return result;
   }
 }
 
@@ -827,7 +907,7 @@ async function fetchEmails(accountId, folder = 'INBOX', limitOrOptions = 10, opt
 /**
  * Send email via SMTP
  */
-async function sendEmail(accountId, { to, subject, body, html, attachments = [] }) {
+async function sendEmail(accountId, { to, subject, body, html, attachments = [], cc, bcc, replyTo }) {
   try {
     // Get account from database
     const { data: account, error } = await supabaseAdmin
@@ -862,15 +942,29 @@ async function sendEmail(accountId, { to, subject, body, html, attachments = [] 
       }
     });
     
-    // Send email
-    const info = await transporter.sendMail({
+    // Prepare email options
+    const mailOptions = {
       from: account.email || account.smtp_username,
       to: to,
       subject: subject,
       text: body,
       html: html || body,
       attachments: attachments
-    });
+    };
+    
+    // Add optional fields if provided
+    if (cc) {
+      mailOptions.cc = cc;
+    }
+    if (bcc) {
+      mailOptions.bcc = bcc;
+    }
+    if (replyTo) {
+      mailOptions.replyTo = replyTo;
+    }
+    
+    // Send email
+    const info = await transporter.sendMail(mailOptions);
     
     return {
       success: true,

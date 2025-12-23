@@ -4,6 +4,12 @@
  * Types for the agent chat interface
  */
 
+export interface ButtonOption {
+  number: string;
+  text: string;
+  fullText: string;
+}
+
 export interface Message {
   id: string; // UUID (new) or message_id (legacy)
   agent_id: string;
@@ -17,6 +23,8 @@ export interface Message {
   message_type?: 'text' | 'image' | 'document';
   whatsapp_message_id?: string | null; // Alias for message_id
   read_at?: string | null;
+  source?: 'dashboard' | 'whatsapp'; // Message source
+  buttons?: ButtonOption[]; // Parsed buttons (client-side only)
   // Legacy fields (for backward compatibility)
   message_text?: string;
   received_at?: string;

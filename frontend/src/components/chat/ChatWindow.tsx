@@ -212,7 +212,11 @@ export const ChatWindow: React.FC<ChatWindowProps> = ({ agentId, agentName }) =>
               
               return Array.from(byContent.values());
             })().map((message) => (
-              <MessageBubble key={`${message.id}-${message.timestamp}`} message={message} />
+              <MessageBubble 
+                key={`${message.id}-${message.timestamp}`} 
+                message={message}
+                onButtonClick={handleSendMessage}
+              />
             ))}
             {isTyping && <TypingIndicator />}
             <div ref={messagesEndRef} />

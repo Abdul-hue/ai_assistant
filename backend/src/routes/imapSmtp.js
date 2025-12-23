@@ -159,11 +159,21 @@ router.post('/connect', authMiddleware, async (req, res) => {
       : { success: false, error: imapTestResult.reason?.message || 'IMAP test failed' };
 
     if (!imapTest.success) {
-      return res.status(400).json({
+      const response = {
         error: 'IMAP connection failed',
-        details: imapTest.error,
-        suggestion: detectedSettings?.note || 'Please check your IMAP settings'
-      });
+        details: imapTest.error
+      };
+      
+      // Add Gmail-specific help
+      if (imapTest.isGmail || email?.includes('@gmail.com')) {
+        response.suggestion = imapTest.suggestion || 'Gmail requires an App Password. Go to your Google Account → Security → 2-Step Verification → App passwords, then create a new app password for "Mail".';
+        response.helpUrl = imapTest.helpUrl || 'https://support.google.com/accounts/answer/185833';
+        response.isGmail = true;
+      } else {
+        response.suggestion = imapTest.suggestion || detectedSettings?.note || 'Please check your IMAP settings';
+      }
+      
+      return res.status(400).json(response);
     }
 
     // Check SMTP test result
@@ -183,29 +193,38 @@ router.post('/connect', authMiddleware, async (req, res) => {
     const encryptedImapPassword = encryptPassword(imapPassword);
     const encryptedSmtpPassword = encryptPassword(smtpPassword);
 
-    // Insert new account (we already checked it doesn't exist above)
+    // ✅ FIX: Use upsert to handle race conditions and duplicate key errors
+    // This ensures we update existing account or create new one atomically
     let emailAccount;
     let dbError;
 
-    // Insert new account (we already checked it doesn't exist above)
+    const accountData = {
+      user_id: userId,
+      provider: provider || 'custom',
+      email: email,
+      imap_host: finalImapHost,
+      imap_port: finalImapPort,
+      smtp_host: finalSmtpHost,
+      smtp_port: finalSmtpPort,
+      imap_username: finalImapUsername,
+      imap_password: encryptedImapPassword,
+      smtp_username: finalSmtpUsername,
+      smtp_password: encryptedSmtpPassword,
+      use_ssl: finalUseSsl,
+      use_tls: finalUseTls,
+      auth_method: 'password',
+      is_active: true,
+      needs_reconnection: false, // Clear any previous reconnection flags
+      last_error: null,
+      sync_status: 'idle'
+    };
+
+    // Use upsert with conflict resolution on unique constraint
     const { data, error } = await supabaseAdmin
       .from('email_accounts')
-      .insert({
-        user_id: userId,
-        provider: provider || 'custom',
-        email: email,
-        imap_host: finalImapHost,
-        imap_port: finalImapPort,
-        smtp_host: finalSmtpHost,
-        smtp_port: finalSmtpPort,
-        imap_username: finalImapUsername,
-        imap_password: encryptedImapPassword,
-        smtp_username: finalSmtpUsername,
-        smtp_password: encryptedSmtpPassword,
-        use_ssl: finalUseSsl,
-        use_tls: finalUseTls,
-        auth_method: 'password',
-        is_active: true
+      .upsert(accountData, {
+        onConflict: 'user_id,email,provider',
+        ignoreDuplicates: false
       })
       .select()
       .single();
@@ -214,11 +233,55 @@ router.post('/connect', authMiddleware, async (req, res) => {
     dbError = error;
 
     if (dbError) {
-      console.error('Database error saving IMAP/SMTP account:', dbError);
-      return res.status(500).json({
-        error: 'Failed to save account',
-        details: dbError.message
-      });
+      // ✅ Handle duplicate key error gracefully
+      if (dbError.code === '23505' || dbError.message?.includes('duplicate key')) {
+        console.log(`[CONNECT] Account ${email} already exists, fetching existing account...`);
+        
+        // Fetch the existing account
+        const { data: existingAccount, error: fetchError } = await supabaseAdmin
+          .from('email_accounts')
+          .select('*')
+          .eq('user_id', userId)
+          .eq('email', email)
+          .eq('provider', provider || 'custom')
+          .single();
+        
+        if (fetchError || !existingAccount) {
+          console.error('[CONNECT] Failed to fetch existing account after duplicate key error:', fetchError);
+          return res.status(500).json({
+            error: 'Failed to save account',
+            details: 'Account exists but could not be retrieved'
+          });
+        }
+        
+        // Update the existing account with new credentials
+        const { data: updatedAccount, error: updateError } = await supabaseAdmin
+          .from('email_accounts')
+          .update({
+            ...accountData,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', existingAccount.id)
+          .select()
+          .single();
+        
+        if (updateError) {
+          console.error('[CONNECT] Failed to update existing account:', updateError);
+          return res.status(500).json({
+            error: 'Failed to update account',
+            details: updateError.message
+          });
+        }
+        
+        emailAccount = updatedAccount;
+        console.log(`[CONNECT] ✅ Updated existing account ${emailAccount.id} with new credentials`);
+      } else {
+        console.error('Database error saving IMAP/SMTP account:', dbError);
+        return res.status(500).json({
+          error: 'Failed to save account',
+          details: dbError.message
+        });
+      }
     }
 
     // ✅ Start IDLE monitoring for newly connected account
@@ -260,6 +323,8 @@ router.post('/connect', authMiddleware, async (req, res) => {
     });
 
     // ✅ NEW: Trigger comprehensive sync in background
+    // ✅ FIX: Start sync immediately, IDLE will start after (5s delay)
+    // This prevents conflicts - sync runs first, then IDLE takes over
     setTimeout(async () => {
       try {
         console.log(`[CONNECT] ⚡ Starting comprehensive sync for ${emailAccount.email}`);
@@ -272,7 +337,7 @@ router.post('/connect', authMiddleware, async (req, res) => {
       } catch (error) {
         console.error(`[CONNECT] ❌ Comprehensive sync failed:`, error.message);
       }
-    }, 3000); // 3 second delay for IDLE to start first
+    }, 1000); // 1 second delay - start sync first, IDLE starts after (5s delay)
   } catch (error) {
     console.error('Error connecting IMAP/SMTP account:', error);
     res.status(500).json({
@@ -791,12 +856,32 @@ router.delete('/accounts/:accountId', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'Email account not found' });
     }
 
-    // ✅ FIX: Stop IDLE monitoring before deleting
+    // ✅ FIX: Stop IDLE monitoring before deleting (by both ID and email to catch all instances)
     try {
       const appModule = require('../../app');
       const idleManager = appModule.idleManager || appModule.default?.idleManager;
       if (idleManager) {
+        // Stop by account ID
         await idleManager.stopIdleMonitoring(accountId);
+        
+        // Also stop by email in case there are multiple accounts with same email
+        if (account.email) {
+          const { data: accountsByEmail } = await supabaseAdmin
+            .from('email_accounts')
+            .select('id')
+            .eq('email', account.email)
+            .eq('is_active', true);
+          
+          if (accountsByEmail && accountsByEmail.length > 0) {
+            for (const acc of accountsByEmail) {
+              if (acc.id !== accountId) {
+                await idleManager.stopIdleMonitoring(acc.id);
+                console.log(`[DISCONNECT] Stopped IDLE monitoring for account ${acc.id} (found by email)`);
+              }
+            }
+          }
+        }
+        
         console.log(`[DISCONNECT] Stopped IDLE monitoring for account ${account.email}`);
       }
     } catch (idleError) {
@@ -986,6 +1071,219 @@ router.get('/debug/:accountId', authMiddleware, async (req, res) => {
     res.status(500).json({
       success: false,
       error: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/imap-smtp/manual-sync/:accountId
+ * Manually trigger email sync for a specific account
+ * NON-BLOCKING: Returns immediately and syncs in background
+ */
+router.post('/manual-sync/:accountId', authMiddleware, async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    const { folder = 'INBOX' } = req.body;
+    const userId = req.user.id;
+
+    console.log(`[MANUAL-SYNC] 📥 Request received: accountId=${accountId}, folder=${folder}, userId=${userId}`);
+
+    // Verify account belongs to user
+    const { data: account, error: accountError } = await supabaseAdmin
+      .from('email_accounts')
+      .select('id, email, user_id, is_active, needs_reconnection')
+      .eq('id', accountId)
+      .eq('user_id', userId)
+      .single();
+
+    if (accountError || !account) {
+      console.error(`[MANUAL-SYNC] ❌ Account not found: accountId=${accountId}, userId=${userId}, error=${accountError?.message}`);
+      return res.status(404).json({ 
+        success: false,
+        error: 'Account not found or not owned by user' 
+      });
+    }
+
+    console.log(`[MANUAL-SYNC] ✅ Account found: ${account.email}, is_active=${account.is_active}, needs_reconnection=${account.needs_reconnection}`);
+
+    // ✅ FIX: Allow manual sync even if account is marked as inactive or needs_reconnection
+    // This allows users to manually trigger sync to clear flags
+    if (!account.is_active) {
+      console.log(`[MANUAL-SYNC] ⚠️  Account ${account.email} is marked as inactive, but allowing manual sync`);
+      // Don't return error - allow the sync to proceed
+    }
+
+    console.log(`[MANUAL-SYNC] Manual sync triggered for account: ${account.email} (${accountId})`);
+
+    // Return immediately - don't wait for sync
+    res.json({ 
+      success: true,
+      status: 'queued', 
+      message: 'Sync started in background',
+      accountId,
+      folder
+    });
+
+    // Import the background sync function
+    const { syncNewEmailsOnly } = require('../services/backgroundSyncService');
+    
+    // Run sync in background (non-blocking)
+    syncNewEmailsOnly(accountId, folder)
+      .then(count => {
+        console.log(`[MANUAL-SYNC] ✅ Synced ${count} new emails for ${account.email}/${folder}`);
+        
+        // Emit WebSocket event when done
+        const io = req.app.get('io');
+        if (io && account.user_id) {
+          io.to(account.user_id).emit('sync_complete', {
+            accountId,
+            folder,
+            newEmailsCount: count,
+            timestamp: new Date().toISOString()
+          });
+        }
+      })
+      .catch(err => {
+        console.error('[MANUAL-SYNC] ❌ Error:', err.message);
+        
+        // Emit error event
+        const io = req.app.get('io');
+        if (io && account.user_id) {
+          io.to(account.user_id).emit('sync_error', {
+            accountId,
+            folder,
+            error: err.message
+          });
+        }
+      });
+      
+  } catch (error) {
+    console.error('[MANUAL-SYNC] Error starting sync:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+/**
+ * POST /api/imap-smtp/accounts/:accountId/clear-reconnection
+ * Clear needs_reconnection flag for an account
+ */
+router.post('/accounts/:accountId/clear-reconnection', authMiddleware, async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    const userId = req.user.id;
+    
+    // Verify account belongs to user
+    const { data: account, error: accountError } = await supabaseAdmin
+      .from('email_accounts')
+      .select('id, email')
+      .eq('id', accountId)
+      .eq('user_id', userId)
+      .single();
+    
+    if (accountError || !account) {
+      return res.status(404).json({
+        success: false,
+        error: 'Account not found'
+      });
+    }
+    
+    // Clear reconnection flags
+    const { error: updateError } = await supabaseAdmin
+      .from('email_accounts')
+      .update({
+        needs_reconnection: false,
+        last_error: null,
+        sync_status: 'idle',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', accountId);
+    
+    if (updateError) {
+      throw updateError;
+    }
+    
+    console.log(`[API] ✅ Cleared needs_reconnection for ${account.email}`);
+    
+    // Restart IDLE for this account
+    try {
+      const appModule = require('../../app');
+      const idleManager = appModule.idleManager || appModule.default?.idleManager;
+      
+      if (idleManager) {
+        // Get full account data
+        const { data: fullAccount } = await supabaseAdmin
+          .from('email_accounts')
+          .select('*')
+          .eq('id', accountId)
+          .single();
+        
+        if (fullAccount) {
+          await idleManager.startIdleMonitoring(fullAccount);
+        }
+      }
+    } catch (idleError) {
+      console.error('[API] Error restarting IDLE:', idleError.message);
+      // Don't fail the request
+    }
+    
+    res.json({
+      success: true,
+      message: 'Reconnection flag cleared',
+      accountId
+    });
+    
+  } catch (error) {
+    console.error('[API] Error clearing reconnection:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/imap-smtp/sync/status
+ * Get sync status and IDLE connection statistics
+ */
+router.get('/sync/status', authMiddleware, async (req, res) => {
+  try {
+    // Get idle stats if available
+    let idleStats = {};
+    let idleConnectionsCount = 0;
+    
+    try {
+      // Try to get stats from the idle manager
+      const appModule = require('../../app');
+      const idleManager = appModule.idleManager || appModule.default?.idleManager;
+      
+      if (idleManager && idleManager.activeConnections) {
+        idleConnectionsCount = idleManager.activeConnections.size;
+        // Build stats object
+        idleManager.activeConnections.forEach((data, accountId) => {
+          idleStats[accountId] = {
+            email: data.account?.email || 'unknown',
+            monitoring: data.monitoring || false
+          };
+        });
+      }
+    } catch (error) {
+      console.error('[SYNC STATUS] Error getting IDLE stats:', error.message);
+    }
+    
+    res.json({
+      timestamp: new Date().toISOString(),
+      cronActive: true, // Cron job is always active if server is running
+      idleConnections: idleConnectionsCount,
+      idleStats: idleStats
+    });
+  } catch (error) {
+    console.error('[SYNC STATUS] Error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
     });
   }
 });

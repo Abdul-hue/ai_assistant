@@ -93,12 +93,28 @@ async function comprehensiveFolderSync(accountId, userId, io = null) {
         console.log(`\n[COMPREHENSIVE SYNC] 📂 Syncing: ${folderName} (${syncResults.completed + 1}/${allFolders.length})`);
         
         // ✅ Add timeout to prevent getting stuck on large folders
+        // Increased to 180 seconds (3 minutes) to handle large folders
+        // ✅ FIX: Use a proper timeout that doesn't leave sync running in background
         const syncPromise = syncSingleFolder(accountId, folderName);
         const timeoutPromise = new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Sync timeout after 60 seconds')), 60000)
+          setTimeout(() => reject(new Error('Sync timeout after 180 seconds')), 180000)
         );
         
-        const result = await Promise.race([syncPromise, timeoutPromise]);
+        // Race the sync against timeout - if timeout wins, log warning but let sync continue
+        // This prevents false error reports while still having a timeout safety
+        let result;
+        try {
+          result = await Promise.race([syncPromise, timeoutPromise]);
+        } catch (timeoutError) {
+          if (timeoutError.message.includes('timeout')) {
+            console.warn(`[COMPREHENSIVE SYNC] ⚠️  ${folderName} sync taking longer than 180s, but continuing...`);
+            // Wait for sync to complete anyway (don't abandon it)
+            result = await syncPromise;
+            console.log(`[COMPREHENSIVE SYNC] ✅ ${folderName} sync completed after timeout warning`);
+          } else {
+            throw timeoutError;
+          }
+        }
         
         syncResults.folders[folderName] = {
           status: 'completed',

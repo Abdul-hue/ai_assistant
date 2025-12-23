@@ -18,6 +18,9 @@ const connectionPool = require('../utils/imapConnectionPool');
 const BATCH_SIZE = 50; // Process 50 emails at a time
 const BATCH_DELAY = 1000; // 1 second delay between batches
 
+// Connection health check configuration
+const CONNECTION_HEALTH_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
+
 // ============================================
 // SYNC STATE MANAGEMENT
 // ============================================
@@ -99,6 +102,104 @@ async function logSyncActivity(accountId, folderName, syncData) {
 // ============================================
 // IMAP CONNECTION
 // ============================================
+
+/**
+ * Check if IMAP connection is healthy and authenticated
+ * @param {Object} connection - IMAP connection object
+ * @returns {Promise<boolean>} - True if connection is healthy
+ */
+async function isConnectionHealthy(connection) {
+  if (!connection || !connection.imap) {
+    return false;
+  }
+  
+  try {
+    // Check if connection is in authenticated state
+    const state = connection.imap.state;
+    if (state !== 'authenticated') {
+      console.log(`[HEALTH-CHECK] Connection not authenticated (state: ${state})`);
+      return false;
+    }
+    
+    // Try a lightweight operation to verify connection
+    // Using getBoxes() is a lightweight way to verify authentication
+    await connection.getBoxes();
+    return true;
+  } catch (error) {
+    // Check for authentication errors
+    if (error.message?.includes('Not authenticated') || 
+        error.message?.includes('not authenticated') ||
+        error.message?.includes('authentication') ||
+        error.code === 'EAUTH') {
+      console.error('[HEALTH-CHECK] Connection authentication failed:', error.message);
+      return false;
+    }
+    
+    console.error('[HEALTH-CHECK] Connection health check failed:', error.message);
+    return false;
+  }
+}
+
+/**
+ * Ensure connection is healthy, reconnect if needed
+ * @param {string} accountId - Account ID
+ * @param {Object} account - Account object from database
+ * @returns {Promise<Object>} - Healthy IMAP connection
+ */
+async function ensureHealthyConnection(accountId, account) {
+  let connection = null;
+  
+  // Try to get existing connection from pool
+  try {
+    connection = await connectionPool.getConnection(
+      accountId,
+      async () => {
+        return await connectToImap(account);
+      }
+    );
+  } catch (error) {
+    console.error(`[RECONNECT] Error getting connection from pool:`, error.message);
+    // Will create new connection below
+  }
+  
+  // Check if connection exists and is healthy
+  const isHealthy = connection ? await isConnectionHealthy(connection) : false;
+  
+  if (!isHealthy) {
+    console.log(`[RECONNECT] Connection unhealthy for ${account.email}, reconnecting...`);
+    
+    // Close existing connection if any
+    if (connection) {
+      try {
+        connectionPool.closeAccountConnections(accountId);
+      } catch (e) {
+        console.error('[RECONNECT] Error closing old connection:', e.message);
+      }
+    }
+    
+    // Establish new connection
+    connection = await connectionPool.getConnection(
+      accountId,
+      async () => {
+        return await connectToImap(account);
+      }
+    );
+    
+    if (!connection) {
+      throw new Error('Failed to establish IMAP connection');
+    }
+    
+    // Verify new connection is healthy
+    const newConnectionHealthy = await isConnectionHealthy(connection);
+    if (!newConnectionHealthy) {
+      throw new Error('New IMAP connection is not authenticated');
+    }
+    
+    console.log(`[RECONNECT] ✅ Successfully reconnected for ${account.email}`);
+  }
+  
+  return connection;
+}
 
 /**
  * Connect to IMAP server
@@ -299,7 +400,7 @@ async function saveOrUpdateEmail(accountId, emailData, mailFlags) {
 /**
  * Sync single folder with UID-based incremental approach
  */
-async function syncFolder(connection, accountId, folderName) {
+async function syncFolder(connection, accountId, folderName, account) {
   const startTime = Date.now();
   let emailsFetched = 0;
   let emailsSaved = 0;
@@ -308,16 +409,37 @@ async function syncFolder(connection, accountId, folderName) {
   try {
     console.log(`[SYNC] Starting sync for folder: ${folderName}`);
 
+    // CRITICAL: Ensure connection is healthy before operations
+    connection = await ensureHealthyConnection(accountId, account);
+
     // Get sync state
     const syncState = await getSyncState(accountId, folderName);
     const lastSyncUid = syncState.last_uid_synced || 0;
 
-    // Open the folder with retry
+    // Open the folder with retry and connection health check
     const box = await retryWithBackoff(
       async () => {
+        // Re-verify connection health before each retry
+        const isHealthy = await isConnectionHealthy(connection);
+        if (!isHealthy) {
+          console.log('[SYNC] Connection lost during retry, reconnecting...');
+          connection = await ensureHealthyConnection(accountId, account);
+        }
+        
         try {
           return await connection.openBox(folderName, false);
         } catch (error) {
+          // Handle authentication errors by reconnecting
+          if (error.message?.includes('Not authenticated') || 
+              error.message?.includes('not authenticated') ||
+              error.message?.includes('authentication') ||
+              error.code === 'EAUTH') {
+            console.log(`[SYNC] Authentication error detected, reconnecting...`);
+            connection = await ensureHealthyConnection(accountId, account);
+            // Retry opening folder after reconnection
+            return await connection.openBox(folderName, false);
+          }
+          
           // Handle folder not found errors gracefully
           if (error.textCode === 'NONEXISTENT' || error.message?.includes('Unknown Mailbox')) {
             console.warn(`[SYNC] Folder ${folderName} does not exist, skipping`);
@@ -347,7 +469,28 @@ async function syncFolder(connection, accountId, folderName) {
     // Search for all messages with retry for throttling
     const allMessages = await retryWithBackoff(
       async () => {
-        return await connection.search(['ALL'], fetchOptions);
+        // Re-verify connection health before search
+        const isHealthy = await isConnectionHealthy(connection);
+        if (!isHealthy) {
+          console.log('[SYNC] Connection lost during search, reconnecting...');
+          connection = await ensureHealthyConnection(accountId, account);
+        }
+        
+        try {
+          return await connection.search(['ALL'], fetchOptions);
+        } catch (error) {
+          // Handle authentication errors by reconnecting
+          if (error.message?.includes('Not authenticated') || 
+              error.message?.includes('not authenticated') ||
+              error.message?.includes('authentication') ||
+              error.code === 'EAUTH') {
+            console.log(`[SYNC] Authentication error during search, reconnecting...`);
+            connection = await ensureHealthyConnection(accountId, account);
+            // Retry search after reconnection
+            return await connection.search(['ALL'], fetchOptions);
+          }
+          throw error;
+        }
       },
       {
         maxRetries: 5,
@@ -422,15 +565,29 @@ async function syncFolder(connection, accountId, folderName) {
           
           // Call webhook/API for new emails
           try {
-            // Get account info for user_id
+            // Get account info for user_id and webhook status
             const { data: account } = await supabaseAdmin
               .from('email_accounts')
-              .select('user_id')
+              .select('user_id, initial_sync_completed, webhook_enabled_at')
               .eq('id', accountId)
               .single();
             
             if (account?.user_id) {
-              await callEmailWebhook(emailData, accountId, account.user_id);
+              // Ensure webhook_enabled_at is set if initial_sync_completed is true
+              if (account.initial_sync_completed && !account.webhook_enabled_at) {
+                console.log(`[SYNC] Setting webhook_enabled_at for account ${accountId}`);
+                await supabaseAdmin
+                  .from('email_accounts')
+                  .update({ webhook_enabled_at: new Date().toISOString() })
+                  .eq('id', accountId);
+              }
+              
+              const webhookResult = await callEmailWebhook(emailData, accountId, account.user_id);
+              if (webhookResult.success) {
+                console.log(`[SYNC] ✅ Webhook sent for email UID ${numericUid} (${emailData.subject?.substring(0, 50) || 'No Subject'})`);
+              } else {
+                console.log(`[SYNC] ⚠️ Webhook skipped for email UID ${numericUid}: ${webhookResult.reason || 'unknown'}`);
+              }
             } else {
               console.warn(`[SYNC] No user_id found for account ${accountId}, skipping webhook`);
             }
@@ -500,6 +657,30 @@ async function syncFolder(connection, accountId, folderName) {
       return { emailsFetched: 0, emailsSaved: 0, emailsUpdated: 0, errorsCount: 0 };
     }
     
+    // Handle authentication errors
+    if (error.message?.includes('Not authenticated') || 
+        error.message?.includes('not authenticated') ||
+        error.message?.includes('authentication') ||
+        error.code === 'EAUTH') {
+      console.error(`[SYNC] Authentication error syncing folder ${folderName}:`, error.message);
+      // Clear connection for this account
+      connectionPool.closeAccountConnections(accountId);
+      
+      // Mark account as needing reconnection
+      try {
+        await supabaseAdmin
+          .from('email_accounts')
+          .update({
+            needs_reconnection: true,
+            last_error: `Authentication failed: ${error.message}`,
+            last_connection_attempt: new Date().toISOString()
+          })
+          .eq('id', accountId);
+      } catch (updateError) {
+        console.error(`[SYNC] Error updating account ${accountId}:`, updateError.message);
+      }
+    }
+    
     console.error(`[SYNC] Error syncing folder ${folderName}:`, error);
     // Don't throw - return error state instead to prevent process crash
     return { 
@@ -560,23 +741,28 @@ async function syncAccountFolders(connection, account) {
       .eq('account_id', account.id)
       .eq('initial_sync_completed', true);
 
+    let folderNames = [];
+    
     if (foldersError) {
       console.error(`[SYNC] Error fetching synced folders:`, foldersError.message);
-      throw foldersError;
+      // Don't throw - try to sync INBOX anyway
+      console.log(`[SYNC] Attempting to sync INBOX folder as fallback`);
+      folderNames = ['INBOX'];
+    } else if (!syncedFolders || syncedFolders.length === 0) {
+      console.log(`[SYNC] No initially synced folders found for account ${account.id}, attempting to sync INBOX`);
+      // Try to sync INBOX if no folders are synced yet
+      folderNames = ['INBOX'];
+    } else {
+      folderNames = syncedFolders.map(f => f.folder_name);
+      console.log(`[SYNC] Account ${account.id} has ${folderNames.length} initially synced folders:`, folderNames);
     }
-
-    if (!syncedFolders || syncedFolders.length === 0) {
-      console.log(`[SYNC] No initially synced folders found for account ${account.id}`);
-      return results;
-    }
-
-    const folderNames = syncedFolders.map(f => f.folder_name);
-    console.log(`[SYNC] Account ${account.id} has ${folderNames.length} initially synced folders:`, folderNames);
 
     // Sync each folder
     for (const folderName of folderNames) {
       try {
-        const folderResult = await syncFolder(connection, account.id, folderName);
+        // CRITICAL: Verify connection before each folder sync
+        connection = await ensureHealthyConnection(account.id, account);
+        const folderResult = await syncFolder(connection, account.id, folderName, account);
 
         results.foldersProcessed++;
         results.totalEmailsFetched += folderResult.emailsFetched;
@@ -596,6 +782,26 @@ async function syncAccountFolders(connection, account) {
         });
       } catch (folderError) {
         console.error(`Error syncing folder ${folderName}:`, folderError.message);
+        
+        // If authentication error, clear connection and mark for reconnection
+        if (folderError.message?.includes('Not authenticated') || 
+            folderError.message?.includes('not authenticated') ||
+            folderError.message?.includes('authentication') ||
+            folderError.code === 'EAUTH') {
+          console.log(`[SYNC] Authentication error for folder ${folderName}, clearing connection`);
+          connectionPool.closeAccountConnections(account.id);
+          
+          // Mark account as needing reconnection
+          await supabaseAdmin
+            .from('email_accounts')
+            .update({
+              needs_reconnection: true,
+              last_error: `Authentication failed: ${folderError.message}`,
+              last_connection_attempt: new Date().toISOString()
+            })
+            .eq('id', account.id);
+        }
+        
         results.totalErrors++;
         await logSyncActivity(account.id, folderName, {
           syncType: 'incremental',
@@ -608,6 +814,16 @@ async function syncAccountFolders(connection, account) {
     return results;
   } catch (error) {
     console.error('Error syncing account folders:', error);
+    
+    // If authentication error, force reconnection on next sync
+    if (error.message?.includes('Not authenticated') || 
+        error.message?.includes('not authenticated') ||
+        error.message?.includes('authentication') ||
+        error.code === 'EAUTH') {
+      console.log('[SYNC] Authentication error detected, clearing connection');
+      connectionPool.closeAccountConnections(account.id);
+    }
+    
     throw error;
   }
 }
@@ -625,13 +841,14 @@ async function syncAllImapAccounts() {
   try {
     console.log('[SYNC] Starting global sync of all IMAP accounts');
 
-    // ✅ CRITICAL: Get all active IMAP/SMTP accounts where comprehensive sync is completed
-    // Only sync accounts that have been fully initialized
+    // ✅ CRITICAL: Get all active IMAP/SMTP accounts
+    // Try to sync accounts even if initial_sync_completed is false (with warning)
+    // This helps accounts that haven't completed initial sync yet
     const { data: accounts, error } = await supabaseAdmin
       .from('email_accounts')
       .select('*')
       .eq('is_active', true)
-      .eq('comprehensive_sync_completed', true) // Only sync fully initialized accounts
+      // REMOVED: .eq('initial_sync_completed', true) - Allow accounts without initial sync
       .or('provider_type.eq.imap_smtp,provider_type.is.null')
       .not('imap_host', 'is', null)
       .not('imap_username', 'is', null);
@@ -663,6 +880,14 @@ async function syncAllImapAccounts() {
       // This prevents accounts from being permanently stuck in "needs_reconnection" state
       if (account.needs_reconnection) {
         console.log(`[SYNC] ⚠️  Account ${account.email || account.id} marked as needs_reconnection, but attempting sync anyway`);
+      }
+      // ✅ WARN if initial_sync_completed is false, but still try to sync
+      if (!account.initial_sync_completed) {
+        console.warn(`[SYNC] ⚠️  Account ${account.email || account.id} has initial_sync_completed=false, but attempting sync anyway`);
+      }
+      // ✅ WARN if webhook_enabled_at is missing, but still try to sync
+      if (!account.webhook_enabled_at && account.initial_sync_completed) {
+        console.warn(`[SYNC] ⚠️  Account ${account.email || account.id} has initial_sync_completed=true but webhook_enabled_at is NULL`);
       }
       return true;
     });
@@ -711,6 +936,41 @@ async function syncAllImapAccounts() {
         if (activeAccount.needs_reconnection) {
           console.log(`[SYNC] ⚠️  Account ${activeAccount.email} marked as needs_reconnection, attempting sync to clear flag`);
         }
+        
+        // ✅ FIX: Ensure webhook_enabled_at is set if initial_sync_completed is true
+        if (activeAccount.initial_sync_completed && !activeAccount.webhook_enabled_at) {
+          console.log(`[SYNC] ⚠️  Account ${activeAccount.email} has initial_sync_completed=true but webhook_enabled_at is NULL. Setting it now.`);
+          await supabaseAdmin
+            .from('email_accounts')
+            .update({ webhook_enabled_at: new Date().toISOString() })
+            .eq('id', activeAccount.id);
+          activeAccount.webhook_enabled_at = new Date().toISOString();
+        }
+        
+        // ✅ FIX: Ensure webhook_enabled_at is set if initial_sync_completed is true
+        if (activeAccount.initial_sync_completed && !activeAccount.webhook_enabled_at) {
+          console.log(`[SYNC] ⚠️  Account ${activeAccount.email} has initial_sync_completed=true but webhook_enabled_at is NULL. Setting it now.`);
+          await supabaseAdmin
+            .from('email_accounts')
+            .update({ webhook_enabled_at: new Date().toISOString() })
+            .eq('id', activeAccount.id);
+          activeAccount.webhook_enabled_at = new Date().toISOString();
+        }
+
+        // ✅ FIX: Check if IDLE is active for this account - if so, skip sync to avoid conflicts
+        // IDLE handles real-time sync, so we don't need to run sync jobs simultaneously
+        try {
+          const appModule = require('../../app');
+          const idleManager = appModule.idleManager || appModule.default?.idleManager;
+          
+          if (idleManager && idleManager.activeConnections && idleManager.activeConnections.has(activeAccount.id)) {
+            console.log(`[SYNC] ⏭️  Skipping sync for ${activeAccount.email} - IDLE monitoring is active (prevents connection conflicts)`);
+            continue; // Skip this account - IDLE will handle sync
+          }
+        } catch (idleCheckError) {
+          // If we can't check IDLE status, proceed with sync anyway
+          console.warn(`[SYNC] ⚠️  Could not check IDLE status:`, idleCheckError.message);
+        }
 
         // Connect to IMAP using connection pool (limits concurrent connections)
         let connection;
@@ -726,15 +986,9 @@ async function syncAllImapAccounts() {
           // ✅ Handle "Connection ended unexpectedly" - likely rate limiting
           if (connectError.message?.includes('Connection ended unexpectedly') || 
               connectError.message?.includes('ended unexpectedly')) {
-            console.error(`[SYNC] ❌ Connection ended unexpectedly for ${activeAccount.email}. Likely rate limiting. Marking as needs_reconnection.`);
-            await supabaseAdmin
-              .from('email_accounts')
-              .update({
-                needs_reconnection: true,
-                last_error: `Connection ended unexpectedly - possible rate limiting. Please wait and reconnect.`,
-                last_connection_attempt: new Date().toISOString()
-              })
-              .eq('id', activeAccount.id);
+            console.error(`[SYNC] ❌ Connection ended unexpectedly for ${activeAccount.email}. Likely rate limiting.`);
+            // ✅ FIX: Don't mark as needs_reconnection for rate limiting - just skip this sync cycle
+            console.log(`[SYNC] ⏭️  Skipping sync for ${activeAccount.email} this cycle due to rate limiting`);
             continue; // Skip this account
           }
           throw connectError; // Re-throw other errors
@@ -793,20 +1047,42 @@ async function syncAllImapAccounts() {
       } catch (accountError) {
         console.error(`[SYNC] Error syncing account ${activeAccount.email || activeAccount.id}:`, accountError.message);
         
-        // ✅ Handle "Connection ended unexpectedly" - likely rate limiting
+        // ✅ Handle "Connection ended unexpectedly" - check if it's a real auth failure
         if (accountError.message?.includes('Connection ended unexpectedly') || 
             accountError.message?.includes('ended unexpectedly')) {
-          console.error(`[SYNC] ❌ Connection ended unexpectedly for ${activeAccount.email}. Likely rate limiting. Marking as needs_reconnection.`);
-          await supabaseAdmin
-            .from('email_accounts')
-            .update({
-              needs_reconnection: true,
-              sync_status: 'error',
-              sync_error_details: 'Connection ended unexpectedly - possible rate limiting. Please wait and reconnect.',
-              last_error: `Connection ended unexpectedly - possible rate limiting`,
-              last_connection_attempt: new Date().toISOString(),
-            })
-            .eq('id', activeAccount.id);
+          
+          // ✅ FIX: Only mark as needs_reconnection if it's a real auth failure
+          // Transient connection drops (rate limiting, network issues) shouldn't mark as needs_reconnection
+          const isRealAuthError = accountError.message?.includes('Invalid credentials') ||
+                                 accountError.message?.includes('AUTHENTICATIONFAILED') ||
+                                 accountError.message?.includes('[AUTHENTICATIONFAILED]') ||
+                                 accountError.code === 'EAUTH';
+          
+          if (isRealAuthError) {
+            // Real auth failure - mark for reconnection
+            console.error(`[SYNC] ❌ Authentication failed for ${activeAccount.email}. Marking as needs_reconnection.`);
+            await supabaseAdmin
+              .from('email_accounts')
+              .update({
+                needs_reconnection: true,
+                sync_status: 'error',
+                sync_error_details: 'Authentication failed. Please reconnect your account.',
+                last_error: `Authentication failed: ${accountError.message}`,
+                last_connection_attempt: new Date().toISOString(),
+              })
+              .eq('id', activeAccount.id);
+          } else {
+            // Transient error (rate limiting, network) - don't mark as needs_reconnection
+            console.warn(`[SYNC] ⚠️  Connection ended unexpectedly for ${activeAccount.email}. Likely rate limiting or network issue. Will retry next cycle.`);
+            await supabaseAdmin
+              .from('email_accounts')
+              .update({
+                sync_status: 'throttled',
+                sync_error_details: 'Connection ended unexpectedly - likely rate limiting. Will retry automatically.',
+                last_sync_attempt_at: new Date().toISOString(),
+              })
+              .eq('id', activeAccount.id);
+          }
           continue; // Skip to next account
         }
         
@@ -908,6 +1184,54 @@ async function saveEmailToSupabase(emailData, emailAccountId, provider) {
   }
 }
 
+// ============================================
+// PERIODIC CONNECTION CLEANUP
+// ============================================
+
+/**
+ * Periodically cleanup stale connections
+ */
+function startConnectionCleanup() {
+  setInterval(async () => {
+    console.log('[CLEANUP] Running connection health check...');
+    
+    try {
+      // Get all active accounts
+      const { data: accounts } = await supabaseAdmin
+        .from('email_accounts')
+        .select('id, email')
+        .eq('is_active', true);
+      
+      if (!accounts || accounts.length === 0) {
+        return;
+      }
+      
+      // Check each account's connections in the pool
+      for (const account of accounts) {
+        try {
+          const stats = connectionPool.getStats();
+          const accountStats = stats[account.id];
+          
+          if (accountStats && accountStats.activeConnections > 0) {
+            // Get connections from pool and check health
+            // Note: This is a simplified check - actual health check happens during sync
+            console.log(`[CLEANUP] Account ${account.email} has ${accountStats.activeConnections} active connections`);
+          }
+        } catch (error) {
+          console.error(`[CLEANUP] Error checking account ${account.id}:`, error.message);
+        }
+      }
+    } catch (error) {
+      console.error('[CLEANUP] Error during connection cleanup:', error.message);
+    }
+  }, CONNECTION_HEALTH_CHECK_INTERVAL);
+  
+  console.log(`[CLEANUP] Connection cleanup task started (runs every ${CONNECTION_HEALTH_CHECK_INTERVAL / 1000 / 60} minutes)`);
+}
+
+// Start cleanup task on module load
+startConnectionCleanup();
+
 module.exports = {
   syncAllImapAccounts,
   syncAccountFolders,
@@ -919,6 +1243,8 @@ module.exports = {
   flattenFolderStructure,
   parseEmailFromImap,
   saveOrUpdateEmail,
+  isConnectionHealthy,
+  ensureHealthyConnection,
   // Legacy exports
   syncEmailsForAccount,
   saveEmailToSupabase,
