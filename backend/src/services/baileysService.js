@@ -3124,6 +3124,58 @@ async function initializeWhatsApp(agentId, userId = null) {
               buttonText: buttonResponse.selectedButtonText,
               from: sanitizedFromNumber
             });
+            
+            // ✅ EMAIL UID BUTTON HANDLING: Check if this is an EMAIL UID button click
+            if (buttonResponse.selectedButtonId && buttonResponse.selectedButtonId.startsWith('create_draft_')) {
+              console.log(`[BUTTON-CLICK] EMAIL UID button clicked: ${buttonResponse.selectedButtonId}`);
+              
+              // Forward to button-response webhook handler
+              try {
+                const baseUrl = process.env.API_BASE_URL || 
+                               process.env.WEBHOOK_BASE_URL || 
+                               'http://localhost:3000'; // Fallback for local dev
+                
+                const buttonResponseWebhookUrl = `${baseUrl}/api/webhooks/button-response`;
+                
+                console.log(`[BUTTON-CLICK] Forwarding EMAIL UID button click to button-response webhook`, {
+                  buttonId: buttonResponse.selectedButtonId,
+                  from: sanitizedFromNumber,
+                  agentId: agentId.substring(0, 8) + '...',
+                  webhookUrl: buttonResponseWebhookUrl
+                });
+                
+                // Call button-response webhook asynchronously (don't block message processing)
+                axios.post(buttonResponseWebhookUrl, {
+                  agentId: agentId,
+                  from: sanitizedFromNumber,
+                  buttonId: buttonResponse.selectedButtonId,
+                  buttonText: buttonResponse.selectedButtonText,
+                  timestamp: timestampIso
+                }, {
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'X-Request-Id': `button-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`,
+                    'X-Internal-Request': 'true'
+                  },
+                  timeout: 10000 // 10 second timeout
+                }).then(response => {
+                  console.log(`[BUTTON-CLICK] ✅ Button response webhook called successfully`, {
+                    buttonId: buttonResponse.selectedButtonId,
+                    status: response.status
+                  });
+                }).catch(error => {
+                  console.error(`[BUTTON-CLICK] ❌ Failed to call button-response webhook:`, {
+                    buttonId: buttonResponse.selectedButtonId,
+                    error: error.message,
+                    status: error.response?.status
+                  });
+                  // Don't throw - continue with normal message processing
+                });
+              } catch (buttonError) {
+                console.error(`[BUTTON-CLICK] ❌ Error forwarding button click:`, buttonError.message);
+                // Don't throw - continue with normal message processing
+              }
+            }
           } else if (msg.message.conversation) {
             messageText = msg.message.conversation;
           } else if (msg.message.extendedTextMessage?.text) {

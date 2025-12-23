@@ -17,24 +17,34 @@ function getProviderSettings(email) {
   
   const providers = {
     'gmail.com': {
+      provider: 'gmail',
       imap: { host: 'imap.gmail.com', port: 993, ssl: true },
       smtp: { host: 'smtp.gmail.com', port: 587, tls: true },
       note: 'Gmail requires an App Password (not your regular password). Enable 2-Step Verification, then create an App Password in Google Account → Security → App passwords.'
     },
     'outlook.com': {
+      provider: 'outlook',
       imap: { host: 'outlook.office365.com', port: 993, ssl: true },
-      smtp: { host: 'smtp.office365.com', port: 587, tls: true },
-      note: 'Outlook may require OAuth2 for Office365 accounts.'
+      smtp: { host: 'smtp-mail.outlook.com', port: 587, tls: true },
+      note: 'For Outlook.com: Use your regular password if 2FA is NOT enabled. If 2FA is enabled, create an App Password at https://account.microsoft.com/security. Ensure IMAP is enabled in Outlook settings.'
     },
     'hotmail.com': {
+      provider: 'outlook',
       imap: { host: 'outlook.office365.com', port: 993, ssl: true },
-      smtp: { host: 'smtp.office365.com', port: 587, tls: true },
-      note: 'Hotmail uses Outlook servers.'
+      smtp: { host: 'smtp-mail.outlook.com', port: 587, tls: true },
+      note: 'Hotmail uses Outlook servers. Use your regular password if 2FA is NOT enabled. If 2FA is enabled, create an App Password.'
     },
     'live.com': {
+      provider: 'outlook',
       imap: { host: 'outlook.office365.com', port: 993, ssl: true },
-      smtp: { host: 'smtp.office365.com', port: 587, tls: true },
-      note: 'Live.com uses Outlook servers.'
+      smtp: { host: 'smtp-mail.outlook.com', port: 587, tls: true },
+      note: 'Live.com uses Outlook servers. Use your regular password if 2FA is NOT enabled. If 2FA is enabled, create an App Password.'
+    },
+    'msn.com': {
+      provider: 'outlook',
+      imap: { host: 'outlook.office365.com', port: 993, ssl: true },
+      smtp: { host: 'smtp-mail.outlook.com', port: 587, tls: true },
+      note: 'MSN uses Outlook servers. Use your regular password if 2FA is NOT enabled. If 2FA is enabled, create an App Password.'
     },
     'yahoo.com': {
       imap: { host: 'imap.mail.yahoo.com', port: 993, ssl: true },
@@ -62,6 +72,82 @@ function getProviderSettings(email) {
 }
 
 /**
+ * Check if email is an Outlook/Microsoft account
+ */
+function isOutlookAccount(email) {
+  if (!email) return false;
+  const domain = email.split('@')[1]?.toLowerCase();
+  const outlookDomains = ['outlook.com', 'hotmail.com', 'live.com', 'msn.com'];
+  return outlookDomains.includes(domain) || domain?.includes('onmicrosoft.com');
+}
+
+/**
+ * Check if email is a Microsoft 365 business account
+ */
+function isMicrosoft365Account(email) {
+  if (!email) return false;
+  const domain = email.split('@')[1]?.toLowerCase();
+  return domain?.includes('onmicrosoft.com') || 
+         (!['outlook.com', 'hotmail.com', 'live.com', 'msn.com'].includes(domain) && 
+          domain?.includes('office365.com'));
+}
+
+/**
+ * Get Outlook-specific error messages
+ */
+function getOutlookAuthError(error) {
+  const errorMsg = error.message?.toLowerCase() || '';
+  
+  if (errorMsg.includes('authentication') || 
+      errorMsg.includes('authenticationfailed') ||
+      errorMsg.includes('invalid credentials') ||
+      errorMsg.includes('login failed')) {
+    return {
+      message: 'Outlook Authentication Failed',
+      suggestion: `Troubleshooting steps:
+1. Verify your email and password are correct
+2. If 2FA is enabled, create an App Password:
+   - Go to: https://account.microsoft.com/security
+   - Select "Advanced security options"
+   - Under "App passwords", select "Create a new app password"
+   - Use the generated password (no spaces)
+3. Enable IMAP in Outlook settings:
+   - Go to: https://outlook.live.com/mail/0/options/mail/accounts
+   - Select "Sync email" → Enable IMAP
+4. For Microsoft 365: Check with your IT admin if IMAP is enabled`,
+      helpUrl: 'https://support.microsoft.com/en-us/office/pop-imap-and-smtp-settings-8361e398-8af4-4e97-b147-6c6c4ac95353'
+    };
+  }
+  
+  if (errorMsg.includes('imap') && errorMsg.includes('disabled')) {
+    return {
+      message: 'IMAP Access Disabled',
+      suggestion: `Your Outlook account doesn't have IMAP enabled:
+1. Go to: https://outlook.live.com/mail/0/options/mail/accounts
+2. Select "Sync email"
+3. Enable "Let devices and apps use IMAP"
+4. For Microsoft 365: Contact your IT administrator`,
+      helpUrl: 'https://support.microsoft.com/en-us/office/pop-imap-and-smtp-settings-8361e398-8af4-4e97-b147-6c6c4ac95353'
+    };
+  }
+  
+  if (errorMsg.includes('organization') || 
+      errorMsg.includes('policy') ||
+      errorMsg.includes('restricted')) {
+    return {
+      message: 'Microsoft 365 Restrictions',
+      suggestion: `Your organization may have restricted IMAP/SMTP access:
+1. Contact your IT administrator
+2. Ask them to enable IMAP for your account
+3. They may need to enable "Authenticated SMTP" in Exchange admin center`,
+      helpUrl: 'https://docs.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/pop3-and-imap4/pop3-and-imap4'
+    };
+  }
+  
+  return null;
+}
+
+/**
  * Test IMAP connection
  */
 async function testImapConnection(config) {
@@ -71,10 +157,11 @@ async function testImapConnection(config) {
     // ✅ FIX: Trim password to remove any accidental spaces
     const trimmedPassword = config.password?.trim() || config.password;
     
-    // ✅ FIX: Increase timeouts for Gmail (can be slow)
+    // ✅ FIX: Increase timeouts for Gmail and Outlook (can be slow)
     const isGmail = config.host?.includes('gmail.com') || config.username?.includes('@gmail.com');
-    const authTimeout = isGmail ? 20000 : 15000; // 20s for Gmail, 15s for others
-    const connTimeout = isGmail ? 30000 : 20000; // 30s for Gmail, 20s for others
+    const isOutlook = isOutlookAccount(config.username || config.email) || config.host?.includes('office365.com') || config.host?.includes('outlook');
+    const authTimeout = isGmail ? 20000 : (isOutlook ? 30000 : 15000); // 20s for Gmail, 30s for Outlook, 15s for others
+    const connTimeout = isGmail ? 30000 : (isOutlook ? 30000 : 20000); // 30s for Gmail/Outlook, 20s for others
     
     // First validate the connection using the centralized validation
     await validateImap({
@@ -95,14 +182,15 @@ async function testImapConnection(config) {
         tls: config.useTls !== false,
         tlsOptions: { 
           rejectUnauthorized: false,
-          minVersion: 'TLSv1.2' // ✅ Require TLS 1.2+ for Gmail
+          minVersion: 'TLSv1.2', // ✅ Require TLS 1.2+ for Gmail and Outlook
+          servername: isOutlook ? (config.host || 'outlook.office365.com') : undefined
         },
         authTimeout: authTimeout, // ✅ Increased timeout
         connTimeout: connTimeout, // ✅ Increased timeout
-        // ✅ Add keepalive for Gmail to prevent premature disconnection
-        keepalive: isGmail ? {
+        // ✅ Add keepalive for Gmail and Outlook to prevent premature disconnection
+        keepalive: (isGmail || isOutlook) ? {
           interval: 10000,
-          idleInterval: 300000,
+          idleInterval: isOutlook ? 120000 : 300000, // 2 min for Outlook, 5 min for Gmail
           forceNoop: true
         } : false
       }
@@ -153,8 +241,9 @@ async function testImapConnection(config) {
       }
     }
     
-    // Detect Gmail
+    // Detect Gmail and Outlook
     const isGmail = config.host?.includes('gmail.com') || config.username?.includes('@gmail.com');
+    const isOutlook = isOutlookAccount(config.username || config.email) || config.host?.includes('office365.com') || config.host?.includes('outlook');
     
     // Provide more helpful error messages
     let errorMessage = error.message;
@@ -168,6 +257,14 @@ async function testImapConnection(config) {
       if (isGmail) {
         errorMessage = 'Gmail authentication failed. Gmail requires an App Password, not your regular account password.';
         suggestion = 'To create a Gmail App Password: 1) Enable 2-Step Verification in your Google Account, 2) Go to Security → App passwords, 3) Create a new app password for "Mail", 4) Use that 16-character password here.';
+      } else if (isOutlook) {
+        const outlookError = getOutlookAuthError(error);
+        if (outlookError) {
+          errorMessage = outlookError.message;
+          suggestion = outlookError.suggestion;
+        } else {
+          errorMessage = 'Outlook authentication failed. Please check your email and password.';
+        }
       } else {
         errorMessage = 'Authentication failed. Please check your email and password.';
       }
@@ -232,6 +329,12 @@ If all steps are correct and it still fails, try generating a completely new App
     if (isGmail) {
       result.isGmail = true;
       result.helpUrl = 'https://support.google.com/accounts/answer/185833';
+    } else if (isOutlook) {
+      result.isOutlook = true;
+      const outlookError = getOutlookAuthError(error);
+      if (outlookError?.helpUrl) {
+        result.helpUrl = outlookError.helpUrl;
+      }
     }
     
     return result;
@@ -243,17 +346,32 @@ If all steps are correct and it still fails, try generating a completely new App
  */
 async function testSmtpConnection(config) {
   try {
+    const isOutlook = isOutlookAccount(config.username || config.email) || config.host?.includes('outlook') || config.host?.includes('office365');
+    const isM365 = isMicrosoft365Account(config.username || config.email);
+    
+    // Determine SMTP host for Outlook if not provided
+    let smtpHost = config.host;
+    if (isOutlook && !smtpHost) {
+      smtpHost = isM365 ? 'smtp.office365.com' : 'smtp-mail.outlook.com';
+    }
+    
     const transporter = nodemailer.createTransport({
-      host: config.host,
-      port: config.port,
-      secure: config.useSsl === true && config.port === 465,
+      host: smtpHost || config.host,
+      port: config.port || 587,
+      secure: config.useSsl === true && (config.port === 465),
+      requireTLS: isOutlook ? true : undefined, // Outlook requires TLS
       auth: {
         user: config.username,
-        pass: config.password
+        pass: config.password?.trim() || config.password
       },
       tls: {
-        rejectUnauthorized: false // Allow self-signed certificates
-      }
+        rejectUnauthorized: false, // Allow self-signed certificates
+        minVersion: isOutlook ? 'TLSv1.2' : undefined,
+        servername: isOutlook ? (smtpHost || config.host) : undefined
+      },
+      connectionTimeout: isOutlook ? 30000 : undefined,
+      greetingTimeout: isOutlook ? 30000 : undefined,
+      socketTimeout: isOutlook ? 60000 : undefined
     });
     
     await transporter.verify();
@@ -263,10 +381,25 @@ async function testSmtpConnection(config) {
       message: 'SMTP connection successful'
     };
   } catch (error) {
+    const isOutlook = isOutlookAccount(config.username || config.email) || config.host?.includes('outlook') || config.host?.includes('office365');
+    const errorMsg = error.message?.toLowerCase() || '';
+    
+    let errorMessage = error.message;
+    let suggestion = null;
+    
+    if (isOutlook && (errorMsg.includes('authentication') || errorMsg.includes('credentials'))) {
+      const outlookError = getOutlookAuthError(error);
+      if (outlookError) {
+        errorMessage = `Outlook SMTP ${outlookError.message}`;
+        suggestion = outlookError.suggestion;
+      }
+    }
+    
     return {
       success: false,
-      error: error.message,
-      details: error.toString()
+      error: errorMessage,
+      details: error.toString(),
+      suggestion: suggestion
     };
   }
 }
@@ -928,18 +1061,34 @@ async function sendEmail(accountId, { to, subject, body, html, attachments = [],
     // Decrypt password
     const password = decryptPassword(account.smtp_password);
     
-    // Create transporter
+    // Check if this is an Outlook account
+    const isOutlook = isOutlookAccount(account.email) || account.provider === 'outlook';
+    const isM365 = isMicrosoft365Account(account.email);
+    
+    // Determine SMTP host for Outlook if not set
+    let smtpHost = account.smtp_host;
+    if (isOutlook && !smtpHost) {
+      smtpHost = isM365 ? 'smtp.office365.com' : 'smtp-mail.outlook.com';
+    }
+    
+    // Create transporter with Outlook-specific settings
     const transporter = nodemailer.createTransport({
-      host: account.smtp_host,
+      host: smtpHost || account.smtp_host,
       port: account.smtp_port || 587,
       secure: account.use_ssl === true && account.smtp_port === 465,
+      requireTLS: isOutlook ? true : undefined, // Outlook requires TLS
       auth: {
-        user: account.smtp_username,
-        pass: password
+        user: account.smtp_username || account.email,
+        pass: password?.trim() || password
       },
       tls: {
-        rejectUnauthorized: false
-      }
+        rejectUnauthorized: false,
+        minVersion: isOutlook ? 'TLSv1.2' : undefined,
+        servername: isOutlook ? (smtpHost || account.smtp_host) : undefined
+      },
+      connectionTimeout: isOutlook ? 30000 : undefined,
+      greetingTimeout: isOutlook ? 30000 : undefined,
+      socketTimeout: isOutlook ? 60000 : undefined
     });
     
     // Prepare email options
@@ -1047,8 +1196,50 @@ async function getFolders(accountId) {
       }
     );
     
+    // Check if this is an Outlook account
+    const isOutlook = isOutlookAccount(account.email) || account.provider === 'outlook';
+    
     // Flatten folder structure and filter out non-selectable folders
     const folders = [];
+    
+    /**
+     * Normalize Outlook folder names to standard names
+     */
+    function normalizeOutlookFolderName(name) {
+      if (!isOutlook) return name;
+      
+      const normalizations = {
+        'Sent Items': 'Sent',
+        'Deleted Items': 'Trash',
+        'Junk Email': 'Spam',
+        'Drafts': 'Drafts',
+        'Archive': 'Archive',
+      };
+      
+      return normalizations[name] || name;
+    }
+    
+    /**
+     * Check if folder is a special Outlook folder
+     */
+    function isSpecialOutlookFolder(name) {
+      if (!isOutlook) return false;
+      
+      const specialFolders = [
+        'INBOX',
+        'Inbox',
+        'Sent Items',
+        'Sent',
+        'Deleted Items',
+        'Trash',
+        'Junk Email',
+        'Spam',
+        'Drafts',
+        'Archive',
+      ];
+      
+      return specialFolders.some(f => name.toLowerCase() === f.toLowerCase());
+    }
     
     function flattenBoxes(boxes, prefix = '') {
       for (const [name, box] of Object.entries(boxes)) {
@@ -1060,11 +1251,14 @@ async function getFolders(accountId) {
         const isSelectable = !attributes.includes('\\Noselect');
         
         if (isSelectable) {
+          const displayName = normalizeOutlookFolderName(name);
           folders.push({
             name: fullName,
-            delimiter: box.delimiter,
+            displayName: displayName,
+            delimiter: box.delimiter || '/',
             attributes: attributes,
-            children: Object.keys(box.children || {}).length
+            children: Object.keys(box.children || {}).length,
+            special: isSpecialOutlookFolder(name)
           });
         }
         
@@ -1077,10 +1271,21 @@ async function getFolders(accountId) {
     
     flattenBoxes(boxes);
     
-    // Sort folders: INBOX first, then alphabetically
+    // Sort folders: INBOX first, special folders, then alphabetically
     folders.sort((a, b) => {
-      if (a.name.toUpperCase() === 'INBOX') return -1;
-      if (b.name.toUpperCase() === 'INBOX') return 1;
+      const aName = a.name.toUpperCase();
+      const bName = b.name.toUpperCase();
+      
+      // INBOX always first
+      if (aName === 'INBOX') return -1;
+      if (bName === 'INBOX') return 1;
+      
+      // Special folders next (for Outlook)
+      if (isOutlook) {
+        if (a.special && !b.special) return -1;
+        if (!a.special && b.special) return 1;
+      }
+      
       return a.name.localeCompare(b.name);
     });
     
@@ -1093,10 +1298,13 @@ async function getFolders(accountId) {
   } catch (error) {
     // Handle throttling errors gracefully
     if (isThrottlingError(error)) {
+      const isOutlook = isOutlookAccount(account?.email) || account?.provider === 'outlook';
       console.error('Error getting folders (throttled):', error.message);
       return {
         success: false,
-        error: 'Gmail rate limit exceeded. Please try again in a few minutes.',
+        error: isOutlook 
+          ? 'Outlook rate limit exceeded. Please try again in a few minutes.'
+          : 'Gmail rate limit exceeded. Please try again in a few minutes.',
         folders: [],
         throttled: true
       };

@@ -8,7 +8,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { MessageSquare, ArrowLeft, Eye, EyeOff, CheckCircle2, XCircle } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
-import GoogleAuthButton from "@/components/GoogleAuthButton.jsx";
 import { useToast } from "@/hooks/use-toast";
 import { API_URL } from "@/config";
 import { CountrySelect } from "@/components/ui/CountrySelect";
@@ -52,25 +51,6 @@ const Auth = () => {
   // Password matching validation
   const passwordsMatch = confirmPassword !== "" && signupData.password === confirmPassword;
   const passwordsMismatch = confirmPassword !== "" && signupData.password !== confirmPassword;
-
-  const handleGoogleLogin = async () => {
-    try {
-      const { data, error } = await supabase.auth.signInWithOAuth({
-        provider: 'google',
-        options: {
-          redirectTo: `${window.location.origin}/dashboard`,
-        },
-      });
-
-      if (error) throw error;
-    } catch (error: any) {
-      toast({
-        variant: "destructive",
-        title: "Google login failed",
-        description: error.message,
-      });
-    }
-  };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -252,17 +232,6 @@ const Auth = () => {
 
               <TabsContent value="login" className="mt-6">
                 <div className="space-y-6">
-                  <GoogleAuthButton />
-
-                  <div className="relative">
-                    <div className="absolute inset-0 flex items-center">
-                      <span className="w-full border-t border-white/10" />
-                    </div>
-                    <div className="relative flex justify-center text-xs uppercase">
-                      <span className="bg-black px-3 text-gray-400">Or continue with email</span>
-                    </div>
-                  </div>
-
                   <form onSubmit={handleLogin} className="space-y-5">
                     <div className="space-y-2">
                       <Label htmlFor="login-email" className="text-gray-300">Email</Label>
@@ -315,17 +284,6 @@ const Auth = () => {
 
               <TabsContent value="signup" className="mt-6">
                 <div className="space-y-6">
-                  <GoogleAuthButton />
-
-                  <div className="relative">
-                    <div className="absolute inset-0 flex items-center">
-                      <span className="w-full border-t border-white/10" />
-                    </div>
-                    <div className="relative flex justify-center text-xs uppercase">
-                      <span className="bg-black px-3 text-gray-400">Or sign up with email</span>
-                    </div>
-                  </div>
-
                   <form onSubmit={handleSignup} className="space-y-4">
                     <div className="space-y-2">
                       <Label htmlFor="signup-name" className="text-gray-300">Full Name</Label>

@@ -57,24 +57,51 @@ router.post('/', async (req, res) => {
     let isButtonMessage = false;
     
     if (typeof message === 'string') {
-      // Try to parse as JSON (for button messages)
-      try {
-        const parsed = JSON.parse(message);
-        if (parsed && typeof parsed === 'object' && parsed.buttons) {
-          // This is a button message
-          messagePayload = parsed;
-          isButtonMessage = true;
-          console.log(`${logPrefix} ✅ Detected button message format`, {
-            hasText: !!parsed.text,
-            buttonCount: parsed.buttons?.length || 0
-          });
-        } else {
-          // Not a button message, use as plain text
+      // ✅ EMAIL UID DETECTION: Check if message contains EMAIL UID pattern
+      const emailUidMatch = message.match(/🆔 \*EMAIL UID:\* (\d+)/);
+      
+      if (emailUidMatch) {
+        const uid = emailUidMatch[1];
+        console.log(`[BUTTON-MESSAGE] Creating button for email UID: ${uid}`);
+        
+        // Convert to button message format (sendMessage will convert to Baileys format)
+        // Button text must be max 20 characters (WhatsApp limit)
+        const buttonText = `Create Draft uid(${uid})`.substring(0, 20);
+        messagePayload = {
+          text: message.trim(),
+          footer: '⚡ Automated Email Triage System',
+          buttons: [{
+            id: `create_draft_${uid}`,
+            text: buttonText
+          }]
+        };
+        isButtonMessage = true;
+        
+        console.log(`${logPrefix} ✅ Detected EMAIL UID, converted to button message`, {
+          uid: uid,
+          buttonId: `create_draft_${uid}`,
+          buttonText: buttonText
+        });
+      } else {
+        // Try to parse as JSON (for button messages)
+        try {
+          const parsed = JSON.parse(message);
+          if (parsed && typeof parsed === 'object' && parsed.buttons) {
+            // This is a button message
+            messagePayload = parsed;
+            isButtonMessage = true;
+            console.log(`${logPrefix} ✅ Detected button message format`, {
+              hasText: !!parsed.text,
+              buttonCount: parsed.buttons?.length || 0
+            });
+          } else {
+            // Not a button message, use as plain text
+            messagePayload = message.trim();
+          }
+        } catch (e) {
+          // Not JSON, use as plain text
           messagePayload = message.trim();
         }
-      } catch (e) {
-        // Not JSON, use as plain text
-        messagePayload = message.trim();
       }
     } else if (message && typeof message === 'object' && message.buttons) {
       // Already an object with buttons

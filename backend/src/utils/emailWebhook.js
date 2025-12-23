@@ -96,6 +96,22 @@ async function callEmailWebhook(emailData, accountId, userId) {
   }
 
   try {
+    // Get account provider for webhook payload
+    let accountProvider = 'custom';
+    try {
+      const { data: accountData } = await supabaseAdmin
+        .from('email_accounts')
+        .select('provider')
+        .eq('id', accountId)
+        .single();
+      if (accountData?.provider) {
+        accountProvider = accountData.provider;
+      }
+    } catch (providerError) {
+      // If we can't get provider, use 'custom' as default
+      console.warn(`[EMAIL_WEBHOOK] Could not fetch provider for account ${accountId}:`, providerError.message);
+    }
+
     // Parse attachments_meta if it's a string
     let attachmentsMeta = [];
     if (emailData.attachments_meta) {
@@ -111,6 +127,7 @@ async function callEmailWebhook(emailData, accountId, userId) {
     const payload = {
       event: 'new_email',
       timestamp: new Date().toISOString(),
+      provider: accountProvider, // ✅ Added: 'gmail', 'outlook', or 'custom'
       account_id: accountId,
       user_id: userId,
       email: {
@@ -135,6 +152,8 @@ async function callEmailWebhook(emailData, accountId, userId) {
       timeout: 10000, // 10 second timeout
       headers: {
         'Content-Type': 'application/json',
+        'X-Email-Provider': accountProvider, // ✅ Added: Header for easy identification
+        'X-Account-Id': accountId,
       }
     });
 

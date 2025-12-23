@@ -15,7 +15,7 @@ function isThrottlingError(error) {
   const errorText = error.textCode || '';
   const errorType = error.type || '';
   
-  // Check for Gmail throttling indicators
+  // Check for Gmail and Outlook throttling indicators
   const throttlingIndicators = [
     '[THROTTLED]',
     'THROTTLED',
@@ -28,7 +28,13 @@ function isThrottlingError(error) {
     'temporary failure',
     'temporary_failure',
     'try again',
-    'try_again'
+    'try_again',
+    // Outlook-specific throttling indicators
+    'throttl',
+    'overloaded',
+    'mailbox is being accessed',
+    'concurrent',
+    'too many connections'
   ];
   
   const messageLower = errorMessage.toLowerCase();
@@ -54,6 +60,7 @@ function isConnectionError(error) {
   const connectionIndicators = [
     'connection',
     'timeout',
+    'etimedout',
     'econnreset',
     'socket',
     'network',
@@ -67,7 +74,8 @@ function isConnectionError(error) {
     'session expired',
     'session closed',
     'connection closed',
-    'connection lost'
+    'connection lost',
+    'disconnected'
   ];
   
   return connectionIndicators.some(indicator => 

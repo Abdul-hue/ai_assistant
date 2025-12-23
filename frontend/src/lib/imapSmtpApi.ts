@@ -47,6 +47,7 @@ export interface ImapSmtpFolder {
 }
 
 export interface ProviderSettings {
+  provider?: string;
   imap: {
     host: string;
     port: number;
@@ -58,6 +59,16 @@ export interface ProviderSettings {
     tls: boolean;
   };
   note?: string;
+}
+
+export interface ProviderGuidance {
+  title: string;
+  steps: string[];
+  links: {
+    settings: string;
+    appPassword: string;
+    help: string;
+  };
 }
 
 /**
@@ -79,6 +90,45 @@ export const detectProviderSettings = async (email: string): Promise<ProviderSet
     console.error('Error detecting provider:', error);
     return null;
   }
+};
+
+/**
+ * Get provider-specific setup guidance
+ */
+export const getProviderGuidance = (provider: string): ProviderGuidance | null => {
+  if (provider === 'outlook') {
+    return {
+      title: 'Outlook/Microsoft 365 Setup',
+      steps: [
+        'Use your full email address as username',
+        'If 2FA is enabled, create an App Password',
+        'Enable IMAP in Outlook settings',
+        'For Microsoft 365: Check with IT if needed',
+      ],
+      links: {
+        settings: 'https://outlook.live.com/mail/0/options/mail/accounts',
+        appPassword: 'https://account.microsoft.com/security',
+        help: 'https://support.microsoft.com/en-us/office/pop-imap-and-smtp-settings-8361e398-8af4-4e97-b147-6c6c4ac95353',
+      },
+    };
+  } else if (provider === 'gmail') {
+    return {
+      title: 'Gmail Setup',
+      steps: [
+        'Enable 2-Step Verification',
+        'Create App Password for Mail',
+        'Enable IMAP in Gmail settings',
+        'Use the 16-character App Password',
+      ],
+      links: {
+        settings: 'https://mail.google.com/mail/u/0/#settings/fwdandpop',
+        appPassword: 'https://myaccount.google.com/apppasswords',
+        help: 'https://support.google.com/mail/answer/7126229',
+      },
+    };
+  }
+  
+  return null;
 };
 
 /**

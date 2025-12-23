@@ -5,17 +5,39 @@
 
 class ImapConnectionPool {
   constructor() {
-    // Map: accountId -> array of active connections (max 5 per account)
+    // Map: accountId -> array of active connections
     this.connections = new Map();
     // Map: accountId -> connection creation timestamps
     this.connectionTimestamps = new Map();
     // Map: accountId -> pending connection requests
     this.pendingRequests = new Map();
-    // ✅ FIX: Limit to 3 connections per account to prevent Gmail rate limiting
-    // 1 for IDLE, 2 for sync operations
-    this.maxConnectionsPerAccount = 3;
+    // Map: accountId -> provider type (for provider-specific limits)
+    this.accountProviders = new Map();
+    // Default max connections per account
+    this.defaultMaxConnections = 3;
+    // Provider-specific max connections
+    this.providerMaxConnections = {
+      'gmail': 5,
+      'outlook': 10, // Outlook allows more concurrent connections
+      'custom': 5
+    };
     // Connection timeout (30 minutes)
     this.connectionTimeout = 30 * 60 * 1000;
+  }
+  
+  /**
+   * Get max connections for an account based on provider
+   */
+  getMaxConnections(accountId) {
+    const provider = this.accountProviders.get(accountId) || 'custom';
+    return this.providerMaxConnections[provider] || this.defaultMaxConnections;
+  }
+  
+  /**
+   * Set provider for an account
+   */
+  setAccountProvider(accountId, provider) {
+    this.accountProviders.set(accountId, provider);
   }
 
   /**
@@ -48,8 +70,9 @@ class ImapConnectionPool {
     }
 
     // If we're at max connections, wait for one to become available
-    if (accountConnections.length >= this.maxConnectionsPerAccount) {
-      console.log(`[POOL] Max connections reached for ${accountId}, waiting for available connection...`);
+    const maxConnections = this.getMaxConnections(accountId);
+    if (accountConnections.length >= maxConnections) {
+      console.log(`[POOL] Max connections reached for ${accountId} (${accountConnections.length}/${maxConnections}), waiting for available connection...`);
       return await this.waitForAvailableConnection(accountId, createConnection);
     }
 
@@ -99,7 +122,8 @@ class ImapConnectionPool {
     accountConnections.push(connection);
     timestamps.push(Date.now());
 
-    console.log(`[POOL] Added connection for account ${accountId} (${accountConnections.length}/${this.maxConnectionsPerAccount})`);
+    const maxConnections = this.getMaxConnections(accountId);
+    console.log(`[POOL] Added connection for account ${accountId} (${accountConnections.length}/${maxConnections})`);
   }
 
   /**
@@ -113,7 +137,8 @@ class ImapConnectionPool {
     if (index !== -1) {
       accountConnections.splice(index, 1);
       timestamps.splice(index, 1);
-      console.log(`[POOL] Removed connection for account ${accountId} (${accountConnections.length}/${this.maxConnectionsPerAccount})`);
+      const maxConnections = this.getMaxConnections(accountId);
+      console.log(`[POOL] Removed connection for account ${accountId} (${accountConnections.length}/${maxConnections})`);
     }
 
     // Clean up connection
@@ -242,7 +267,8 @@ class ImapConnectionPool {
     const accountConnections = this.connections.get(accountId) || [];
 
     // Process requests while we have capacity
-    while (pending.length > 0 && accountConnections.length < this.maxConnectionsPerAccount) {
+    const maxConnections = this.getMaxConnections(accountId);
+    while (pending.length > 0 && accountConnections.length < maxConnections) {
       const request = pending.shift();
       
       try {
@@ -287,6 +313,7 @@ class ImapConnectionPool {
     this.connections.delete(accountId);
     this.connectionTimestamps.delete(accountId);
     this.pendingRequests.delete(accountId);
+    this.accountProviders.delete(accountId);
 
     console.log(`[POOL] Closed all connections for account ${accountId}`);
   }
@@ -300,7 +327,8 @@ class ImapConnectionPool {
     for (const [accountId, connections] of this.connections.entries()) {
       stats[accountId] = {
         activeConnections: connections.length,
-        maxConnections: this.maxConnectionsPerAccount,
+        maxConnections: this.getMaxConnections(accountId),
+        provider: this.accountProviders.get(accountId) || 'unknown',
         pendingRequests: (this.pendingRequests.get(accountId) || []).length
       };
     }

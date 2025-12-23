@@ -109,6 +109,9 @@ router.post('/connect', authMiddleware, async (req, res) => {
       detectedSettings = getProviderSettings(email);
     }
 
+    // Determine provider from detected settings or provided value
+    const finalProvider = provider || detectedSettings?.provider || 'custom';
+
     // Use detected settings or provided settings
     const finalImapHost = imapHost || detectedSettings?.imap?.host;
     const finalImapPort = imapPort || detectedSettings?.imap?.port || 993;
@@ -164,11 +167,15 @@ router.post('/connect', authMiddleware, async (req, res) => {
         details: imapTest.error
       };
       
-      // Add Gmail-specific help
+      // Add provider-specific help
       if (imapTest.isGmail || email?.includes('@gmail.com')) {
         response.suggestion = imapTest.suggestion || 'Gmail requires an App Password. Go to your Google Account → Security → 2-Step Verification → App passwords, then create a new app password for "Mail".';
         response.helpUrl = imapTest.helpUrl || 'https://support.google.com/accounts/answer/185833';
         response.isGmail = true;
+      } else if (imapTest.isOutlook || finalProvider === 'outlook' || email?.match(/@(outlook|hotmail|live|msn)\.com/)) {
+        response.suggestion = imapTest.suggestion || detectedSettings?.note || 'Outlook authentication failed. If 2FA is enabled, create an App Password at https://account.microsoft.com/security';
+        response.helpUrl = imapTest.helpUrl || 'https://support.microsoft.com/en-us/office/pop-imap-and-smtp-settings-8361e398-8af4-4e97-b147-6c6c4ac95353';
+        response.isOutlook = true;
       } else {
         response.suggestion = imapTest.suggestion || detectedSettings?.note || 'Please check your IMAP settings';
       }
@@ -182,11 +189,21 @@ router.post('/connect', authMiddleware, async (req, res) => {
       : { success: false, error: smtpTestResult.reason?.message || 'SMTP test failed' };
 
     if (!smtpTest.success) {
-      return res.status(400).json({
+      const response = {
         error: 'SMTP connection failed',
-        details: smtpTest.error,
-        suggestion: detectedSettings?.note || 'Please check your SMTP settings'
-      });
+        details: smtpTest.error
+      };
+      
+      // Add Outlook-specific help
+      if (finalProvider === 'outlook' || email?.match(/@(outlook|hotmail|live|msn)\.com/)) {
+        response.suggestion = smtpTest.suggestion || detectedSettings?.note || 'Outlook SMTP authentication failed. If 2FA is enabled, create an App Password.';
+        response.helpUrl = 'https://support.microsoft.com/en-us/office/pop-imap-and-smtp-settings-8361e398-8af4-4e97-b147-6c6c4ac95353';
+        response.isOutlook = true;
+      } else {
+        response.suggestion = smtpTest.suggestion || detectedSettings?.note || 'Please check your SMTP settings';
+      }
+      
+      return res.status(400).json(response);
     }
 
     // Encrypt passwords
@@ -200,7 +217,7 @@ router.post('/connect', authMiddleware, async (req, res) => {
 
     const accountData = {
       user_id: userId,
-      provider: provider || 'custom',
+      provider: finalProvider,
       email: email,
       imap_host: finalImapHost,
       imap_port: finalImapPort,
@@ -243,7 +260,7 @@ router.post('/connect', authMiddleware, async (req, res) => {
           .select('*')
           .eq('user_id', userId)
           .eq('email', email)
-          .eq('provider', provider || 'custom')
+          .eq('provider', finalProvider)
           .single();
         
         if (fetchError || !existingAccount) {
