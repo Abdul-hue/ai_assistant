@@ -106,9 +106,6 @@ class ImapIdleManager {
       // Start monitoring
       await this.monitorFolders(account.id);
 
-<<<<<<< Updated upstream
-      console.log(`[IDLE] IDLE monitoring started for ${account.email}`);
-=======
       // ✅ Open INBOX folder
       await connection.openBox('INBOX');
       console.log(`[IDLE] ✅ INBOX opened for ${account.email}`);
@@ -393,7 +390,6 @@ class ImapIdleManager {
       this.healthCheckIntervals.set(account.id, healthCheckInterval);
 
       console.log(`[IDLE] ✅ IDLE monitoring active for ${account.email}`);
->>>>>>> Stashed changes
     } catch (error) {
       // ✅ Handle "Connection ended unexpectedly" in catch block too
       if (error.message?.includes('Connection ended unexpectedly') || 
@@ -445,28 +441,6 @@ class ImapIdleManager {
 
       // Close connection
       connectionData.monitoring = false;
-<<<<<<< Updated upstream
-      try {
-        connectionData.connection.end();
-      } catch (e) {
-        // Ignore errors when closing
-=======
-      
-      try {
-        const nodeImap = connectionData.connection?.imap;
-        if (nodeImap && connectionData.idleStarted && typeof nodeImap.idleStop === 'function') {
-          console.log(`[IDLE] Stopping IDLE mode for account ${accountId}...`);
-          try {
-            nodeImap.idleStop();
-            connectionData.idleStarted = false;
-            console.log(`[IDLE] ✅ IDLE mode stopped for account ${accountId}`);
-          } catch (idleStopError) {
-            console.warn(`[IDLE] Error stopping IDLE mode:`, idleStopError.message);
-          }
-        }
-      } catch (idleCheckError) {
-        // Ignore errors when checking for IDLE
-      }
       
       // ✅ FIX: Remove event listeners to prevent memory leak
       if (connectionData.connection) {
@@ -490,7 +464,6 @@ class ImapIdleManager {
         } catch (e) {
           // Ignore errors when closing
         }
->>>>>>> Stashed changes
       }
 
       this.activeConnections.delete(accountId);
