@@ -51,77 +51,20 @@ router.post('/', async (req, res) => {
   try {
     let { agentId, to, message } = req.body || {};
 
-    // ✅ TASK 1: Parse button JSON messages
-    // Support both plain text and button object format
+    // Validate and process message as plain text string
     let messagePayload = null;
-    let isButtonMessage = false;
     
     if (typeof message === 'string') {
-      // ✅ EMAIL UID DETECTION: Check if message contains EMAIL UID pattern
-      const emailUidMatch = message.match(/🆔 \*EMAIL UID:\* (\d+)/);
-      
-      if (emailUidMatch) {
-        const uid = emailUidMatch[1];
-        console.log(`[BUTTON-MESSAGE] Creating button for email UID: ${uid}`);
-        
-        // Convert to button message format (sendMessage will convert to Baileys format)
-        // Button text must be max 20 characters (WhatsApp limit)
-        const buttonText = `Create Draft uid(${uid})`.substring(0, 20);
-        messagePayload = {
-          text: message.trim(),
-          footer: '⚡ Automated Email Triage System',
-          buttons: [{
-            id: `create_draft_${uid}`,
-            text: buttonText
-          }]
-        };
-        isButtonMessage = true;
-        
-        console.log(`${logPrefix} ✅ Detected EMAIL UID, converted to button message`, {
-          uid: uid,
-          buttonId: `create_draft_${uid}`,
-          buttonText: buttonText
-        });
-      } else {
-        // Try to parse as JSON (for button messages)
-        try {
-          const parsed = JSON.parse(message);
-          if (parsed && typeof parsed === 'object' && parsed.buttons) {
-            // This is a button message
-            messagePayload = parsed;
-            isButtonMessage = true;
-            console.log(`${logPrefix} ✅ Detected button message format`, {
-              hasText: !!parsed.text,
-              buttonCount: parsed.buttons?.length || 0
-            });
-          } else {
-            // Not a button message, use as plain text
-            messagePayload = message.trim();
-          }
-        } catch (e) {
-          // Not JSON, use as plain text
-          messagePayload = message.trim();
-        }
-      }
-    } else if (message && typeof message === 'object' && message.buttons) {
-      // Already an object with buttons
-      messagePayload = message;
-      isButtonMessage = true;
-      console.log(`${logPrefix} ✅ Detected button message object`, {
-        hasText: !!message.text,
-        buttonCount: message.buttons?.length || 0
-      });
+      messagePayload = message.trim();
     } else {
-      // Invalid format
       messagePayload = null;
     }
 
     console.log(`${logPrefix} Incoming webhook request`, {
       agentId: agentId ? agentId.substring(0, 8) + '...' : 'missing',
       to: to ? to.substring(0, 10) + '...' : 'missing',
-      messageType: isButtonMessage ? 'button' : 'text',
       hasMessage: messagePayload !== null,
-      messageLength: typeof messagePayload === 'string' ? messagePayload.length : (messagePayload?.text?.length || 0)
+      messageLength: messagePayload ? messagePayload.length : 0
     });
 
     // Validate agentId
@@ -145,98 +88,23 @@ router.post('/', async (req, res) => {
       });
     }
 
-    // ✅ TASK 1: Validate message (support both text and button formats)
-    if (!messagePayload) {
+    // Validate message
+    if (!messagePayload || typeof messagePayload !== 'string' || messagePayload.trim().length === 0) {
       console.warn(`${logPrefix} Invalid message`);
       return res.status(400).json({
         success: false,
         error: 'Invalid or missing message',
-        details: 'Message must be a string or a button object with text and buttons array'
+        details: 'Message must be a non-empty string'
       });
     }
 
-    if (isButtonMessage) {
-      // Validate button message format
-      if (!messagePayload.text || typeof messagePayload.text !== 'string' || messagePayload.text.trim().length === 0) {
-        console.warn(`${logPrefix} Button message missing text`);
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid button message',
-          details: 'Button messages must include a text field'
-        });
-      }
-
-      if (!Array.isArray(messagePayload.buttons) || messagePayload.buttons.length === 0) {
-        console.warn(`${logPrefix} Button message missing buttons array`);
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid button message',
-          details: 'Button messages must include a buttons array with at least one button'
-        });
-      }
-
-      if (messagePayload.buttons.length > 3) {
-        console.warn(`${logPrefix} Too many buttons: ${messagePayload.buttons.length}`);
-        return res.status(400).json({
-          success: false,
-          error: 'Too many buttons',
-          details: 'WhatsApp supports a maximum of 3 buttons per message'
-        });
-      }
-
-      // Validate each button
-      for (let i = 0; i < messagePayload.buttons.length; i++) {
-        const button = messagePayload.buttons[i];
-        if (!button.id || typeof button.id !== 'string') {
-          return res.status(400).json({
-            success: false,
-            error: 'Invalid button',
-            details: `Button ${i + 1} must have an id (string)`
-          });
-        }
-        if (!button.text || typeof button.text !== 'string' || button.text.trim().length === 0) {
-          return res.status(400).json({
-            success: false,
-            error: 'Invalid button',
-            details: `Button ${i + 1} must have a text (string)`
-          });
-        }
-        if (button.text.length > 20) {
-          return res.status(400).json({
-            success: false,
-            error: 'Button text too long',
-            details: `Button ${i + 1} text must be 20 characters or less`
-          });
-        }
-      }
-
-      if (messagePayload.text.length > MAX_MESSAGE_LENGTH) {
-        console.warn(`${logPrefix} Button message text too long: ${messagePayload.text.length} chars`);
-        return res.status(400).json({
-          success: false,
-          error: 'Message text too long',
-          details: `Message text must be less than ${MAX_MESSAGE_LENGTH} characters (WhatsApp limit)`
-        });
-      }
-    } else {
-      // Validate plain text message
-      if (typeof messagePayload !== 'string' || messagePayload.trim().length === 0) {
-        console.warn(`${logPrefix} Invalid message`);
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid or missing message',
-          details: 'Message cannot be empty'
-        });
-      }
-
-      if (messagePayload.length > MAX_MESSAGE_LENGTH) {
-        console.warn(`${logPrefix} Message too long: ${messagePayload.length} chars`);
+    if (messagePayload.length > MAX_MESSAGE_LENGTH) {
+      console.warn(`${logPrefix} Message too long: ${messagePayload.length} chars`);
       return res.status(400).json({
         success: false,
         error: 'Message too long',
         details: `Message must be less than ${MAX_MESSAGE_LENGTH} characters (WhatsApp limit)`
       });
-      }
     }
 
     // Verify agent exists in database
@@ -262,109 +130,6 @@ router.post('/', async (req, res) => {
         error: 'Agent not found',
         details: `No agent found with ID: ${agentId}`
       });
-    }
-
-    // ✅ CRITICAL FIX: Store dashboard message BEFORE checking WhatsApp connection
-    // This ensures the message is stored even if WhatsApp is disconnected
-    let dashboardMessageId = null;
-    console.log(`${logPrefix} 🔍 Starting dashboard message storage...`, {
-      agentId: agentId.substring(0, 8) + '...',
-      isButtonMessage,
-      hasMessagePayload: !!messagePayload
-    });
-    
-    try {
-      const { data: agentDataForStorage, error: agentDataError } = await supabaseAdmin
-        .from('agents')
-        .select('user_id, whatsapp_phone_number')
-        .eq('id', agentId)
-        .single();
-
-      console.log(`${logPrefix} 🔍 Agent data lookup for storage:`, {
-        hasAgentData: !!agentDataForStorage,
-        hasError: !!agentDataError,
-        hasUserId: !!agentDataForStorage?.user_id,
-        hasPhone: !!agentDataForStorage?.whatsapp_phone_number
-      });
-
-      if (agentDataForStorage && agentDataForStorage.user_id && agentDataForStorage.whatsapp_phone_number) {
-        const now = new Date().toISOString();
-        const agentMessageId = `agent-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
-        
-        // Format button message for dashboard display
-        let dashboardMessage = isButtonMessage ? messagePayload.text : messagePayload;
-        
-        if (isButtonMessage && Array.isArray(messagePayload.buttons)) {
-          const buttonLines = messagePayload.buttons.map((btn, index) => {
-            const buttonNumber = index + 1;
-            return `*${buttonNumber} ${btn.text}*`;
-          }).join('\n');
-          
-          dashboardMessage = `${messagePayload.text}\n\n${buttonLines}`;
-          
-          console.log(`${logPrefix} 📝 Formatted button message for dashboard:`, {
-            originalText: messagePayload.text,
-            buttonCount: messagePayload.buttons.length,
-            formattedLength: dashboardMessage.length,
-            formattedMessage: dashboardMessage.substring(0, 200)
-          });
-        }
-        
-        const insertPayload = {
-          message_id: agentMessageId,
-          conversation_id: `${agentDataForStorage.whatsapp_phone_number}@s.whatsapp.net`,
-          sender_phone: agentDataForStorage.whatsapp_phone_number,
-          agent_id: agentId,
-          user_id: agentDataForStorage.user_id,
-          message_text: dashboardMessage,
-          received_at: now,
-          created_at: now,
-          message_type: 'text',
-          source: 'dashboard',
-          sender_type: 'agent',
-          is_from_me: false,
-          status: 'delivered',
-        };
-
-        console.log(`${logPrefix} 🔍 Attempting database insert:`, {
-          message_id: insertPayload.message_id,
-          source: insertPayload.source,
-          sender_type: insertPayload.sender_type,
-          messagePreview: insertPayload.message_text.substring(0, 100)
-        });
-
-        const { data: insertedData, error: insertError } = await supabaseAdmin
-          .from('message_log')
-          .insert(insertPayload)
-          .select()
-          .single();
-
-        if (insertError) {
-          console.error(`${logPrefix} ❌ Failed to store agent response in database:`, {
-            error: insertError.message,
-            code: insertError.code,
-            details: insertError.details,
-            hint: insertError.hint
-          });
-        } else {
-          dashboardMessageId = insertedData?.id || insertedData?.message_id;
-          console.log(`${logPrefix} ✅ Agent response stored in database:`, {
-            id: dashboardMessageId,
-            message_id: insertedData?.message_id,
-            source: insertedData?.source,
-            sender_type: insertedData?.sender_type,
-            messagePreview: (insertedData?.message_text || '').substring(0, 100)
-          });
-        }
-      } else {
-        console.warn(`${logPrefix} ⚠️  Cannot store agent response:`, {
-          hasAgentData: !!agentDataForStorage,
-          hasUserId: !!agentDataForStorage?.user_id,
-          hasPhone: !!agentDataForStorage?.whatsapp_phone_number
-        });
-      }
-    } catch (dbError) {
-      console.error(`${logPrefix} ❌ Error storing agent response:`, dbError.message);
     }
 
     // Check WhatsApp connection status
@@ -494,17 +259,14 @@ router.post('/', async (req, res) => {
       }
     }
 
-    // ✅ TASK 1: Send message via Baileys (supports both text and button messages)
+    // Send message via Baileys
     try {
-      await sendMessage(agentId, sanitizedTo, messagePayload, isButtonMessage);
+      await sendMessage(agentId, sanitizedTo, messagePayload);
       
       console.log(`${logPrefix} ✅ Message sent successfully`, {
         agentId: agentId.substring(0, 8) + '...',
         to: sanitizedTo.substring(0, 10) + '...',
-        messageType: isButtonMessage ? 'button' : 'text',
-        messageLength: isButtonMessage ? messagePayload.text.length : messagePayload.length,
-        buttonCount: isButtonMessage ? messagePayload.buttons.length : 0,
-        dashboardMessageId: dashboardMessageId
+        messageLength: messagePayload.length
       });
 
       return res.status(200).json({
@@ -547,68 +309,38 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * ✅ TASK 5: Test endpoint for button message validation
  * GET /api/webhooks/send-message/test
  * Returns example payloads for testing
  */
 router.get('/test', (req, res) => {
   res.json({
     success: true,
-    message: 'Button message test endpoint',
+    message: 'Send message webhook test endpoint',
+    endpoint: '/api/webhooks/send-message',
+    method: 'POST',
     examples: {
-      plainText: {
+      basicMessage: {
         agentId: 'b361a914-18bb-405c-92eb-8afe549ca9e1',
         to: '923336906200',
         message: 'Hello! This is a plain text message.'
       },
-      buttonMessage: {
+      longMessage: {
         agentId: 'b361a914-18bb-405c-92eb-8afe549ca9e1',
         to: '923336906200',
-        message: {
-          text: '👋 Welcome! Please choose an option:',
-          buttons: [
-            { id: 'option_1', text: 'Option 1' },
-            { id: 'option_2', text: 'Option 2' },
-            { id: 'option_3', text: 'Option 3' }
-          ]
-        }
-      },
-      buttonMessageJSON: {
-        agentId: 'b361a914-18bb-405c-92eb-8afe549ca9e1',
-        to: '923336906200',
-        message: JSON.stringify({
-          text: '👋 Welcome! Please choose an option:',
-          buttons: [
-            { id: 'option_1', text: 'Option 1' },
-            { id: 'option_2', text: 'Option 2' },
-            { id: 'option_3', text: 'Option 3' }
-          ]
-        })
-      }
-    },
-    buttonResponseFormat: {
-      description: 'When a user clicks a button, your webhook will receive:',
-      payload: {
-        id: 'message-id',
-        messageId: 'message-id',
-        from: '923336906200',
-        to: 'agent-phone-number',
-        messageType: 'BUTTON_RESPONSE',
-        type: 'button_response',
-        content: 'Option 1', // The button text
-        buttonResponse: {
-          selectedButtonId: 'option_1',
-          selectedButtonText: 'Option 1',
-          contextInfo: {}
-        },
-        timestamp: '2025-12-17T10:00:00.000Z'
+        message: 'This is a longer message that can contain multiple lines.\n\nIt supports newlines and formatting as plain text.'
       }
     },
     validation: {
-      maxButtons: 3,
-      maxButtonTextLength: 20,
-      maxMessageTextLength: 4096
-    }
+      maxMessageTextLength: MAX_MESSAGE_LENGTH,
+      requiredFields: ['agentId', 'to', 'message']
+    },
+    curlExample: `curl -X POST https://pa.duhanashrah.ai/api/webhooks/send-message \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "agentId": "your-agent-id-here",
+    "to": "923336906200",
+    "message": "Hello! This is a test message."
+  }'`
   });
 });
 

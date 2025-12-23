@@ -47,8 +47,6 @@ import { cn } from '@/lib/utils';
 import { Message } from '@/types/message.types';
 import { formatDistanceToNow } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
-import { parseMessageButtons } from '@/utils/messageButtonParser';
-import { MessageButtons } from './MessageButtons';
 
 export const ChatInterface: React.FC = () => {
   const navigate = useNavigate();
@@ -321,7 +319,6 @@ export const ChatInterface: React.FC = () => {
                   message={msg} 
                   agentName={selectedAgent?.agent_name || 'Agent'}
                   agentAvatar={(selectedAgent as any)?.avatar_url}
-                  onButtonClick={handleSendMessage}
                 />
               ))}
               <div ref={messagesEndRef} />
@@ -463,10 +460,9 @@ interface MessageItemProps {
   message: Message;
   agentName: string;
   agentAvatar?: string;
-  onButtonClick?: (text: string) => void;
 }
 
-const MessageItem: React.FC<MessageItemProps> = ({ message, agentName, agentAvatar, onButtonClick }) => {
+const MessageItem: React.FC<MessageItemProps> = ({ message, agentName, agentAvatar }) => {
   // Determine if this is a user message (outgoing from dashboard)
   // Check multiple indicators since data may vary:
   // 1. is_from_me = true or "true" (handle string/boolean)
@@ -478,34 +474,6 @@ const MessageItem: React.FC<MessageItemProps> = ({ message, agentName, agentAvat
   // Debug logging (remove in production)
   // console.log('[MessageItem] Message:', { id: message.id, is_from_me: message.is_from_me, sender_type: message.sender_type, isUser, message: message.message?.substring(0, 30) });
   
-  // Parse buttons for agent messages
-  const buttons = React.useMemo(() => {
-    if (message.source === 'dashboard' && message.sender_type === 'agent' && !isUser) {
-      return parseMessageButtons(message.message);
-    }
-    return [];
-  }, [message.source, message.sender_type, message.message, isUser]);
-  
-  // Clean message text (remove button patterns)
-  const displayMessage = React.useMemo(() => {
-    if (buttons.length === 0) return message.message;
-    
-    let cleanedMessage = message.message;
-    const buttonPatterns = [
-      /\*\d[️⃣?]+\s+[^*]+\*/g,
-      /\*\d+\s+[^*]+\*/g,
-      /\*\d+\.\s+[^*]+\*/g,
-      /\d[️⃣?]+\s+[^\n*]+/g,
-      /(?:^|\n)\d+\s+[^\n*]+(?=\n|$)/g,
-      /\d+\.\s+[^\n*]+/g,
-    ];
-    
-    buttonPatterns.forEach(pattern => {
-      cleanedMessage = cleanedMessage.replace(pattern, '');
-    });
-    
-    return cleanedMessage.replace(/\n{3,}/g, '\n\n').trim();
-  }, [message.message, buttons.length]);
 
   const StatusIcon = () => {
     if (!isUser) return null;
@@ -566,26 +534,8 @@ const MessageItem: React.FC<MessageItemProps> = ({ message, agentName, agentAvat
           )}
         >
           <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">
-            {displayMessage}
+            {message.message}
           </p>
-          
-          {/* Buttons for agent messages */}
-          {buttons.length > 0 && (
-            <div className="mt-3 pt-3 border-t border-white/10 space-y-2">
-              {buttons.map((btn, idx) => (
-                <button
-                  key={idx}
-                  onClick={() => onButtonClick?.(btn.fullText)}
-                  className="w-full px-3 py-2 text-sm text-left bg-white/5 hover:bg-white/10 rounded-lg border border-white/10 hover:border-violet-500/30 transition-all flex items-center gap-2"
-                >
-                  <span className="w-6 h-6 rounded-md bg-violet-500/20 flex items-center justify-center text-violet-400 text-xs font-medium">
-                    {btn.number}
-                  </span>
-                  <span className="text-gray-300">{btn.text}</span>
-                </button>
-              ))}
-            </div>
-          )}
         </div>
         
         {isUser && (

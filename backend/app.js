@@ -37,7 +37,6 @@ const agentRoutes = require('./src/routes/agents');
 const webhookUploadRoute = require('./src/routes/webhookUpload');
 const webhookSendMessageRoute = require('./src/routes/webhookSendMessage');
 const webhookSendEmailRoute = require('./src/routes/webhookSendEmail');
-const webhookButtonResponseRoute = require('./src/routes/webhookButtonResponse');
 const extractPdfRoute = require('./src/routes/extractPdf');
 const processAgentFileRoute = require('./src/routes/processAgentFile');
 const agentDocumentsRoute = require('./src/routes/agentDocuments');
@@ -444,9 +443,6 @@ app.use('/api/webhooks/send-message', webhookSendMessageRoute);
 
 // Webhook for N8N to send emails (public endpoint)
 app.use('/api/webhooks/send-email', webhookSendEmailRoute);
-
-// Webhook for handling button response clicks (public endpoint)
-app.use('/api/webhooks/button-response', webhookButtonResponseRoute);
 
 // Document extraction endpoint (used by frontend after file upload)
 app.use('/extract-pdf', extractPdfRoute);

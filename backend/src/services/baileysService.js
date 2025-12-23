@@ -4575,14 +4575,13 @@ async function getWhatsAppStatus(agentId) {
 
 // Send message
 /**
- * ✅ TASK 2: Send message with button support
+ * Send plain text message via WhatsApp
  * @param {string} agentId - Agent ID
  * @param {string} to - Recipient phone number
- * @param {string|object} message - Plain text string or button message object
- * @param {boolean} isButtonMessage - Whether message is a button message (optional, auto-detected)
+ * @param {string} message - Plain text message string
  * @returns {Promise<void>}
  */
-async function sendMessage(agentId, to, message, isButtonMessage = false) {
+async function sendMessage(agentId, to, message) {
   const session = activeSessions.get(agentId);
   
   if (!session || !session.isConnected) {
@@ -4591,102 +4590,10 @@ async function sendMessage(agentId, to, message, isButtonMessage = false) {
   
   const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
   
-  // ✅ TASK 2: Handle button messages
-  if (isButtonMessage || (message && typeof message === 'object' && message.buttons)) {
-    // Button message format
-    const buttonMessage = typeof message === 'object' ? message : JSON.parse(message);
-    
-    if (!buttonMessage.text || !Array.isArray(buttonMessage.buttons) || buttonMessage.buttons.length === 0) {
-      throw new Error('Invalid button message format. Must have text and buttons array.');
-    }
-    
-    // ✅ FIX: Use Baileys buttonsMessage format (the format that actually works)
-    // Based on Baileys GitHub examples and documentation, the working format is:
-    // { text, footer, buttons: [{ buttonId, buttonText: { displayText }, type: 1 }], headerType: 1 }
-    // This is the standard format that Baileys supports, even if WhatsApp has restrictions
-    
-    const baileysButtons = buttonMessage.buttons.slice(0, 3).map((btn, index) => {
-      const buttonText = btn.text.substring(0, 20); // Max 20 chars per WhatsApp
-      const buttonId = btn.id || `btn_${index + 1}`;
-      
-      return {
-        buttonId: buttonId,
-        buttonText: { 
-          displayText: buttonText
-        },
-        type: 1 // REPLY button type (1 = quick reply button)
-      };
-    });
-    
-    // Build buttonsMessage in the format Baileys expects (from official examples)
-    const baileysMessage = {
-      text: buttonMessage.text,
-      buttons: baileysButtons,
-      headerType: 1 // TEXT header type
-    };
-    
-    // Add optional footer if provided
-    if (buttonMessage.footer) {
-      baileysMessage.footer = buttonMessage.footer.substring(0, 60);
-    }
-    
-    console.log(`[BAILEYS] 📤 Sending buttonsMessage to ${to}`, {
-      textLength: buttonMessage.text.length,
-      buttonCount: baileysButtons.length,
-      buttonIds: baileysButtons.map(b => b.buttonId),
-      buttonTexts: baileysButtons.map(b => b.buttonText.displayText),
-      hasFooter: !!buttonMessage.footer,
-      jid: jid,
-      messageFormat: JSON.stringify(baileysMessage, null, 2)
-    });
-    
-    try {
-      const result = await session.socket.sendMessage(jid, baileysMessage);
-      console.log(`[BAILEYS] ✅ buttonsMessage sent successfully to ${to}`, {
-        messageId: result?.key?.id,
-        status: result?.status,
-        hasButtons: baileysButtons.length > 0
-      });
-    } catch (sendError) {
-      console.error(`[BAILEYS] ❌ Failed to send buttonsMessage:`, sendError.message);
-      console.error(`[BAILEYS] Error stack:`, sendError.stack);
-      
-      // Log full error details for debugging
-      const errorDetails = {
-        message: sendError.message,
-        name: sendError.name,
-        code: sendError.code,
-        status: sendError.status,
-        statusCode: sendError.statusCode
-      };
-      
-      if (sendError.response) {
-        errorDetails.response = sendError.response;
-      }
-      if (sendError.data) {
-        errorDetails.data = sendError.data;
-      }
-      
-      console.error(`[BAILEYS] Error details:`, JSON.stringify(errorDetails, null, 2));
-      
-      // Final fallback: plain text
-      console.log(`[BAILEYS] ⚠️ Falling back to plain text message`);
-      try {
-        await session.socket.sendMessage(jid, { text: buttonMessage.text });
-        console.log(`[BAILEYS] ✅ Plain text fallback sent to ${to}`);
-      } catch (textError) {
-        console.error(`[BAILEYS] ❌ Even plain text failed:`, textError.message);
-        throw textError;
-      }
-      
-      throw new Error(`buttonsMessage failed: ${sendError.message}. Sent as plain text instead.`);
-    }
-  } else {
-    // Plain text message
-    const textMessage = typeof message === 'string' ? message : String(message);
-    await session.socket.sendMessage(jid, { text: textMessage });
-    console.log(`[BAILEYS] ✅ Text message sent to ${to}`);
-  }
+  // Plain text message
+  const textMessage = typeof message === 'string' ? message : String(message);
+  await session.socket.sendMessage(jid, { text: textMessage });
+  console.log(`[BAILEYS] ✅ Text message sent to ${to}`);
 }
 
 // Cleanup expired QR codes
