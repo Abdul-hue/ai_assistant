@@ -106,7 +106,294 @@ class ImapIdleManager {
       // Start monitoring
       await this.monitorFolders(account.id);
 
+<<<<<<< Updated upstream
       console.log(`[IDLE] IDLE monitoring started for ${account.email}`);
+=======
+      // ✅ Open INBOX folder
+      await connection.openBox('INBOX');
+      console.log(`[IDLE] ✅ INBOX opened for ${account.email}`);
+      
+      // ✅ CRITICAL: Set up mail listener BEFORE starting IDLE mode
+      // The listener must be registered before IDLE starts to catch events
+      connection.imap.on('mail', async (numNewMsgs) => {
+        const accountEmail = account.email;
+        const accountIdFromClosure = account.id;
+        console.log(`[IDLE] 📧 ${accountEmail} received ${numNewMsgs} new email(s)`);
+        
+        // ✅ FIX: Get account from connectionData (most up-to-date) or use closure variable
+        const connectionData = this.activeConnections.get(accountIdFromClosure);
+        const currentAccount = connectionData?.account || account;
+        
+        // ✅ FIX: Run sync in background without blocking IDLE connection
+        // This ensures sync completes even if IDLE connection ends
+        (async () => {
+          try {
+          // ✅ FIX: Get fresh account data - try by ID first, then by email as fallback
+          let freshAccount = null;
+          
+          console.log(`[IDLE] 🔍 Looking up account: ID=${currentAccount.id}, email=${currentAccount.email || accountEmail}`);
+          
+          // First try: Look up by account ID from connectionData
+          const { data: accountById, error: idError } = await supabaseAdmin
+            .from('email_accounts')
+            .select('id, email, user_id, is_active')
+            .eq('id', currentAccount.id)
+            .eq('is_active', true)
+            .single();
+          
+          if (idError && idError.code !== 'PGRST116') {
+            console.error(`[IDLE] ❌ Error looking up account by ID ${currentAccount.id}:`, idError.message);
+          }
+          
+          if (accountById) {
+            freshAccount = accountById;
+            console.log(`[IDLE] ✅ Found account by ID: ${freshAccount.id}`);
+          } else {
+            // Fallback: Look up by email (account may have been reconnected with new ID)
+            console.log(`[IDLE] ⚠️  Account ${currentAccount.id} not found, trying lookup by email: ${currentAccount.email || accountEmail}`);
+            const { data: accountByEmail, error: emailError } = await supabaseAdmin
+              .from('email_accounts')
+              .select('id, email, user_id, is_active')
+              .eq('email', currentAccount.email || accountEmail)
+              .eq('is_active', true)
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            
+            if (emailError) {
+              console.error(`[IDLE] ❌ Error looking up account by email:`, emailError.message);
+            }
+            
+            if (accountByEmail) {
+              freshAccount = accountByEmail;
+              console.log(`[IDLE] ✅ Found account by email: ${freshAccount.id} (old ID was ${currentAccount.id})`);
+              // Update the connectionData account ID for future lookups
+              if (connectionData) {
+                connectionData.account.id = freshAccount.id;
+                connectionData.account.email = freshAccount.email;
+                // Also update the activeConnections map with new ID if different
+                if (freshAccount.id !== currentAccount.id) {
+                  this.activeConnections.set(freshAccount.id, connectionData);
+                  this.activeConnections.delete(currentAccount.id);
+                }
+              }
+            } else {
+              console.error(`[IDLE] ❌ Account ${currentAccount.id} (${currentAccount.email || accountEmail}) not found in database`);
+              return; // Don't stop IDLE, just skip this sync
+            }
+          }
+          
+          if (!freshAccount) {
+            console.error(`[IDLE] ❌ Could not find account for ${currentAccount.email || accountEmail}, aborting sync`);
+        return;
+      }
+          
+          // Trigger background sync for this specific account/folder
+          const { syncNewEmailsOnly } = require('./backgroundSyncService');
+          console.log(`[IDLE] 🔄 Triggering sync for account ${freshAccount.id} (${freshAccount.email})`);
+          
+          const count = await syncNewEmailsOnly(freshAccount.id, 'INBOX');
+          
+          console.log(`[IDLE] ✅ Synced ${count} new emails for ${freshAccount.email}`);
+          
+          // Notify frontend via WebSocket
+          if (this.wsManager && freshAccount.user_id) {
+            this.wsManager.io.to(freshAccount.user_id).emit('new_emails', {
+              accountId: freshAccount.id,
+              accountEmail: freshAccount.email,
+              count,
+              folder: 'INBOX',
+              timestamp: new Date().toISOString()
+            });
+            console.log(`[IDLE] 📡 Sent WebSocket notification to user ${freshAccount.user_id}`);
+          } else {
+            console.warn(`[IDLE] ⚠️  Cannot send WebSocket notification: wsManager=${!!this.wsManager}, user_id=${freshAccount.user_id}`);
+          }
+          } catch (syncError) {
+            console.error(`[IDLE] ❌ Sync error for ${accountEmail}:`, syncError.message);
+            console.error(`[IDLE] Stack:`, syncError.stack);
+            // Don't throw - keep IDLE connection alive
+          }
+        })(); // Execute immediately without blocking
+      });
+      
+      // IDLE handled automatically by imap-simple library
+      console.log(`[IDLE] ✅ IDLE monitoring active for ${account.email}`);
+      
+      // ✅ Track connection health
+      this.connectionHealth.set(account.id, {
+        lastCheck: Date.now(),
+        consecutiveDrops: 0,
+        lastDropTime: null,
+        establishedAt: Date.now()
+      });
+      
+      // ✅ Handle connection errors
+      connection.imap.on('error', async (error) => {
+        const errorMsg = error.message || String(error);
+        console.error(`[IDLE] ❌ Connection error for ${account.email}:`, errorMsg);
+        
+        // Update health tracking
+        const health = this.connectionHealth.get(account.id) || {};
+        health.consecutiveDrops = (health.consecutiveDrops || 0) + 1;
+        health.lastDropTime = Date.now();
+        this.connectionHealth.set(account.id, health);
+        
+        console.log(`[IDLE] 📊 Connection health: ${health.consecutiveDrops} consecutive drops for ${account.email}`);
+        
+        // Clean up this connection
+        this.stopIdleMonitoring(account.id);
+        
+        // ❌ DON'T mark account as needs_reconnection for IDLE errors
+        // Sync jobs will handle reconnection separately
+        
+        // ✅ FIX: Prevent duplicate restart attempts
+        if (this.isRestarting.has(account.id)) {
+          console.log(`[IDLE] ⏭️  Restart already in progress for ${account.email}, skipping duplicate restart`);
+          return;
+        }
+        
+        // Calculate backoff delay (exponential backoff: 30s, 60s, 120s, max 5min)
+        const backoffDelay = Math.min(
+          300000, // Max 5 minutes
+          Math.pow(2, health.consecutiveDrops - 1) * 30000 // 30s * 2^(drops-1)
+        );
+        
+        console.log(`[IDLE] 🔄 Scheduling restart for ${account.email} in ${Math.round(backoffDelay / 1000)}s (backoff due to ${health.consecutiveDrops} drops)`);
+        
+        // Clear any existing restart timeout
+        if (this.restartTimeouts.has(account.id)) {
+          clearTimeout(this.restartTimeouts.get(account.id));
+        }
+        
+        // Schedule restart with backoff
+        const timeoutId = setTimeout(() => {
+          this.restartTimeouts.delete(account.id);
+          this.isRestarting.add(account.id);
+          
+          console.log(`[IDLE] 🔄 Attempting to restart IDLE for ${account.email}...`);
+          this.startIdleMonitoring(account)
+            .then(() => {
+              this.isRestarting.delete(account.id);
+              // Reset drop count on successful restart
+              const health = this.connectionHealth.get(account.id);
+              if (health) {
+                health.consecutiveDrops = 0;
+                health.lastCheck = Date.now();
+                health.establishedAt = Date.now();
+                this.connectionHealth.set(account.id, health);
+              }
+            })
+            .catch(err => {
+              this.isRestarting.delete(account.id);
+              console.error(`[IDLE] ❌ Failed to restart IDLE:`, err.message);
+            });
+        }, backoffDelay);
+        
+        this.restartTimeouts.set(account.id, timeoutId);
+      });
+      
+      // ✅ Handle connection end
+      connection.imap.on('end', () => {
+        console.log(`[IDLE] ⚠️  Connection ended for ${account.email}`);
+        
+        // Update health tracking
+        const health = this.connectionHealth.get(account.id) || {};
+        health.consecutiveDrops = (health.consecutiveDrops || 0) + 1;
+        health.lastDropTime = Date.now();
+        this.connectionHealth.set(account.id, health);
+        
+        const dropCount = health.consecutiveDrops || 0;
+        const timeSinceLastDrop = health.lastDropTime ? Date.now() - health.lastDropTime : 0;
+        console.log(`[IDLE] 📊 Connection end stats: ${dropCount} consecutive drops, ${Math.round(timeSinceLastDrop / 1000)}s since last drop`);
+        
+        this.stopIdleMonitoring(account.id);
+        
+        // ✅ FIX: Prevent duplicate restart attempts
+        if (this.isRestarting.has(account.id)) {
+          console.log(`[IDLE] ⏭️  Restart already in progress for ${account.email}, skipping duplicate restart`);
+          return;
+        }
+        
+        // Calculate backoff delay
+        const backoffDelay = Math.min(
+          300000, // Max 5 minutes
+          Math.pow(2, dropCount - 1) * 30000 // Exponential backoff
+        );
+        
+        console.log(`[IDLE] 🔄 Scheduling restart for ${account.email} in ${Math.round(backoffDelay / 1000)}s`);
+        
+        // Clear any existing restart timeout
+        if (this.restartTimeouts.has(account.id)) {
+          clearTimeout(this.restartTimeouts.get(account.id));
+        }
+        
+        // Schedule restart with backoff
+        const timeoutId = setTimeout(() => {
+          this.restartTimeouts.delete(account.id);
+          this.isRestarting.add(account.id);
+          
+          console.log(`[IDLE] 🔄 Restarting IDLE after connection end for ${account.email}...`);
+          this.startIdleMonitoring(account)
+            .then(() => {
+              this.isRestarting.delete(account.id);
+              // Reset drop count on successful restart
+              const health = this.connectionHealth.get(account.id);
+              if (health) {
+                health.consecutiveDrops = 0;
+                health.lastCheck = Date.now();
+                health.establishedAt = Date.now();
+                this.connectionHealth.set(account.id, health);
+              }
+            })
+            .catch(err => {
+              this.isRestarting.delete(account.id);
+              console.error(`[IDLE] ❌ Failed to restart IDLE:`, err.message);
+            });
+        }, backoffDelay);
+        
+        this.restartTimeouts.set(account.id, timeoutId);
+      });
+      
+      // ✅ Handle close event
+      connection.imap.on('close', () => {
+        console.log(`[IDLE] Connection closed for ${account.email}`);
+        this.stopIdleMonitoring(account.id);
+      });
+      
+      // ✅ NEW: Periodic health check (every 2 minutes)
+      const healthCheckInterval = setInterval(() => {
+        const health = this.connectionHealth.get(account.id);
+        if (!health) {
+          clearInterval(healthCheckInterval);
+        return;
+      }
+        
+        const connectionData = this.activeConnections.get(account.id);
+        if (!connectionData || !connectionData.connection) {
+          clearInterval(healthCheckInterval);
+          return;
+        }
+        
+        const connection = connectionData.connection;
+        const isAlive = connection.imap && connection.imap.state === 'authenticated';
+        
+        health.lastCheck = Date.now();
+        this.connectionHealth.set(account.id, health);
+        
+        if (!isAlive) {
+          console.warn(`[IDLE] ⚠️  Health check: Connection for ${account.email} is not authenticated (state: ${connection.imap?.state || 'unknown'})`);
+        } else {
+          const uptime = Math.round((Date.now() - health.establishedAt) / 1000);
+          console.log(`[IDLE] ✅ Health check: ${account.email} connection healthy (uptime: ${uptime}s, drops: ${health.consecutiveDrops})`);
+        }
+      }, 120000); // Every 2 minutes
+      
+      // Store health check interval for cleanup
+      this.healthCheckIntervals.set(account.id, healthCheckInterval);
+
+      console.log(`[IDLE] ✅ IDLE monitoring active for ${account.email}`);
+>>>>>>> Stashed changes
     } catch (error) {
       // ✅ Handle "Connection ended unexpectedly" in catch block too
       if (error.message?.includes('Connection ended unexpectedly') || 
@@ -158,10 +445,52 @@ class ImapIdleManager {
 
       // Close connection
       connectionData.monitoring = false;
+<<<<<<< Updated upstream
       try {
         connectionData.connection.end();
       } catch (e) {
         // Ignore errors when closing
+=======
+      
+      try {
+        const nodeImap = connectionData.connection?.imap;
+        if (nodeImap && connectionData.idleStarted && typeof nodeImap.idleStop === 'function') {
+          console.log(`[IDLE] Stopping IDLE mode for account ${accountId}...`);
+          try {
+            nodeImap.idleStop();
+            connectionData.idleStarted = false;
+            console.log(`[IDLE] ✅ IDLE mode stopped for account ${accountId}`);
+          } catch (idleStopError) {
+            console.warn(`[IDLE] Error stopping IDLE mode:`, idleStopError.message);
+          }
+        }
+      } catch (idleCheckError) {
+        // Ignore errors when checking for IDLE
+      }
+      
+      // ✅ FIX: Remove event listeners to prevent memory leak
+      if (connectionData.connection) {
+        // Remove event listeners from underlying IMAP connection
+        if (connectionData.connection.imap) {
+          connectionData.connection.imap.removeAllListeners('mail');
+          connectionData.connection.imap.removeAllListeners('error');
+          connectionData.connection.imap.removeAllListeners('end');
+          connectionData.connection.imap.removeAllListeners('close');
+        }
+        // Remove event listeners from imap-simple connection wrapper
+        connectionData.connection.removeAllListeners('mail');
+        connectionData.connection.removeAllListeners('update');
+        connectionData.connection.removeAllListeners('expunge');
+        
+        // Close connection
+        try {
+          if (typeof connectionData.connection.end === 'function') {
+            connectionData.connection.end();
+          }
+        } catch (e) {
+          // Ignore errors when closing
+        }
+>>>>>>> Stashed changes
       }
 
       this.activeConnections.delete(accountId);
@@ -515,8 +844,21 @@ class ImapIdleManager {
       
       // Close old connection
       try {
-        if (connectionData.connection && typeof connectionData.connection.end === 'function') {
-          connectionData.connection.end();
+        if (connectionData.connection) {
+          // ✅ FIX: Remove event listeners to prevent memory leak
+          if (connectionData.connection.imap) {
+            connectionData.connection.imap.removeAllListeners('mail');
+            connectionData.connection.imap.removeAllListeners('error');
+            connectionData.connection.imap.removeAllListeners('end');
+            connectionData.connection.imap.removeAllListeners('close');
+          }
+          connectionData.connection.removeAllListeners('mail');
+          connectionData.connection.removeAllListeners('update');
+          connectionData.connection.removeAllListeners('expunge');
+          
+          if (typeof connectionData.connection.end === 'function') {
+            connectionData.connection.end();
+          }
         }
       } catch (e) {
         // Ignore errors when closing
