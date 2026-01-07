@@ -259,6 +259,22 @@ router.post('/', async (req, res) => {
       }
     }
 
+    // Get user_id from agent for message_log insertion
+    const { data: agentWithUser, error: userError } = await supabaseAdmin
+      .from('agents')
+      .select('user_id, whatsapp_phone_number')
+      .eq('id', agentId)
+      .single();
+
+    if (userError || !agentWithUser) {
+      console.error(`${logPrefix} ❌ Failed to fetch agent user_id:`, userError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to fetch agent information',
+        details: 'Could not retrieve user_id for message logging'
+      });
+    }
+
     // Send message via Baileys
     try {
       await sendMessage(agentId, sanitizedTo, messagePayload);
@@ -269,13 +285,122 @@ router.post('/', async (req, res) => {
         messageLength: messagePayload.length
       });
 
+      // CRITICAL: Save agent response to message_log table so it appears in chat interface
+      // This ensures AI responses are immediately visible in the dashboard chat
+      const now = new Date().toISOString();
+      const agentMessageId = `agent-${Date.now()}-${Math.random().toString(36).substring(2, 15)}`;
+      const agentPhoneNumber = agentWithUser.whatsapp_phone_number 
+        ? agentWithUser.whatsapp_phone_number.replace(/[+\s-]/g, '') 
+        : sanitizedTo;
+      
+      const conversationId = `${agentPhoneNumber}@s.whatsapp.net`;
+      
+      // Check for duplicate message before inserting (prevent duplicates if message comes back through WhatsApp)
+      const timeWindow = 10000; // 10 seconds window
+      const duplicateCheckStart = new Date(new Date(now).getTime() - timeWindow).toISOString();
+      const duplicateCheckEnd = new Date(new Date(now).getTime() + timeWindow).toISOString();
+      
+      const { data: existingMessage } = await supabaseAdmin
+        .from('message_log')
+        .select('id, message_id')
+        .eq('agent_id', agentId)
+        .eq('message_text', messagePayload.trim())
+        .eq('conversation_id', conversationId)
+        .eq('sender_phone', agentPhoneNumber)
+        .eq('sender_type', 'agent')
+        .gte('received_at', duplicateCheckStart)
+        .lte('received_at', duplicateCheckEnd)
+        .maybeSingle();
+      
+      if (existingMessage) {
+        console.log(`${logPrefix} ⚠️ Duplicate agent message detected, skipping insert:`, {
+          existingId: existingMessage.id,
+          existingMessageId: existingMessage.message_id
+        });
+        // Return success but don't insert duplicate
+        return res.status(200).json({
+          success: true,
+          message: 'Message sent successfully (duplicate detected, not saved)',
+          data: {
+            agentId,
+            to: sanitizedTo,
+            sentAt: now,
+            messageId: existingMessage.id || existingMessage.message_id || agentMessageId,
+            duplicate: true
+          }
+        });
+      }
+      
+      // Insert agent response into message_log
+      const { data: savedMessage, error: insertError } = await supabaseAdmin
+        .from('message_log')
+        .insert({
+          message_id: agentMessageId,
+          conversation_id: conversationId,
+          sender_phone: agentPhoneNumber,
+          agent_id: agentId,
+          user_id: agentWithUser.user_id,
+          message_text: messagePayload,
+          message: messagePayload, // New column
+          received_at: now,
+          created_at: now,
+          timestamp: now, // New column
+          message_type: 'text',
+          sender_type: 'agent', // CRITICAL: Mark as agent message
+          is_from_me: false, // CRITICAL: Agent messages are not from user
+          status: 'sent',
+          source: 'webhook', // Mark as coming from webhook (AI response)
+        })
+        .select()
+        .single();
+
+      if (insertError) {
+        // If new columns don't exist, try with legacy columns only
+        if (insertError.message && insertError.message.includes('column')) {
+          console.log(`${logPrefix} ⚠️ New columns not available, using legacy columns only`);
+          const { error: legacyError } = await supabaseAdmin
+            .from('message_log')
+            .insert({
+              message_id: agentMessageId,
+              conversation_id: conversationId,
+              sender_phone: agentPhoneNumber,
+              agent_id: agentId,
+              user_id: agentWithUser.user_id,
+              message_text: messagePayload,
+              received_at: now,
+              created_at: now,
+              message_type: 'text',
+              sender_type: 'agent',
+              is_from_me: false,
+              source: 'webhook',
+            });
+          
+          if (legacyError) {
+            console.error(`${logPrefix} ❌ Failed to save agent message to database:`, legacyError);
+            // Don't fail the request - message was sent successfully via WhatsApp
+            // It will be saved when it comes back through messages.upsert
+          } else {
+            console.log(`${logPrefix} ✅ Agent message saved to database (legacy columns)`);
+          }
+        } else {
+          console.error(`${logPrefix} ❌ Failed to save agent message to database:`, insertError);
+          // Don't fail the request - message was sent successfully via WhatsApp
+        }
+      } else {
+        console.log(`${logPrefix} ✅ Agent message saved to database:`, {
+          messageId: savedMessage?.id || savedMessage?.uuid_id || agentMessageId,
+          senderType: 'agent'
+        });
+      }
+
       return res.status(200).json({
         success: true,
         message: 'Message sent successfully',
         data: {
           agentId,
           to: sanitizedTo,
-          sentAt: new Date().toISOString()
+          sentAt: now,
+          messageId: savedMessage?.id || savedMessage?.uuid_id || agentMessageId
         }
       });
     } catch (sendError) {

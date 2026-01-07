@@ -15,7 +15,7 @@
     "test:whatsapp": "node tests/whatsapp-connection.test.js"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": "18.19.1"
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",

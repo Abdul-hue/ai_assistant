@@ -137,8 +137,39 @@ router.get('/chat-list', authMiddleware, async (req, res) => {
 });
 
 /**
+ * Extract phone number from conversation_id format
+ * @param {string} conversationId - Format: "923336906200@s.whatsapp.net"
+ * @returns {string|null} - Extracted phone number or null
+ */
+function extractPhoneFromConversationId(conversationId) {
+  if (!conversationId || typeof conversationId !== 'string') return null;
+  const match = conversationId.match(/^(\d+)@s\.whatsapp\.net$/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Sanitize phone number - remove all non-digit characters
+ * @param {string} phone - Phone number with potential formatting
+ * @returns {string|null} - Digits only or null
+ */
+function sanitizePhoneNumber(phone) {
+  if (!phone || typeof phone !== 'string') return null;
+  const digits = phone.replace(/\D/g, '');
+  return digits.length > 0 ? digits : null;
+}
+
+/**
  * GET /api/agents/:agentId/messages
- * Get conversation history for specific agent
+ * Fetch messages for dashboard self-conversations
+ * 
+ * Security: Only returns messages where the conversation is with the agent's own number
+ * This includes:
+ * - User messages sent from dashboard (source='dashboard')
+ * - AI responses sent via webhook (source='webhook')
+ * 
+ * Excludes:
+ * - WhatsApp contact conversations (different sender/recipient)
+ * - Messages from other sources ('whatsapp', 'baileys', etc.)
  */
 router.get('/:agentId/messages', authMiddleware, async (req, res) => {
   try {
@@ -150,10 +181,10 @@ router.get('/:agentId/messages', authMiddleware, async (req, res) => {
       return res.status(401).json({ error: 'Unauthorized - user ID not found' });
     }
 
-    // Verify agent ownership
+    // Verify agent ownership and fetch WhatsApp phone number
     const { data: agent, error: agentError } = await supabaseAdmin
       .from('agents')
-      .select('id')
+      .select('id, whatsapp_phone_number')
       .eq('id', agentId)
       .eq('user_id', userId)
       .maybeSingle();
@@ -167,25 +198,30 @@ router.get('/:agentId/messages', authMiddleware, async (req, res) => {
       return res.status(403).json({ error: 'Unauthorized - agent not found or not owned by user' });
     }
 
-    // Build query - use received_at (existing column) - timestamp will be populated by trigger
-    // ✅ CRITICAL: Only fetch dashboard messages (source = 'dashboard')
-    // WhatsApp messages (contact conversations) are NOT shown in the agent chat UI
-    // Dashboard = agent sends to self via dashboard interface
-    // 
-    // IMPORTANT: Exclude all WhatsApp messages, especially:
-    // - Outgoing messages from agent to other numbers (source='whatsapp', is_from_me=true)
-    // - Incoming messages from contacts to agent (source='whatsapp', is_from_me=false)
-    // Only show messages where source='dashboard' (user-agent conversations via dashboard UI)
+    // Get agent's WhatsApp phone number to identify self-conversations
+    const agentPhone = sanitizePhoneNumber(agent.whatsapp_phone_number);
+
+    if (!agentPhone) {
+      console.error('[MESSAGES] Agent has no valid WhatsApp phone number');
+      return res.status(400).json({ 
+        success: false,
+        error: 'Agent has no valid WhatsApp phone number configured',
+        details: 'The agent must have a WhatsApp phone number to display dashboard messages'
+      });
+    }
+
+    // Build query - fetch messages from both dashboard and webhook sources
+    // We'll filter to self-conversations only in the next step
     let query = supabaseAdmin
       .from('message_log')
       .select('*')
       .eq('agent_id', agentId)
-      .eq('source', 'dashboard') // Only show dashboard messages, explicitly exclude whatsapp
+      .in('source', ['dashboard', 'webhook']) // Include both user messages and AI responses
       .order('received_at', { ascending: false })
       .limit(parseInt(limit));
 
     if (before) {
-      // Use received_at for pagination (timestamp will be populated by trigger)
+      // Use received_at for pagination
       query = query.lt('received_at', before);
     }
 
@@ -196,28 +232,41 @@ router.get('/:agentId/messages', authMiddleware, async (req, res) => {
       throw messagesError;
     }
 
-    // ✅ CRITICAL: Additional safety filter to exclude WhatsApp messages
-    // Even if source='dashboard', exclude messages that are clearly WhatsApp:
-    // - Messages where source is explicitly 'whatsapp' (shouldn't happen due to query filter, but safety check)
-    // - Outgoing messages to other numbers (is_from_me=true and not a self-conversation)
-    // This ensures that messages sent from agent to other numbers never appear in dashboard
+    // CRITICAL SECURITY FILTER: Only show self-conversation messages
+    // This ensures dashboard messages (user and AI responses) are shown,
+    // while excluding WhatsApp contact conversations
     const filteredMessages = (messages || []).filter(msg => {
-      // Exclude if source is explicitly 'whatsapp' (shouldn't happen, but safety check)
-      if (msg.source === 'whatsapp') {
+      // Extract phone number from conversation_id (e.g., "923336906200@s.whatsapp.net")
+      const conversationPhone = extractPhoneFromConversationId(msg.conversation_id);
+      
+      // Sanitize sender phone (remove formatting)
+      const senderPhone = sanitizePhoneNumber(msg.sender_phone);
+      
+      // Safety checks - skip if we can't extract phone numbers
+      if (!conversationPhone || !senderPhone) {
         return false;
       }
       
-      // Exclude if this is an outgoing message (is_from_me=true) and source is not explicitly 'dashboard'
-      // This catches edge cases where messages might not have source set correctly
-      if (msg.is_from_me === true && msg.source !== 'dashboard') {
-        return false;
-      }
+      // RULE 1: Conversation must be with the agent's own number (self-conversation)
+      // This is the primary identifier for dashboard conversations
+      const isAgentConversation = conversationPhone === agentPhone;
       
-      return true;
+      // RULE 2: Sender must be either:
+      // - The agent's number (AI responses via webhook)
+      // - The same as conversation phone (user messages from dashboard)
+      const isValidSender = senderPhone === agentPhone || senderPhone === conversationPhone;
+      
+      // RULE 3: Source must be dashboard or webhook
+      const isValidSource = msg.source === 'dashboard' || msg.source === 'webhook';
+      
+      // All three rules must pass for message to be included
+      return isAgentConversation && isValidSender && isValidSource;
     });
 
+    console.log(`[MESSAGES] Fetched ${messages?.length || 0} messages, filtered to ${filteredMessages.length} self-conversation messages`);
+
     // Normalize messages to match expected format
-    const normalizedMessages = (filteredMessages || []).map(msg => {
+    const normalizedMessages = filteredMessages.map(msg => {
       // Handle id: prefer uuid_id if id is integer, otherwise use id or message_id
       const messageId = msg.uuid_id || 
                         (typeof msg.id === 'string' ? msg.id : null) ||

@@ -2,13 +2,13 @@
 # Multi-stage Dockerfile for ConnectBot AI
 # Stage 1: Build frontend (Vite)
 # Stage 2: Install backend production dependencies
-# Stage 3: Final image with Node 20 Alpine
+# Stage 3: Final image with Node 18.19.1 Alpine
 # ============================================================================
 
 # ============================================================================
 # Stage 1: Build Frontend
 # ============================================================================
-FROM node:20-alpine AS frontend-builder
+FROM node:18.19.1-alpine AS frontend-builder
 
 # Build arguments for frontend environment variables
 ARG VITE_SUPABASE_URL
@@ -43,7 +43,7 @@ RUN npm run build
 # ============================================================================
 # Stage 2: Install Backend Dependencies
 # ============================================================================
-FROM node:20-alpine AS backend-deps
+FROM node:18.19.1-alpine AS backend-deps
 
 WORKDIR /app/backend
 
@@ -57,7 +57,7 @@ RUN npm ci --only=production && \
 # ============================================================================
 # Stage 3: Final Image
 # ============================================================================
-FROM node:20-alpine
+FROM node:18.19.1-alpine
 
 # Install system dependencies required for Baileys QR code generation
 # These are needed for canvas/image processing libraries
