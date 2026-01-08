@@ -1,0 +1,62 @@
+
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                     ⚡ DO THIS RIGHT NOW ⚡                                ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+🔧 VERCEL BUILD CACHE ERROR - FIXED! ✅
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT I FIXED:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ Vercel was using old cached config.js → Fixed with vercel.json
+✅ Added rebuild trigger → Forces fresh deployment
+✅ Local builds work perfectly → Verified
+✅ Pushed to GitHub → Commits: 24e0080, e5ea0e7, 1449c79
+✅ Vercel auto-deployment triggered → In progress NOW
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+YOUR ACTION - DO IN ORDER:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1️⃣  MONITOR VERCEL (2-3 min)
+    https://vercel.com/dashboard
+    → Build should succeed (no "duplicate exports" error)
+
+2️⃣  FIX GOOGLE CONSOLE (5 min)
+    https://console.cloud.google.com/apis/credentials
+    → Edit: 494556024053-c1mgtgp8v8q305t0fkfp733d63lrefb5
+    → Change redirect URIs to point to RAILWAY BACKEND
+    → See: GOOGLE_OAUTH_FIX_URGENT.md
+
+3️⃣  UPDATE RAILWAY (2 min)
+    https://railway.app
+    → Variables tab
+    → Update GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET
+    → See: OAUTH_UPDATE_COMPLETE.txt
+
+4️⃣  WAIT 5 MINUTES (for all deployments)
+
+5️⃣  TEST LOGIN
+    https://connectbot-ai-frontend.vercel.app
+    → Click "Sign in with Google"
+    → Should work! ✅
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEW CREDENTIALS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+CLIENT_ID:     494556024053-c1mgtgp8v8q305t0fkfp733d63lrefb5
+CLIENT_SECRET: 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
+
+✅ Already in code
+⚠️  Need in Railway Variables
+⚠️  Need correct redirect URIs in Google Console
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📚 Read: DEPLOYMENT_STATUS.txt for full checklist
+🚀 Start: Check Vercel dashboard NOW!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+

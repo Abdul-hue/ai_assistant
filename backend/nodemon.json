@@ -1,0 +1,15 @@
+{
+  "watch": [
+    "app.js",
+    "src"
+  ],
+  "ignore": [
+    "auth_sessions/**",
+    "sessions/**",
+    "logs/**",
+    "WHATSAPP_QR_FIX_COMPLETE.md"
+  ],
+  "ext": "js,json",
+  "delay": "500"
+}
+

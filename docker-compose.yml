@@ -1,0 +1,38 @@
+﻿version: '3.8'
+
+services:
+  connectbot-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Frontend build arguments (read from backend/.env via env_file)
+        VITE_SUPABASE_URL: ${SUPABASE_URL}
+        VITE_SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_ANON_KEY}
+    container_name: connectbot-ai
+    ports:
+      - "3001:3001"
+    env_file:
+      - ./backend/.env
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+    volumes:
+      - auth_sessions_data:/app/backend/auth_sessions
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get({host:'localhost',port:3001,path:'/api/health',headers:{'Origin':'http://localhost:3001'}}, (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - connectbot-network
+
+volumes:
+  auth_sessions_data:
+    driver: local
+
+networks:
+  connectbot-network:
+    driver: bridge

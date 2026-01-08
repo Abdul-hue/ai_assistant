@@ -1,0 +1,46 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://pa.duhanashrah.ai/api/webhooks/send-email",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": []
+        },
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"accountId\": \"9633fa58-1fd1-4960-9c51-f51f4cbf0d7e\",\n  \"to\": \"{{ $json.to || 'wasay3531@gmail.com' }}\",\n  \"subject\": \"{{ $json.subject || 'Test Email' }}\",\n  \"body\": \"{{ $json.body || 'This is a test email body' }}\",\n  \"html\": \"{{ $json.html || '<h1>Test Email</h1><p>This is HTML content</p>' }}\"\n}",
+        "options": {}
+      },
+      "id": "c21b17e3-9c48-4ce9-b059-2ff22bdd2e47",
+      "name": "HTTP Request4",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        250,
+        300
+      ]
+    }
+  ],
+  "connections": {},
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2025-12-19T00:00:00.000Z",
+  "versionId": "1"
+}
+

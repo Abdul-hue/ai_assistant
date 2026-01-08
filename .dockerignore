@@ -1,0 +1,133 @@
+# ============================================================================
+# .dockerignore - Exclude unnecessary files from Docker build context
+# ============================================================================
+
+# Node modules (will be installed in container)
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+**/node_modules/
+
+# Environment files (will be mounted as volume)
+# EXCEPT: Allow root .env for frontend build (contains VITE_ variables)
+# backend/.env
+backend/.env.*
+# Allow root .env for Vite build
+!.env
+
+# Auth sessions (will be mounted as volume)
+auth_sessions/
+backend/auth_sessions/
+**/auth_sessions/
+
+# Build outputs (will be built in container)
+dist/
+build/
+frontend/dist/
+frontend/build/
+backend/dist/
+backend/build/
+**/dist/
+**/build/
+
+# Git files
+.git/
+.gitignore
+.gitattributes
+**/.git/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.log
+
+# Test files
+**/*.test.js
+**/*.test.ts
+**/*.test.tsx
+**/tests/
+**/__tests__/
+**/test-*.js
+**/test-*.ts
+coverage/
+.nyc_output/
+
+# Documentation (not needed in production)
+*.md
+!README-DOCKER.md
+docs/
+**/*.md
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+pnpm-debug.log*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# OS files
+Thumbs.db
+.DS_Store
+*.swp
+*.swo
+
+# Development files
+nodemon.json
+.eslintrc*
+.prettierrc*
+.editorconfig
+
+# Railway and deployment configs (not needed in Docker)
+railway.json
+Procfile
+vercel.json
+
+# Lock files (will use package-lock.json in container)
+yarn.lock
+pnpm-lock.yaml
+bun.lockb
+
+# Source maps (not needed in production)
+*.map
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Vite cache
+.vite/
+
+# Docker files themselves (avoid recursion)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Analysis and documentation files
+PROJECT_ANALYSIS.md
+BAILEYS_FEATURES_SUMMARY.md
+ACTION_NOW.txt
+
+# Migration and test scripts (keep migrations, exclude test scripts)
+backend/test-*.js
+backend/monitor-*.js
+backend/generate-*.js
+backend/validate-*.js
+
+# Session directories
+backend/sessions/
+sessions/
+
+# Duplicate nested directories
+connectbot-ai-main/
+
