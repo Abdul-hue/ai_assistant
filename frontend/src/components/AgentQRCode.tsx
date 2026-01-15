@@ -2,11 +2,20 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from '@/integrations/supabase/client';
 import QRCode from 'qrcode';
 import { useToast } from '@/hooks/use-toast';
+import { API_URL } from '@/config';
 
 const POLL_INTERVAL_MS = 4000;
 const BACKOFF_DELAYS = [5000, 10000, 20000];
 
-async function normalizeQrCode(value) {
+type WhatsAppStatus = 'loading' | 'disconnected' | 'connecting' | 'initializing' | 'qr_pending' | 'authenticated' | 'connected' | 'cooldown';
+type PollResult = 'stop' | 'continue' | 'backoff';
+
+interface AgentQRCodeProps {
+  agentId: string;
+  phoneNumber?: string;
+}
+
+async function normalizeQrCode(value: string | null): Promise<string | null> {
   if (!value) return null;
   if (value.startsWith('data:image')) return value;
   try {
@@ -17,25 +26,25 @@ async function normalizeQrCode(value) {
   }
 }
 
-export default function AgentQRCode({ agentId }) {
+export default function AgentQRCode({ agentId, phoneNumber: initialPhoneNumber }: AgentQRCodeProps) {
   const { toast } = useToast();
-  const [qrCode, setQrCode] = useState(null);
-  const [status, setStatus] = useState('loading'); // Start with loading state
+  const [qrCode, setQrCode] = useState<string | null>(null);
+  const [status, setStatus] = useState<WhatsAppStatus>('loading');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState(null);
+  const [error, setError] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState('');
-  const [phoneNumber, setPhoneNumber] = useState(null);
-  const [cooldownSeconds, setCooldownSeconds] = useState(null);
-  const [qrCodeTimestamp, setQrCodeTimestamp] = useState(null);
+  const [phoneNumber, setPhoneNumber] = useState<string | null>(initialPhoneNumber || null);
+  const [cooldownSeconds, setCooldownSeconds] = useState<number | null>(null);
+  const [qrCodeTimestamp, setQrCodeTimestamp] = useState<number | null>(null);
   const [qrCountdownSeconds, setQrCountdownSeconds] = useState(0);
-  const pollingIntervalRef = useRef(null);
+  const pollingIntervalRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollInFlightRef = useRef(false);
   const backoffIndexRef = useRef(0);
   const pollingEnabledRef = useRef(false);
-  const lastQrStringRef = useRef(null);
-  const previousStatusRef = useRef(null); // Track previous status to detect connection
+  const lastQrStringRef = useRef<string | null>(null);
+  const previousStatusRef = useRef<WhatsAppStatus | null>(null);
 
-  const clearIntervalRef = useCallback((ref) => {
+  const clearIntervalRef = useCallback((ref: React.MutableRefObject<ReturnType<typeof setTimeout> | null>) => {
     if (ref.current) {
       clearInterval(ref.current);
       ref.current = null;
@@ -112,7 +121,8 @@ export default function AgentQRCode({ agentId }) {
       
       initializeIfNeeded();
     }
-  }, [agentId]); // Remove status and startPolling from dependencies to prevent infinite loops
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentId]);
 
   useEffect(() => {
     if (!qrCodeTimestamp || status !== 'qr_pending') {
@@ -148,8 +158,7 @@ export default function AgentQRCode({ agentId }) {
   }, [qrCodeTimestamp, status]);
 
   // Helper function to get auth token
-  // 🔧 FIX: Fetch from backend endpoint to ensure token is available even after page refresh
-  const getAuthToken = async () => {
+  const getAuthToken = async (): Promise<string | null> => {
     try {
       // First, try to get from Supabase client (fast path if session is in memory)
       const { data: { session } } = await supabase.auth.getSession();
@@ -159,13 +168,12 @@ export default function AgentQRCode({ agentId }) {
 
       // Fallback: Fetch from backend endpoint (works even after page refresh)
       try {
-        const { API_URL } = await import('@/config');
         const response = await fetch(`${API_URL}/api/auth/session-token`, {
           credentials: 'include', // Send HttpOnly cookies
         });
 
         if (response.ok) {
-          const data = await response.json();
+          const data = await response.json() as { access_token?: string; refresh_token?: string };
           if (data.access_token) {
             // Optionally restore the session in Supabase client for future use
             await supabase.auth.setSession({
@@ -204,13 +212,13 @@ export default function AgentQRCode({ agentId }) {
         throw new Error('No authentication token available');
       }
 
-      console.log('AgentQRCode - Making request to:', `/api/agents/${agentId}/init-whatsapp`);
+      console.log('AgentQRCode - Making request to:', `${API_URL}/api/agents/${agentId}/init-whatsapp`);
       console.log('AgentQRCode - Request details:', {
         agentId: agentId,
         token: token ? 'Bearer [REDACTED]' : 'MISSING'
       });
       
-      const response = await fetch(`/api/agents/${agentId}/init-whatsapp`, {
+      const response = await fetch(`${API_URL}/api/agents/${agentId}/init-whatsapp`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -223,7 +231,7 @@ export default function AgentQRCode({ agentId }) {
       });
 
       if (response.status === 202 || response.status === 429) {
-        const info = await response.json();
+        const info = await response.json() as { message?: string; retryAfter?: number };
         console.log('WhatsApp init informational response:', info);
 
         if (response.status === 202) {
@@ -240,11 +248,11 @@ export default function AgentQRCode({ agentId }) {
       }
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
+        const errorData = await response.json().catch(() => ({})) as { error?: string; message?: string };
         throw new Error(errorData.error || errorData.message || `HTTP ${response.status}: ${response.statusText}`);
       }
 
-      const data = await response.json();
+      const data = await response.json() as { qrCode?: string; qr?: string; status?: string; phoneNumber?: string };
       console.log('WhatsApp init response:', data);
 
       setCooldownSeconds(null);
@@ -253,9 +261,9 @@ export default function AgentQRCode({ agentId }) {
       if (data.qrCode || data.qr) {
         console.log('QR code received in frontend:', !!data.qrCode || !!data.qr);
         const rawQr = data.qrCode || data.qr;
-        const newQrCode = await normalizeQrCode(rawQr);
+        const newQrCode = await normalizeQrCode(rawQr || null);
         if (newQrCode) {
-          lastQrStringRef.current = rawQr;
+          lastQrStringRef.current = rawQr || null;
           setQrCode(newQrCode);
           setQrCodeTimestamp(Date.now());
           setStatus('qr_pending');
@@ -267,7 +275,7 @@ export default function AgentQRCode({ agentId }) {
       } else if (data.status === 'authenticated') {
         const wasNotAuthenticated = previousStatusRef.current !== 'authenticated' && previousStatusRef.current !== 'connected';
         setStatus('authenticated');
-        setPhoneNumber(data.phoneNumber);
+        setPhoneNumber(data.phoneNumber || null);
         setStatusMessage('');
         
         // Show success popup when authenticated (only once)
@@ -294,10 +302,11 @@ export default function AgentQRCode({ agentId }) {
       setStatus('disconnected');
       setStatusMessage('');
       setCooldownSeconds(null);
-      if (err?.message?.toLowerCase().includes('conflict')) {
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+      if (errorMessage.toLowerCase().includes('conflict')) {
         setError('Session conflict detected. Please unlink existing WhatsApp Web sessions and try again.');
-      } else if (err.message) {
-        setError(err.message);
+      } else if (errorMessage) {
+        setError(errorMessage);
       } else {
         setError('Network error. Please try again.');
       }
@@ -307,7 +316,7 @@ export default function AgentQRCode({ agentId }) {
   };
 
   // Check WhatsApp status
-  const checkStatus = useCallback(async () => {
+  const checkStatus = useCallback(async (): Promise<PollResult> => {
     try {
       const token = await getAuthToken();
       if (!token) {
@@ -317,7 +326,7 @@ export default function AgentQRCode({ agentId }) {
         return 'stop';
       }
 
-      const response = await fetch(`/api/agents/${agentId}/whatsapp-status`, {
+      const response = await fetch(`${API_URL}/api/agents/${agentId}/whatsapp-status`, {
         headers: {
           'Authorization': `Bearer ${token}`
         },
@@ -343,7 +352,12 @@ export default function AgentQRCode({ agentId }) {
         return 'stop';
       }
 
-      const data = JSON.parse(text);
+      const data = JSON.parse(text) as {
+        status?: string;
+        phone_number?: string;
+        qr_code?: string;
+        message?: string;
+      };
       console.log('Status check response:', data);
 
       const qrExpired = qrCodeTimestamp && (Date.now() - qrCodeTimestamp > 60000);
@@ -354,7 +368,7 @@ export default function AgentQRCode({ agentId }) {
       if (data.status === 'connected' || data.status === 'authenticated') {
         const wasNotConnected = previousStatusRef.current !== 'connected' && previousStatusRef.current !== 'authenticated';
         setStatus('connected');
-        setPhoneNumber(data.phone_number);
+        setPhoneNumber(data.phone_number || null);
         setQrCode(null);
         setQrCodeTimestamp(null);
         lastQrStringRef.current = null;
@@ -521,7 +535,7 @@ export default function AgentQRCode({ agentId }) {
         throw new Error('No authentication token available');
       }
 
-      const response = await fetch(`/api/agents/${agentId}/disconnect-whatsapp`, {
+      const response = await fetch(`${API_URL}/api/agents/${agentId}/disconnect-whatsapp`, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${token}`
@@ -529,7 +543,7 @@ export default function AgentQRCode({ agentId }) {
         credentials: 'include' // SECURITY: Send HttpOnly cookies
       });
 
-      const data = await response.json();
+      const data = await response.json() as { success?: boolean };
       
       if (data.success) {
         setStatus('disconnected');
@@ -563,6 +577,7 @@ export default function AgentQRCode({ agentId }) {
             onClick={initializeWhatsApp} 
             disabled={loading || status === 'connecting' || status === 'cooldown'}
             className="bg-gradient-primary hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)] text-white font-bold py-2 px-4 rounded-lg transition-all duration-300 disabled:opacity-50"
+            aria-label="Connect WhatsApp"
           >
             {loading || status === 'connecting' ? 'Connecting...' : 'Connect WhatsApp'}
           </button>
@@ -602,6 +617,7 @@ export default function AgentQRCode({ agentId }) {
             onClick={initializeWhatsApp}
             disabled={cooldownSeconds !== null && cooldownSeconds > 0}
             className="mt-4 bg-muted hover:bg-muted/80 text-white font-bold py-2 px-4 rounded-lg transition-all duration-300 disabled:opacity-50"
+            aria-label="Retry connecting WhatsApp"
           >
             Retry Now
           </button>
@@ -634,6 +650,7 @@ export default function AgentQRCode({ agentId }) {
           <button 
             onClick={handleDisconnect} 
             className="bg-destructive hover:bg-destructive/90 text-white font-bold py-2 px-4 rounded-lg transition-all duration-300"
+            aria-label="Disconnect WhatsApp"
           >
             Disconnect WhatsApp
           </button>
@@ -647,6 +664,7 @@ export default function AgentQRCode({ agentId }) {
           <button 
             onClick={() => setError(null)}
             className="mt-2 bg-destructive hover:bg-destructive/90 text-white font-bold py-1 px-2 rounded text-sm transition-all duration-300"
+            aria-label="Dismiss error"
           >
             Dismiss
           </button>

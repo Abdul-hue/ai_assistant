@@ -1,11 +1,12 @@
 /**
- * ChatInterface Component - Modern Production-Ready Design
+ * ChatInterface Component - ChatGPT-Style Design
  * 
- * A sleek, ChatGPT-inspired chat interface with:
- * - Agent dropdown selector
- * - Centered chat area with max-width
- * - Modern message styling
- * - Smooth animations
+ * A clean, modern chat interface inspired by ChatGPT with:
+ * - Clean alternating message layout
+ * - User messages on right (blue)
+ * - Bot messages on left (white/gray)
+ * - Proper vertical spacing
+ * - Fixed input at bottom
  */
 
 import React, { useState, useEffect, useRef } from 'react';
@@ -21,12 +22,7 @@ import {
   Bot, 
   User,
   Sparkles,
-  Check,
-  CheckCheck,
-  Clock,
-  AlertCircle,
   Plus,
-  Settings,
   Zap,
   WifiOff,
   QrCode
@@ -47,6 +43,7 @@ import { cn } from '@/lib/utils';
 import { Message } from '@/types/message.types';
 import { formatDistanceToNow } from 'date-fns';
 import { useNavigate } from 'react-router-dom';
+import { ariaLabels } from '@/lib/accessibility';
 
 export const ChatInterface: React.FC = () => {
   const navigate = useNavigate();
@@ -90,8 +87,8 @@ export const ChatInterface: React.FC = () => {
     }
   }, [message]);
 
-  const handleSendMessage = (text?: string) => {
-    const messageToSend = text || message.trim();
+  const handleSendMessage = () => {
+    const messageToSend = message.trim();
     if (messageToSend && selectedAgentId) {
       sendMessageMutation.mutate({
         agentId: selectedAgentId,
@@ -141,43 +138,44 @@ export const ChatInterface: React.FC = () => {
       }
     });
     
-    return Array.from(byContent.values());
+    return Array.from(byContent.values()).sort((a, b) => {
+      return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+    });
   }, [messages]);
+
+  // Determine if message is from user
+  const isUserMessage = (msg: Message) => {
+    return msg.is_from_me === true || msg.is_from_me === 'true' || String(msg.is_from_me).toLowerCase() === 'true' || msg.sender_type === 'user';
+  };
 
   if (agentsLoading) {
     return (
-      <div className="flex items-center justify-center h-full bg-gradient-to-b from-[#0a0a0a] to-[#111]">
+      <div className="flex items-center justify-center h-full bg-gray-50 dark:bg-gray-900">
         <div className="flex flex-col items-center gap-4">
-          <div className="relative">
-            <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center animate-pulse">
-              <Sparkles className="w-8 h-8 text-white" />
-            </div>
-            <div className="absolute -bottom-1 -right-1 w-6 h-6 bg-emerald-500 rounded-full flex items-center justify-center border-2 border-[#0a0a0a]">
-              <Loader2 className="w-3 h-3 animate-spin text-white" />
-            </div>
-          </div>
-          <p className="text-gray-400 text-sm">Loading your agents...</p>
+          <Loader2 className="w-8 h-8 animate-spin text-gray-500 dark:text-gray-400" />
+          <p className="text-gray-600 dark:text-gray-400 text-sm">Loading your agents...</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col h-full bg-gradient-to-b from-[#0a0a0a] to-[#0d0d0d] overflow-hidden">
+    <div className="flex flex-col h-full bg-gray-50 dark:bg-gray-900">
       {/* Header with Agent Selector */}
-      <div className="shrink-0 border-b border-white/5 bg-black/40 backdrop-blur-xl">
-        <div className="max-w-4xl mx-auto px-4 py-3">
+      <div className="shrink-0 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+        <div className="max-w-3xl mx-auto px-4 py-3">
           <div className="flex items-center justify-between gap-4">
             <div className="flex items-center gap-3 flex-1 min-w-0">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button
                     variant="ghost"
-                    className="h-auto p-2 pr-3 hover:bg-white/5 border border-white/10 rounded-xl gap-3 max-w-[300px]"
+                    className="h-auto p-2 pr-3 hover:bg-gray-100 dark:hover:bg-gray-700 border border-gray-200 dark:border-gray-700 rounded-xl gap-3 max-w-[300px]"
+                    aria-label={ariaLabels.chat.agentSelector}
                   >
                     {selectedAgent ? (
                       <>
-                        <Avatar className="h-9 w-9 border border-white/10">
+                        <Avatar className="h-9 w-9 border border-gray-200 dark:border-gray-700">
                           {(selectedAgent as any).avatar_url ? (
                             <AvatarImage src={(selectedAgent as any).avatar_url} alt={selectedAgent.agent_name} />
                           ) : null}
@@ -186,44 +184,45 @@ export const ChatInterface: React.FC = () => {
                           </AvatarFallback>
                         </Avatar>
                         <div className="flex-1 min-w-0 text-left">
-                          <p className="text-sm font-medium text-white truncate">{selectedAgent.agent_name}</p>
-                          <p className="text-xs text-gray-500 truncate">
-                            {selectedAgent.unreadCount > 0 && (
-                              <span className="text-emerald-400">{selectedAgent.unreadCount} new • </span>
-                            )}
+                          <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{selectedAgent.agent_name}</p>
+                          <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
+                            {selectedAgent.unreadCount > 0 ? (
+                              <span className="text-blue-600 dark:text-blue-400">{selectedAgent.unreadCount} new • </span>
+                            ) : null}
                             AI Assistant
                           </p>
                         </div>
-                        <ChevronDown className="w-4 h-4 text-gray-500 shrink-0" />
+                        <ChevronDown className="w-4 h-4 text-gray-500 dark:text-gray-400 shrink-0" />
                       </>
                     ) : (
                       <>
-                        <div className="w-9 h-9 rounded-full bg-white/5 flex items-center justify-center">
-                          <Bot className="w-5 h-5 text-gray-500" />
+                        <div className="w-9 h-9 rounded-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center">
+                          <Bot className="w-5 h-5 text-gray-500 dark:text-gray-400" />
                         </div>
-                        <span className="text-sm text-gray-400">Select an agent</span>
-                        <ChevronDown className="w-4 h-4 text-gray-500" />
+                        <span className="text-sm text-gray-500 dark:text-gray-400">Select an agent</span>
+                        <ChevronDown className="w-4 h-4 text-gray-500 dark:text-gray-400" />
                       </>
                     )}
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent 
                   align="start" 
-                  className="w-72 bg-[#1a1a1a] border-white/10 p-2"
+                  className="w-72 bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700 p-2"
                 >
-                  <DropdownMenuLabel className="text-gray-400 text-xs font-normal px-2 pb-2">
+                  <DropdownMenuLabel className="text-gray-500 dark:text-gray-400 text-xs font-normal px-2 pb-2">
                     Your AI Agents
                   </DropdownMenuLabel>
                   {agents.length === 0 ? (
                     <div className="py-6 text-center">
-                      <Bot className="w-10 h-10 mx-auto text-gray-600 mb-2" />
-                      <p className="text-sm text-gray-400">No agents yet</p>
+                      <Bot className="w-10 h-10 mx-auto text-gray-400 mb-2" />
+                      <p className="text-sm text-gray-500 dark:text-gray-400">No agents yet</p>
                       <Button 
                         size="sm" 
-                        className="mt-3 bg-violet-600 hover:bg-violet-700"
+                        className="mt-3 bg-blue-600 hover:bg-blue-700"
                         onClick={() => navigate('/create-agent')}
+                        aria-label={ariaLabels.actions.create('agent')}
                       >
-                        <Plus className="w-4 h-4 mr-1" />
+                        <Plus className="w-4 h-4 mr-1" aria-hidden="true" />
                         Create Agent
                       </Button>
                     </div>
@@ -234,10 +233,11 @@ export const ChatInterface: React.FC = () => {
                         onClick={() => setSelectedAgentId(ag.id)}
                         className={cn(
                           "flex items-center gap-3 p-2 rounded-lg cursor-pointer",
-                          selectedAgentId === ag.id && "bg-white/5"
+                          selectedAgentId === ag.id && "bg-gray-100 dark:bg-gray-700"
                         )}
+                        aria-label={`Select ${ag.agent_name} agent`}
                       >
-                        <Avatar className="h-10 w-10 border border-white/10">
+                        <Avatar className="h-10 w-10 border border-gray-200 dark:border-gray-700">
                           {(ag as any).avatar_url ? (
                             <AvatarImage src={(ag as any).avatar_url} alt={ag.agent_name} />
                           ) : null}
@@ -246,28 +246,25 @@ export const ChatInterface: React.FC = () => {
                           </AvatarFallback>
                         </Avatar>
                         <div className="flex-1 min-w-0">
-                          <p className="text-sm font-medium text-white truncate">{ag.agent_name}</p>
+                          <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">{ag.agent_name}</p>
                           {ag.lastMessage && (
-                            <p className="text-xs text-gray-500 truncate">
+                            <p className="text-xs text-gray-500 dark:text-gray-400 truncate">
                               {ag.lastMessage.message}
                             </p>
                           )}
                         </div>
                         {ag.unreadCount > 0 && (
-                          <Badge className="bg-emerald-500/20 text-emerald-400 border-0 text-xs">
+                          <Badge className="bg-blue-600 text-white border-0 text-xs">
                             {ag.unreadCount}
                           </Badge>
-                        )}
-                        {selectedAgentId === ag.id && (
-                          <div className="w-2 h-2 rounded-full bg-emerald-500" />
                         )}
                       </DropdownMenuItem>
                     ))
                   )}
-                  <DropdownMenuSeparator className="bg-white/5 my-2" />
+                  <DropdownMenuSeparator className="bg-gray-200 dark:bg-gray-700 my-2" />
                   <DropdownMenuItem 
                     onClick={() => navigate('/create-agent')}
-                    className="flex items-center gap-2 p-2 rounded-lg text-gray-400 hover:text-white"
+                    className="flex items-center gap-2 p-2 rounded-lg text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
                   >
                     <Plus className="w-4 h-4" />
                     <span className="text-sm">Create new agent</span>
@@ -277,20 +274,20 @@ export const ChatInterface: React.FC = () => {
             </div>
             
             {selectedAgent && (
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 shrink-0">
                 {isWhatsAppConnected ? (
-                  <Badge variant="outline" className="border-emerald-500/30 text-emerald-400 bg-emerald-500/10">
-                    <Zap className="w-3 h-3 mr-1" />
+                  <Badge variant="outline" className="border-green-500/50 text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-900/20 gap-1">
+                    <Zap className="w-3 h-3" />
                     Connected
                   </Badge>
                 ) : whatsappStatus.hasQRCode ? (
-                  <Badge variant="outline" className="border-amber-500/30 text-amber-400 bg-amber-500/10">
-                    <QrCode className="w-3 h-3 mr-1" />
+                  <Badge variant="outline" className="border-amber-500/30 text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 gap-1">
+                    <QrCode className="w-3 h-3" />
                     Scan QR
                   </Badge>
                 ) : (
-                  <Badge variant="outline" className="border-red-500/30 text-red-400 bg-red-500/10">
-                    <WifiOff className="w-3 h-3 mr-1" />
+                  <Badge variant="outline" className="border-red-500/30 text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20 gap-1">
+                    <WifiOff className="w-3 h-3" />
                     Disconnected
                   </Badge>
                 )}
@@ -300,250 +297,151 @@ export const ChatInterface: React.FC = () => {
         </div>
       </div>
 
-      {/* Messages Area */}
+      {/* Messages Area - Scrollable */}
       <div className="flex-1 overflow-y-auto">
-        <div className="max-w-4xl mx-auto px-4 py-6">
+        <div className="max-w-3xl mx-auto px-4 py-6">
           {!selectedAgentId ? (
-            <EmptyState onCreateAgent={() => navigate('/create-agent')} />
+            <div className="flex flex-col items-center justify-center py-20 text-center">
+              <div className="w-20 h-20 rounded-3xl bg-gradient-to-br from-violet-500/20 to-purple-600/20 flex items-center justify-center mb-6 border border-violet-200 dark:border-violet-800">
+                <MessageCircle className="w-10 h-10 text-violet-600 dark:text-violet-400" />
+              </div>
+              <h3 className="text-xl font-semibold text-gray-900 dark:text-gray-100 mb-2">No agent selected</h3>
+              <p className="text-gray-500 dark:text-gray-400 mb-6">
+                Select an agent from the dropdown above to start chatting
+              </p>
+              <Button 
+                onClick={() => navigate('/create-agent')}
+                className="bg-blue-600 hover:bg-blue-700"
+              >
+                <Plus className="mr-2 h-4 w-4" />
+                Create Agent
+              </Button>
+            </div>
           ) : messagesLoading ? (
             <div className="flex items-center justify-center py-20">
-              <Loader2 className="w-6 h-6 animate-spin text-gray-500" />
+              <Loader2 className="w-6 h-6 animate-spin text-gray-500 dark:text-gray-400" />
             </div>
           ) : uniqueMessages.length === 0 ? (
-            <WelcomeState agentName={selectedAgent?.agent_name || 'Agent'} />
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center mb-6 shadow-lg shadow-violet-500/20">
+                <Sparkles className="w-8 h-8 text-white" />
+              </div>
+              <h3 className="text-xl font-semibold text-gray-900 dark:text-gray-100 mb-2">
+                Start a conversation with {selectedAgent?.agent_name || 'your agent'}
+              </h3>
+              <p className="text-gray-500 dark:text-gray-400 mb-8">
+                Send a message to {selectedAgent?.agent_name || 'your agent'} and get an AI-powered response.
+              </p>
+            </div>
           ) : (
             <div className="space-y-6">
-              {uniqueMessages.map((msg) => (
-                <MessageItem 
-                  key={`${msg.id}-${msg.timestamp}`} 
-                  message={msg} 
-                  agentName={selectedAgent?.agent_name || 'Agent'}
-                  agentAvatar={(selectedAgent as any)?.avatar_url}
-                />
-              ))}
+              {uniqueMessages.map((msg) => {
+                const isUser = isUserMessage(msg);
+                return (
+                  <div
+                    key={`${msg.id}-${msg.timestamp}`}
+                    className={cn(
+                      "flex",
+                      isUser ? "justify-end" : "justify-start"
+                    )}
+                  >
+                    <div className={cn(
+                      "flex items-start gap-3 max-w-2xl",
+                      isUser && "flex-row-reverse"
+                    )}>
+                      {/* Avatar */}
+                      <div className={cn(
+                        "w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0",
+                        isUser 
+                          ? "bg-blue-600" 
+                          : "bg-green-600"
+                      )}>
+                        {isUser ? (
+                          <User className="w-4 h-4 text-white" />
+                        ) : (
+                          <Bot className="w-4 h-4 text-white" />
+                        )}
+                      </div>
+                      
+                      {/* Message Bubble */}
+                      <div className={cn(
+                        "rounded-2xl px-4 py-3",
+                        isUser
+                          ? "bg-blue-600 text-white"
+                          : "bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 shadow-sm"
+                      )}>
+                        <p className={cn(
+                          "text-sm leading-relaxed whitespace-pre-wrap break-words",
+                          isUser
+                            ? "text-white"
+                            : "text-gray-800 dark:text-gray-200"
+                        )}>
+                          {msg.message || msg.message_text || ''}
+                        </p>
+                        {msg.status === 'failed' && (
+                          <div className="flex items-center gap-1 mt-2 text-red-200 dark:text-red-400">
+                            <span className="text-xs">Failed to send</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
               <div ref={messagesEndRef} />
             </div>
           )}
         </div>
       </div>
 
-      {/* Input Area */}
+      {/* Input Area - Fixed at Bottom */}
       {selectedAgentId && (
-        <div className="shrink-0 border-t border-white/5 bg-black/40 backdrop-blur-xl">
-          <div className="max-w-4xl mx-auto px-4 py-4">
+        <div className="shrink-0 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+          <div className="max-w-3xl mx-auto px-4 py-4">
             {/* WhatsApp Disconnected Warning */}
             {!isWhatsAppConnected && (
-              <div className="mb-3 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center gap-3">
-                <div className="w-10 h-10 rounded-lg bg-amber-500/20 flex items-center justify-center shrink-0">
-                  <WifiOff className="w-5 h-5 text-amber-400" />
+              <div className="mb-3 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 flex items-center gap-3">
+                <div className="w-10 h-10 rounded-lg bg-amber-100 dark:bg-amber-900/40 flex items-center justify-center shrink-0">
+                  <WifiOff className="w-5 h-5 text-amber-600 dark:text-amber-400" />
                 </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-amber-300">WhatsApp Not Connected</p>
-                  <p className="text-xs text-amber-400/70">
-                    {whatsappStatus.hasQRCode 
-                      ? "Scan the QR code in agent settings to connect" 
-                      : "Connect WhatsApp in agent settings to send messages"}
+                  <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
+                    WhatsApp Disconnected
+                  </p>
+                  <p className="text-xs text-amber-700 dark:text-amber-300">
+                    Messages won't be sent until WhatsApp is connected
                   </p>
                 </div>
-                <Button 
-                  size="sm" 
-                  variant="outline"
-                  className="border-amber-500/30 text-amber-400 hover:bg-amber-500/10 shrink-0"
-                  onClick={() => navigate(`/dashboard`)}
-                >
-                  <Settings className="w-4 h-4 mr-1" />
-                  Setup
-                </Button>
               </div>
             )}
             
-            <div className={cn(
-              "relative bg-[#1a1a1a] rounded-2xl border transition-colors",
-              !isWhatsAppConnected 
-                ? "border-amber-500/20 opacity-60" 
-                : "border-white/10 focus-within:border-violet-500/50"
-            )}>
+            <div className="flex items-end gap-2 bg-gray-50 dark:bg-gray-900 border border-gray-300 dark:border-gray-600 rounded-full px-4 py-2 shadow-lg">
               <Textarea
                 ref={textareaRef}
                 value={message}
                 onChange={(e) => setMessage(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder={isWhatsAppConnected 
-                  ? `Message ${selectedAgent?.agent_name || 'Agent'}...`
-                  : "Connect WhatsApp to send messages..."
-                }
-                className="min-h-[52px] max-h-[200px] w-full resize-none bg-transparent border-0 text-white placeholder:text-gray-500 focus-visible:ring-0 focus-visible:ring-offset-0 py-4 px-4 pr-14 text-sm"
+                placeholder="Message AI Bot..."
                 disabled={sendMessageMutation.isPending || !isWhatsAppConnected}
+                className="flex-1 bg-transparent border-none outline-none resize-none text-sm text-gray-800 dark:text-gray-200 placeholder-gray-400 dark:placeholder-gray-500 focus-visible:ring-0 focus-visible:ring-offset-0 min-h-[24px] max-h-[200px] py-2 px-0"
                 rows={1}
               />
               <Button
-                onClick={() => handleSendMessage()}
-                disabled={sendMessageMutation.isPending || !message.trim() || !isWhatsAppConnected}
-                size="icon"
-                className={cn(
-                  "absolute right-2 bottom-2 h-9 w-9 rounded-xl transition-all",
-                  message.trim() && isWhatsAppConnected
-                    ? "bg-violet-600 hover:bg-violet-700 text-white"
-                    : "bg-white/5 text-gray-500"
-                )}
+                onClick={handleSendMessage}
+                disabled={!message.trim() || sendMessageMutation.isPending || !isWhatsAppConnected}
+                className="p-2 bg-blue-600 hover:bg-blue-700 rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed h-8 w-8 shrink-0"
+                aria-label={ariaLabels.chat.sendButton}
               >
                 {sendMessageMutation.isPending ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <Loader2 className="w-4 h-4 text-white animate-spin" />
                 ) : (
-                  <Send className="w-4 h-4" />
+                  <Send className="w-4 h-4 text-white" />
                 )}
               </Button>
             </div>
-            <p className="text-[11px] text-gray-600 text-center mt-2">
-              {isWhatsAppConnected 
-                ? "Press Enter to send • Shift + Enter for new line"
-                : "WhatsApp connection required to send messages"
-              }
-            </p>
           </div>
         </div>
       )}
-    </div>
-  );
-};
-
-// Empty State Component
-const EmptyState: React.FC<{ onCreateAgent: () => void }> = ({ onCreateAgent }) => (
-  <div className="flex flex-col items-center justify-center py-20 text-center">
-    <div className="w-20 h-20 rounded-3xl bg-gradient-to-br from-violet-500/20 to-purple-600/20 flex items-center justify-center mb-6 border border-violet-500/20">
-      <MessageCircle className="w-10 h-10 text-violet-400" />
-    </div>
-    <h3 className="text-xl font-semibold text-white mb-2">No Agent Selected</h3>
-    <p className="text-gray-500 mb-6 max-w-sm">
-      Select an agent from the dropdown above to start a conversation, or create a new one.
-    </p>
-    <Button 
-      onClick={onCreateAgent}
-      className="bg-violet-600 hover:bg-violet-700"
-    >
-      <Plus className="w-4 h-4 mr-2" />
-      Create Your First Agent
-    </Button>
-  </div>
-);
-
-// Welcome State Component
-const WelcomeState: React.FC<{ agentName: string }> = ({ agentName }) => (
-  <div className="flex flex-col items-center justify-center py-16 text-center">
-    <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center mb-6 shadow-lg shadow-violet-500/20">
-      <Sparkles className="w-8 h-8 text-white" />
-    </div>
-    <h3 className="text-xl font-semibold text-white mb-2">Start a Conversation</h3>
-    <p className="text-gray-500 max-w-sm">
-      Send a message to {agentName} and get an AI-powered response.
-    </p>
-    <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-md">
-      {[
-        'What can you help me with?',
-        'Tell me about yourself',
-        'Show me the menu',
-        'Schedule a meeting'
-      ].map((suggestion) => (
-        <button
-          key={suggestion}
-          className="px-4 py-3 text-sm text-gray-400 hover:text-white bg-white/5 hover:bg-white/10 rounded-xl border border-white/5 hover:border-white/10 transition-all text-left"
-        >
-          {suggestion}
-        </button>
-      ))}
-    </div>
-  </div>
-);
-
-// Message Item Component
-interface MessageItemProps {
-  message: Message;
-  agentName: string;
-  agentAvatar?: string;
-}
-
-const MessageItem: React.FC<MessageItemProps> = ({ message, agentName, agentAvatar }) => {
-  // Determine if this is a user message (outgoing from dashboard)
-  // Check multiple indicators since data may vary:
-  // 1. is_from_me = true or "true" (handle string/boolean)
-  // 2. sender_type = 'user' (user type)
-  // 3. For dashboard messages: if from agent's own number AND outgoing
-  const isFromMe = message.is_from_me === true || message.is_from_me === 'true' || String(message.is_from_me).toLowerCase() === 'true';
-  const isUser = isFromMe || message.sender_type === 'user';
-  
-  // Debug logging (remove in production)
-  // console.log('[MessageItem] Message:', { id: message.id, is_from_me: message.is_from_me, sender_type: message.sender_type, isUser, message: message.message?.substring(0, 30) });
-  
-
-  const StatusIcon = () => {
-    if (!isUser) return null;
-    
-    switch (message.status) {
-      case 'sending':
-        return <Clock className="w-3 h-3 text-gray-500" />;
-      case 'sent':
-        return <Check className="w-3 h-3 text-gray-500" />;
-      case 'delivered':
-        return <CheckCheck className="w-3 h-3 text-gray-500" />;
-      case 'read':
-        return <CheckCheck className="w-3 h-3 text-emerald-400" />;
-      case 'failed':
-        return <AlertCircle className="w-3 h-3 text-red-400" />;
-      default:
-        return <Check className="w-3 h-3 text-gray-500" />;
-    }
-  };
-
-  return (
-    <div className={cn("flex gap-4", isUser ? "flex-row-reverse" : "flex-row")}>
-      {/* Avatar */}
-      <div className="shrink-0">
-        {isUser ? (
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-cyan-500 flex items-center justify-center">
-            <User className="w-4 h-4 text-white" />
-          </div>
-        ) : (
-          <Avatar className="w-8 h-8 rounded-lg border border-white/10">
-            {agentAvatar ? (
-              <AvatarImage src={agentAvatar} alt={agentName} className="rounded-lg" />
-            ) : null}
-            <AvatarFallback className="rounded-lg bg-gradient-to-br from-violet-500 to-purple-600 text-white text-xs font-semibold">
-              <Bot className="w-4 h-4" />
-            </AvatarFallback>
-          </Avatar>
-        )}
-      </div>
-
-      {/* Message Content */}
-      <div className={cn("flex-1 flex flex-col", isUser ? "items-end" : "items-start")}>
-        <div className={cn("flex items-center gap-2 mb-1", isUser ? "flex-row-reverse" : "flex-row")}>
-          <span className="text-xs font-medium text-gray-400">
-            {isUser ? 'You' : agentName}
-          </span>
-          <span className="text-[10px] text-gray-600">
-            {formatDistanceToNow(new Date(message.timestamp), { addSuffix: true })}
-          </span>
-        </div>
-        
-        <div
-          className={cn(
-            "rounded-2xl px-4 py-3 max-w-[85%]",
-            isUser
-              ? "bg-gradient-to-r from-violet-600 to-purple-600 text-white rounded-tr-sm"
-              : "bg-[#1a1a1a] text-gray-100 border border-white/5 rounded-tl-sm"
-          )}
-        >
-          <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">
-            {message.message}
-          </p>
-        </div>
-        
-        {isUser && (
-          <div className="flex items-center gap-1 mt-1 justify-end">
-            <StatusIcon />
-          </div>
-        )}
-      </div>
     </div>
   );
 };

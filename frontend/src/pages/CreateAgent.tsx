@@ -1,297 +1,187 @@
-import { useState, useEffect } from "react";
-import { useNavigate } from "react-router-dom";
-import { supabase } from "@/integrations/supabase/client";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Badge } from "@/components/ui/badge";
-import { ArrowLeft, Bot, Loader2, MessageSquare, MessageCircle, LayoutDashboard, Plus, Calendar as CalendarIcon, Settings, Home, User, Phone, FileText, Globe, Clock, Building2, Users, Upload, Trash2, Eye, EyeOff, Sparkles, Key } from "lucide-react";
-import { useToast } from "@/hooks/use-toast";
-import AgentQRCode from "@/components/AgentQRCode";
-import KnowledgeBaseFilesSection from "@/components/agents/KnowledgeBaseFilesSection";
-import ContactUploadDialog from "@/components/agents/ContactUploadDialog";
-import type { FileMetadata } from "@/types/agent.types";
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { supabase } from '@/integrations/supabase/client';
+import { AppLayout } from '@/components/layout/AppLayout';
+import { useValidatedForm } from '@/hooks/useValidatedForm';
+import { agentSchema, AgentFormData } from '@/lib/validation';
+import { Button } from '@/components/ui/button';
+import { Loader2, ArrowLeft } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
+import { API_URL } from '@/config';
+import type { FileMetadata } from '@/types/agent.types';
 import {
   uploadAgentFile as uploadFileToStorage,
   updateAgentFiles as persistAgentFiles,
-} from "@/lib/agentStorage";
-import { API_URL } from "@/config";
-import { useUploadContacts } from "@/hooks/useContacts";
-import ProfileAvatarMenu from "@/components/ProfileAvatarMenu";
-import { useLocation } from "react-router-dom";
+} from '@/lib/agentStorage';
+import { useUploadContacts } from '@/hooks/useContacts';
 
-const CreateAgent = () => {
+// Import form section components
+import { OwnerDetailsForm } from '@/components/agents/create/OwnerDetailsForm';
+import { AgentConfigForm } from '@/components/agents/create/AgentConfigForm';
+import { CompanyIntegrationForm } from '@/components/agents/create/CompanyIntegrationForm';
+import { PersonalityForm } from '@/components/agents/create/PersonalityForm';
+import { InstructionsForm } from '@/components/agents/create/InstructionsForm';
+import { FileUploadSection } from '@/components/agents/create/FileUploadSection';
+import { ContactManagementSection } from '@/components/agents/create/ContactManagementSection';
+import AgentQRCode from '@/components/AgentQRCode';
+
+interface Contact {
+  name: string;
+  phone: string;
+  email?: string;
+}
+
+export default function CreateAgent() {
   const navigate = useNavigate();
   const { toast } = useToast();
-  const [isLoading, setIsLoading] = useState(false);
-  const [showQRCode, setShowQRCode] = useState(false);
-  const [createdAgentId, setCreatedAgentId] = useState("");
-  const [contactFile, setContactFile] = useState<File | null>(null);
-  const [showAccessToken, setShowAccessToken] = useState(false);
-
-  const [draftAgentId, setDraftAgentId] = useState<string>(() => crypto.randomUUID());
-  const [formData, setFormData] = useState({
-    // Owner Details
-    agentOwnerName: "",
-    ownerCountryCode: "+92",
-    ownerPhoneNumber: "",
-    ownerNotes: "",
-    
-    // Agent Configuration
-    agentName: "",
-    agentCountryCode: "+92",
-    agentPhoneNumber: "",
-    timezone: "Asia/Karachi",
-    persona: "",
-    agentType: "custom",
-    
-    // Company Integration
-    description: "",
-    whatsappPhoneNumber: "",
-    initialPrompt: "",
-    companyIntegrations: [
-      {
-        endpoint_url: "",
-        access_token: "",
-      }
-    ],
-  });
-  const [pendingFiles, setPendingFiles] = useState<FileMetadata[]>([]);
   const uploadContacts = useUploadContacts();
 
-  useEffect(() => {
-    checkAuth();
-  }, []);
+  // Multi-step state
+  const [showQRCode, setShowQRCode] = useState(false);
+  const [createdAgentId, setCreatedAgentId] = useState('');
+  const [draftAgentId] = useState(() => crypto.randomUUID());
+  
+  // Additional data state
+  const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
+  const [contacts, setContacts] = useState<Contact[]>([]);
 
-  const handleAddFiles = (files: File[]) => {
-    if (!files.length) return;
+  // Form validation
+  const {
+    values: formData,
+    errors,
+    touched,
+    isSubmitting,
+    handleChange,
+    handleBlur,
+    handleSubmit,
+  } = useValidatedForm(agentSchema, {
+    name: '',
+    phone_number: '',
+    owner_name: '',
+    owner_email: '',
+    owner_phone: '',
+    personality: '',
+    instructions: '',
+    company_name: '',
+    company_website: '',
+  });
 
-    const filesWithIds = files.map<FileMetadata>((file) => ({
-      id: crypto.randomUUID(),
-      name: file.name,
-      size: file.size,
-      type: file.type,
-      file,
-    }));
-
-    setPendingFiles((prev) => [...prev, ...filesWithIds]);
-  };
-
-  const handleRemoveFile = (fileId: string) => {
-    setPendingFiles((prev) => prev.filter((file) => file.id !== fileId));
-  };
-
-  const handleContactFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    const validTypes = [
-      "text/csv",
-      "text/vcard",
-      "application/vnd.ms-excel",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ];
-
-    const isValid =
-      validTypes.includes(file.type) || /\.(csv|vcf|xlsx|xls)$/i.test(file.name);
-
-    if (!isValid) {
-      toast({
-        variant: "destructive",
-        title: "Unsupported file",
-        description: "Please upload a CSV, VCF, or Excel file.",
-      });
-      return;
-    }
-
-    setContactFile(file);
-  };
-
-  const checkAuth = async () => {
-    const { data: { session } } = await supabase.auth.getSession();
-    if (!session) {
-      navigate("/auth");
-    }
-  };
-
+  // Helper function to trigger file processing
   const triggerFileProcessing = async (agentId: string, files: FileMetadata[]) => {
-    if (!files.length) {
-      return { successCount: 0, failureCount: 0 };
-    }
+    try {
+      console.log(`[CREATE-AGENT] Triggering file processing for ${files.length} file(s)`, {
+        agentId,
+        fileIds: files.map(f => f.id),
+      });
 
-    const results = await Promise.allSettled(
-      files.map(async (file) => {
-        const response = await fetch(`${API_URL}/api/process-agent-file`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          credentials: "include",
-          body: JSON.stringify({
-            agent_id: agentId,
-            file_id: file.id,
-          }),
-        });
-
-        const payload = await response.json().catch(() => ({}));
+      const response = await fetch(`${API_URL}/api/agents/${agentId}/process-files`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ fileIds: files.map(f => f.id) }),
+      });
 
         if (!response.ok) {
-          const errorMessage =
-            payload?.error ||
-            payload?.message ||
-            `Failed to process ${file.name || "file"}`;
-          throw new Error(errorMessage);
-        }
-
-        console.log("[CreateAgent] File processed", {
-          agentId,
-          fileId: file.id,
-          fileName: file.name,
+        const errorText = await response.text();
+        console.error('[CREATE-AGENT] File processing failed:', {
+          status: response.status,
+          statusText: response.statusText,
+          error: errorText,
         });
-      })
-    );
+        throw new Error(`Failed to trigger file processing: ${response.status} ${response.statusText}`);
+      }
 
-    const failures = results.filter(
-      (result): result is PromiseRejectedResult => result.status === "rejected"
-    );
-
-    if (failures.length) {
-      failures.forEach((failure) => {
-        console.error("[CreateAgent] File processing error:", failure.reason);
-      });
-    }
+      const result = await response.json();
+      console.log('[CREATE-AGENT] File processing result:', result);
 
     return {
-      successCount: results.length - failures.length,
-      failureCount: failures.length,
-    };
+        successCount: result.successCount || 0,
+        failureCount: result.failureCount || 0,
+        results: result.results || [],
+      };
+    } catch (error) {
+      console.error('[CREATE-AGENT] Error triggering file processing:', error);
+      return { 
+        successCount: 0, 
+        failureCount: files.length,
+        results: files.map(f => ({ fileId: f.id, success: false, error: error.message })),
+      };
+    }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsLoading(true);
-
+  // Form submission handler
+  const onSubmit = handleSubmit(async (values: AgentFormData) => {
     try {
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) throw new Error("Not authenticated");
+      if (!user) throw new Error('Not authenticated');
 
-      // Validate Owner Details
-      if (!formData.agentOwnerName.trim()) {
-        throw new Error("Agent owner name is required");
-      }
-      if (!formData.ownerPhoneNumber.trim()) {
-        throw new Error("Owner phone number is required");
-      }
+      // Combine phone numbers (assuming country code is included in phone_number)
+      const ownerFullPhone = values.owner_phone.replace(/[^\d+]/g, '');
+      const agentFullPhone = values.phone_number.replace(/[^\d+]/g, '');
 
-      // Validate Agent Configuration
-      if (!formData.agentName.trim()) {
-        throw new Error("Agent name is required");
-      }
-      if (!formData.agentPhoneNumber.trim()) {
-        throw new Error("Agent WhatsApp number is required");
-      }
-
-      // Combine country codes with phone numbers
-      const ownerFullPhone = `${formData.ownerCountryCode}${formData.ownerPhoneNumber}`.replace(/[^\d]/g, "");
-      const agentFullPhone = `${formData.agentCountryCode}${formData.agentPhoneNumber}`.replace(/[^\d]/g, "");
-
-      // Validate phone number format
-      if (ownerFullPhone.length < 10) {
-        throw new Error("Please enter a valid owner phone number");
-      }
-      if (agentFullPhone.length < 10) {
-        throw new Error("Please enter a valid WhatsApp phone number for the agent");
-      }
-
-      const phoneNumber = agentFullPhone; // For backwards compatibility
-
-      // Validate and sanitize company integrations
-      const sanitizedCompanyIntegrations = formData.companyIntegrations
-        .filter(integration => integration.endpoint_url?.trim() || integration.access_token?.trim())
-        .map(integration => ({
-          endpoint_url: integration.endpoint_url?.trim() || null,
-          access_token: integration.access_token?.trim() || null,
-        }));
-
-      // Validate URLs
-      for (const integration of sanitizedCompanyIntegrations) {
-        if (integration.endpoint_url) {
-          try {
-            const url = new URL(integration.endpoint_url);
-            if (url.protocol !== 'https:') {
-              throw new Error('Company integration URLs must use HTTPS');
-            }
-          } catch (error) {
-            throw new Error('Invalid URL format in company integration');
-          }
-        }
-      }
-      
-      const { data, error } = await supabase
-        .from("agents")
+      // Create agent in Supabase
+      const { data: agentData, error: agentError } = await supabase
+        .from('agents')
         .insert({
           user_id: user.id,
-          // Owner Details
-          agent_owner_name: formData.agentOwnerName,
+          agent_owner_name: values.owner_name,
           agent_phone_number: ownerFullPhone,
-          description: formData.ownerNotes, // Notes saved in description field
-          // Agent Configuration
-          agent_name: formData.agentName,
+          agent_name: values.name,
           whatsapp_phone_number: agentFullPhone,
-          timezone: formData.timezone,
-          persona: formData.persona,
-          // Company Integration
-          agent_type: formData.agentType,
-          initial_prompt: formData.persona, // Also save in initial_prompt for backwards compatibility
-          company_data: sanitizedCompanyIntegrations.length > 0 ? sanitizedCompanyIntegrations : null,
+          description: values.personality || values.instructions || null,
+          initial_prompt: values.instructions || values.personality || null,
+          persona: values.personality || null,
+          company_data: values.company_name || values.company_website
+            ? {
+                company_name: values.company_name || null,
+                company_website: values.company_website || null,
+              }
+            : null,
           integration_endpoints: [],
           uploaded_files: [],
           id: draftAgentId,
-          status: "active"
+          is_active: true,
+          status: 'pending', // Explicitly set status to match constraint
         })
         .select()
         .single();
 
-      if (error || !data) {
-        throw error || new Error('Failed to create agent');
+      if (agentError || !agentData) {
+        throw agentError || new Error('Failed to create agent');
       }
 
-      console.log('Agent created successfully:', data);
-      console.log('Agent ID:', data.id);
+      console.log('Agent created successfully:', agentData);
+      setCreatedAgentId(agentData.id);
 
-      // Upload pending files now that the agent exists
-      if (pendingFiles.length) {
+      // Upload files if any
+      if (uploadedFiles.length > 0) {
         try {
           const uploadedMetadata = await Promise.all(
-            pendingFiles.map(async (pending) => {
-              if (!(pending.file instanceof File)) {
-                return null;
-              }
-              const metadata = await uploadFileToStorage(data.id, pending.file);
+            uploadedFiles.map(async (file) => {
+              const metadata = await uploadFileToStorage(agentData.id, file);
               return metadata;
             })
           );
 
-          const filteredMetadata = uploadedMetadata.filter((meta): meta is FileMetadata => Boolean(meta));
+          const filteredMetadata = uploadedMetadata.filter(
+            (meta): meta is FileMetadata => Boolean(meta)
+          );
 
-          if (filteredMetadata.length) {
-            await persistAgentFiles(data.id, filteredMetadata);
-            const processingSummary = await triggerFileProcessing(data.id, filteredMetadata);
+          if (filteredMetadata.length > 0) {
+            await persistAgentFiles(agentData.id, filteredMetadata);
+            const processingSummary = await triggerFileProcessing(agentData.id, filteredMetadata);
 
-            if (processingSummary.failureCount) {
+            if (processingSummary.failureCount > 0) {
               toast({
-                variant: "destructive",
-                title: "File processing issues",
+                variant: 'destructive',
+                title: 'File processing issues',
                 description:
-                  "Agent was created but some files failed to process. You can retry from the agent details page.",
+                  'Agent was created but some files failed to process. You can retry from the agent details page.',
               });
-            } else if (processingSummary.successCount) {
+            } else if (processingSummary.successCount > 0) {
               toast({
-                title: "Knowledge base ready",
-                description: "Uploaded files were processed successfully.",
+                title: 'Knowledge base ready',
+                description: 'Uploaded files were processed successfully.',
               });
             }
           }
@@ -300,759 +190,236 @@ const CreateAgent = () => {
           toast({
             variant: 'destructive',
             title: 'File upload failed',
-            description: 'Agent was created but some files could not be uploaded. You can retry from the agent details page.',
+            description:
+              'Agent was created but some files could not be uploaded. You can retry from the agent details page.',
           });
         }
       }
 
-      if (contactFile) {
+      // Upload contacts if any
+      if (contacts.length > 0) {
         try {
-          await uploadContacts.mutateAsync({ agentId: data.id, file: contactFile });
+          // Convert contacts array to CSV file
+          const csv = [
+            'Name,Phone,Email',
+            ...contacts.map(c => `${c.name},${c.phone},${c.email || ''}`)
+          ].join('\n');
+
+          const blob = new Blob([csv], { type: 'text/csv' });
+          const contactFile = new File([blob], `contacts_${agentData.id}.csv`, { type: 'text/csv' });
+
+          await uploadContacts.mutateAsync({ agentId: agentData.id, file: contactFile });
+          toast({
+            title: 'Contacts uploaded',
+            description: `${contacts.length} contact(s) uploaded successfully.`,
+          });
         } catch (contactError) {
-          console.error("Contact upload error:", contactError);
+          console.error('Contact upload error:', contactError);
+          toast({
+            variant: 'destructive',
+            title: 'Contact upload failed',
+            description: 'Agent was created but contacts could not be uploaded.',
+          });
         }
       }
 
-      setCreatedAgentId(data.id);
-      setPendingFiles([]);
-      setContactFile(null);
+      // Show QR code
       setShowQRCode(true);
-
       toast({
-        title: "Agent created!",
-        description: "Share the QR code to let users chat with your agent on WhatsApp.",
+        title: 'Agent created!',
+        description: 'Share the QR code to let users chat with your agent on WhatsApp.',
       });
-
     } catch (error) {
+      console.error('Error creating agent:', error);
       const message = error instanceof Error ? error.message : 'Failed to create agent';
       toast({
-        variant: "destructive",
-        title: "Error creating agent",
+        variant: 'destructive',
+        title: 'Error creating agent',
         description: message,
       });
-    } finally {
-      setIsLoading(false);
     }
-  };
+  });
 
-  if (showQRCode) {
-    return (
-      <div className="min-h-screen bg-black">
-        <header className="border-b border-white/10 bg-black/80 backdrop-blur-xl">
-          <div className="container mx-auto px-4 py-4">
+  // Show QR code screen if agent created
+  if (showQRCode && createdAgentId) {
+    const headerContent = (
+      <div className="flex items-center gap-4">
             <Button 
               variant="ghost" 
-              onClick={() => navigate("/dashboard")}
+          onClick={() => navigate('/dashboard')}
               className="hover:bg-white/10 text-gray-300"
+          aria-label="Go back to dashboard"
             >
-              <ArrowLeft className="mr-2 h-4 w-4" />
+          <ArrowLeft className="mr-2 h-4 w-4" aria-hidden="true" />
               Back to Dashboard
             </Button>
           </div>
-        </header>
+    );
 
+    return (
+      <AppLayout headerContent={headerContent}>
         <div className="container mx-auto px-4 py-12 max-w-2xl">
-          <Card className="glass-card shadow-glow border-primary/20">
-            <CardHeader className="text-center pb-6">
-              <Bot className="h-16 w-16 mx-auto mb-4 text-primary animate-pulse-glow" />
-              <CardTitle className="text-3xl font-bold text-white mb-2">Agent Created Successfully!</CardTitle>
-              <CardDescription className="text-gray-400 text-base">
+          <div className="glass-card shadow-glow border-primary/20 rounded-lg p-6">
+            <div className="text-center mb-6">
+              <h1 className="text-3xl font-bold text-white mb-2">Agent Created Successfully!</h1>
+              <p className="text-gray-400">
                 Scan this QR code with WhatsApp to connect your agent
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-6">
+              </p>
+            </div>
               <AgentQRCode 
                 agentId={createdAgentId}
-                phoneNumber={`${formData.agentCountryCode}${formData.agentPhoneNumber}`}
+              phoneNumber={formData.phone_number}
               />
-              
-              <div className="space-y-4">
-                <div className="space-y-2 text-sm text-gray-300">
-                  <p className="font-semibold text-white">Scan with WhatsApp</p>
-                  <p>Open WhatsApp → Settings → Linked Devices → Link a Device</p>
-                  <p className="text-gray-400">Ready to scan. Open WhatsApp → Linked Devices to scan the QR.</p>
-                </div>
-                <div className="rounded-lg bg-muted p-4 space-y-2">
-                  <p className="text-sm font-medium">Agent Details:</p>
-                  <p className="text-sm text-muted-foreground">
-                    <span className="font-medium">Owner:</span> {formData.agentOwnerName}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    <span className="font-medium">Agent:</span> {formData.agentName}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    <span className="font-medium">Phone:</span> {formData.agentCountryCode}{formData.agentPhoneNumber}
-                  </p>
-                  <p className="text-sm text-muted-foreground">
-                    <span className="font-medium">Agent ID:</span> {createdAgentId.substring(0, 8)}...
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex gap-4">
+            <div className="flex gap-4 mt-6">
                 <Button 
                   variant="outline" 
                   className="flex-1"
                   onClick={() => {
                     setShowQRCode(false);
-                    setFormData({
-                      // Owner Details
-                      agentOwnerName: "",
-                      ownerCountryCode: "+92",
-                      ownerPhoneNumber: "",
-                      ownerNotes: "",
-                      // Agent Configuration
-                      agentName: "",
-                      agentCountryCode: "+92",
-                      agentPhoneNumber: "",
-                      timezone: "Asia/Karachi",
-                      persona: "",
-                      agentType: "custom",
-                      // Backwards compatibility
-                      description: "",
-                      whatsappPhoneNumber: "",
-                      initialPrompt: "",
-                      companyIntegrations: [
-                        {
-                          endpoint_url: "",
-                          access_token: "",
-                        }
-                      ],
-                    });
-                    setPendingFiles([]);
-                    setContactFile(null);
-                    setDraftAgentId(crypto.randomUUID());
+                  setCreatedAgentId('');
+                  // Reset form would go here if needed
                   }}
                 >
                   Create Another
                 </Button>
                 <Button 
                   className="flex-1 bg-gradient-primary"
-                  onClick={() => navigate("/dashboard")}
+                onClick={() => navigate('/dashboard')}
                 >
                   Go to Dashboard
                 </Button>
               </div>
-            </CardContent>
-          </Card>
         </div>
       </div>
+      </AppLayout>
     );
   }
 
-  const location = useLocation();
-  const isActive = (path: string) => location.pathname === path;
-
-  return (
-    <div className="min-h-screen bg-black flex">
-      {/* Sidebar */}
-      <aside className="w-64 bg-[#0a0a0a] border-r border-white/5 flex flex-col fixed h-screen z-40">
-        <div className="p-5 border-b border-white/5">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center">
-              <Sparkles className="h-5 w-5 text-white" />
-            </div>
-            <div>
-              <span className="text-lg font-bold text-white">
-                PA Agent
-              </span>
-              <p className="text-[10px] text-gray-500 -mt-0.5">AI Powered Assistant</p>
-            </div>
-          </div>
-        </div>
-        
-        <nav className="flex-1 p-3 space-y-1">
-          <NavButton
-            icon={<LayoutDashboard className="h-4 w-4" />}
-            label="Dashboard"
-            active={isActive("/dashboard")}
-            onClick={() => navigate("/dashboard")}
-          />
-          <NavButton
-            icon={<MessageCircle className="h-4 w-4" />}
-            label="Agent Chat"
-            active={isActive("/agent-chat")}
-            onClick={() => navigate("/agent-chat")}
-          />
-          <NavButton
-            icon={<Plus className="h-4 w-4" />}
-            label="Create Agent"
-            active={isActive("/create-agent")}
-            onClick={() => navigate("/create-agent")}
-          />
-          <NavButton
-            icon={<CalendarIcon className="h-4 w-4" />}
-            label="Calendar"
-            active={isActive("/calendar")}
-            onClick={() => navigate("/calendar")}
-          />
-          <NavButton
-            icon={<Key className="h-4 w-4" />}
-            label="Email Integration"
-            active={isActive("/email-integration")}
-            onClick={() => navigate("/email-integration")}
-          />
-          
-          <div className="pt-4 pb-2">
-            <p className="px-3 text-[10px] uppercase tracking-wider text-gray-600 font-medium">
-              Settings
-            </p>
-          </div>
-          
-          <NavButton
-            icon={<Settings className="h-4 w-4" />}
-            label="Profile Settings"
-            active={isActive("/profile")}
-            onClick={() => navigate("/profile")}
-          />
-          <NavButton
-            icon={<Home className="h-4 w-4" />}
-            label="Back to Home"
-            active={false}
-            onClick={() => navigate("/")}
-          />
-        </nav>
-
-        <div className="p-4 border-t border-white/5">
-          <ProfileAvatarMenu />
-        </div>
-      </aside>
-
-      {/* Main Content */}
-      <div className="flex-1 ml-64">
-        <header className="border-b border-white/10 bg-black/80 backdrop-blur-xl">
-          <div className="px-6 py-4">
+  // Show create agent form
+  const headerContent = (
+    <div className="flex items-center gap-4">
             <Button 
               variant="ghost" 
-              onClick={() => navigate("/dashboard")}
-              className="hover:bg-white/10 text-gray-300"
+        onClick={() => navigate('/dashboard')}
+              className="hover:bg-gray-100 dark:hover:bg-white/10 text-gray-700 dark:text-gray-300"
+        aria-label="Go back to dashboard"
             >
-              <ArrowLeft className="mr-2 h-4 w-4" />
+        <ArrowLeft className="mr-2 h-4 w-4" aria-hidden="true" />
               Back to Dashboard
             </Button>
           </div>
-        </header>
+  );
 
-        <div className="p-6 max-w-3xl mx-auto">
-        <div className="mb-8 animate-fade-in-up">
-          <h1 className="text-4xl font-bold mb-3 text-white">Create New Agent</h1>
-          <p className="text-gray-400 text-lg">
-            Set up a new AI agent for WhatsApp communication
+  return (
+    <AppLayout headerContent={headerContent}>
+      <div className="max-w-4xl mx-auto p-6">
+        {/* Header */}
+        <div className="mb-6">
+          <h1 className="text-3xl font-bold bg-gradient-to-r from-purple-600 to-blue-600 bg-clip-text text-transparent">Create New Agent</h1>
+          <p className="text-gray-600 dark:text-gray-400 mt-2">
+            Set up your AI agent by filling out the form below
           </p>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-8">
-          {/* SECTION 1: Owner Details */}
-          <Card className="glass-card shadow-glow border-white/10">
-            <CardHeader className="pb-6">
-              <CardTitle className="text-2xl font-bold text-white mb-2 flex items-center gap-2">
-                <User className="w-6 h-6 text-primary" />
-                Owner Details
-              </CardTitle>
-              <CardDescription className="text-gray-400 text-base">
-                Information about the agent owner
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {/* Agent Owner Name */}
-              <div className="space-y-2">
-                <Label htmlFor="owner-name" className="text-gray-300">
-                  Agent Owner Name <span className="text-red-500">*</span>
-                </Label>
-                <Input
-                  id="owner-name"
-                  type="text"
-                  placeholder="Enter your full name"
-                  value={formData.agentOwnerName}
-                  onChange={(e) => setFormData({...formData, agentOwnerName: e.target.value})}
-                  className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50 transition-all duration-300"
-                  required
-                />
-              </div>
+        {/* Form */}
+        <form onSubmit={onSubmit} className="space-y-6">
+          {/* Owner Details */}
+          <OwnerDetailsForm
+            formData={{
+              owner_name: formData.owner_name,
+              owner_email: formData.owner_email,
+              owner_phone: formData.owner_phone,
+            }}
+            errors={errors}
+            touched={touched}
+            onChange={handleChange}
+            onBlur={handleBlur}
+          />
 
-              {/* Owner Phone Number with Country Code */}
-              <div className="space-y-2">
-                <Label htmlFor="owner-phone" className="text-gray-300">
-                  Phone Number <span className="text-red-500">*</span>
-                </Label>
-                <div className="grid grid-cols-[140px_1fr] gap-2">
-                  <Select
-                    value={formData.ownerCountryCode}
-                    onValueChange={(value) => setFormData({...formData, ownerCountryCode: value})}
-                  >
-                    <SelectTrigger className="bg-white/5 border-white/10 text-white">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="max-h-[300px] bg-[#0a0a0a] border-white/10">
-                      <SelectItem value="+92">🇵🇰 Pakistan (+92)</SelectItem>
-                      <SelectItem value="+1">🇺🇸 United States (+1)</SelectItem>
-                      <SelectItem value="+44">🇬🇧 United Kingdom (+44)</SelectItem>
-                      <SelectItem value="+91">🇮🇳 India (+91)</SelectItem>
-                      <SelectItem value="+971">🇦🇪 UAE (+971)</SelectItem>
-                      <SelectItem value="+966">🇸🇦 Saudi Arabia (+966)</SelectItem>
-                      <SelectItem value="+86">🇨🇳 China (+86)</SelectItem>
-                      <SelectItem value="+81">🇯🇵 Japan (+81)</SelectItem>
-                      <SelectItem value="+82">🇰🇷 South Korea (+82)</SelectItem>
-                      <SelectItem value="+49">🇩🇪 Germany (+49)</SelectItem>
-                      <SelectItem value="+33">🇫🇷 France (+33)</SelectItem>
-                      <SelectItem value="+39">🇮🇹 Italy (+39)</SelectItem>
-                      <SelectItem value="+34">🇪🇸 Spain (+34)</SelectItem>
-                      <SelectItem value="+7">🇷🇺 Russia (+7)</SelectItem>
-                      <SelectItem value="+55">🇧🇷 Brazil (+55)</SelectItem>
-                      <SelectItem value="+52">🇲🇽 Mexico (+52)</SelectItem>
-                      <SelectItem value="+27">🇿🇦 South Africa (+27)</SelectItem>
-                      <SelectItem value="+61">🇦🇺 Australia (+61)</SelectItem>
-                      <SelectItem value="+64">🇳🇿 New Zealand (+64)</SelectItem>
-                      <SelectItem value="+65">🇸🇬 Singapore (+65)</SelectItem>
-                      <SelectItem value="+60">🇲🇾 Malaysia (+60)</SelectItem>
-                      <SelectItem value="+62">🇮🇩 Indonesia (+62)</SelectItem>
-                      <SelectItem value="+63">🇵🇭 Philippines (+63)</SelectItem>
-                      <SelectItem value="+66">🇹🇭 Thailand (+66)</SelectItem>
-                      <SelectItem value="+84">🇻🇳 Vietnam (+84)</SelectItem>
-                      <SelectItem value="+20">🇪🇬 Egypt (+20)</SelectItem>
-                      <SelectItem value="+234">🇳🇬 Nigeria (+234)</SelectItem>
-                      <SelectItem value="+254">🇰🇪 Kenya (+254)</SelectItem>
-                      <SelectItem value="+90">🇹🇷 Turkey (+90)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Input
-                    id="owner-phone"
-                    type="tel"
-                    placeholder="3001234567"
-                    value={formData.ownerPhoneNumber}
-                    onChange={(e) => setFormData({...formData, ownerPhoneNumber: e.target.value.replace(/\D/g, '')})}
-                    className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50 transition-all duration-300"
-                    required
-                  />
-                </div>
-                <p className="text-xs text-gray-400">Enter number without country code or spaces</p>
-              </div>
+          {/* Agent Configuration */}
+          <AgentConfigForm
+            formData={{
+              name: formData.name,
+              phone_number: formData.phone_number,
+            }}
+            errors={errors}
+            touched={touched}
+            onChange={handleChange}
+            onBlur={handleBlur}
+          />
 
-              {/* Owner Notes */}
-              <div className="space-y-2">
-                <Label htmlFor="owner-notes" className="text-gray-300">
-                  Notes <span className="text-gray-400">(Optional)</span>
-                </Label>
-                <Textarea
-                  id="owner-notes"
-                  placeholder="Personal notes about this agent (visible only to you)"
-                  value={formData.ownerNotes}
-                  onChange={(e) => {
-                    if (e.target.value.length <= 500) {
-                      setFormData({...formData, ownerNotes: e.target.value});
-                    }
-                  }}
-                  className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50 transition-all duration-300 resize-none min-h-[80px]"
-                  maxLength={500}
-                />
-                <p className="text-xs text-gray-400 text-right">
-                  {formData.ownerNotes.length} / 500 characters
-                </p>
-              </div>
-            </CardContent>
-          </Card>
+          {/* Company Integration */}
+          <CompanyIntegrationForm
+            formData={{
+              company_name: formData.company_name,
+              company_website: formData.company_website,
+            }}
+            errors={errors}
+            touched={touched}
+            onChange={handleChange}
+            onBlur={handleBlur}
+          />
 
-          {/* SECTION 2: Agent Configuration */}
-          <Card className="glass-card shadow-glow border-white/10">
-            <CardHeader className="pb-6">
-              <CardTitle className="text-2xl font-bold text-white mb-2 flex items-center gap-2">
-                <Bot className="w-6 h-6 text-primary" />
-                Agent Configuration
-              </CardTitle>
-              <CardDescription className="text-gray-400 text-base">
-                Configure your AI agent's settings and behavior
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {/* Agent Name */}
-              <div className="space-y-2">
-                <Label htmlFor="agent-name" className="text-gray-300">
-                  Agent Name <span className="text-red-500">*</span>
-                </Label>
-                <Input
-                  id="agent-name"
-                  placeholder="e.g., Sales Assistant"
-                  value={formData.agentName}
-                  onChange={(e) => setFormData({ ...formData, agentName: e.target.value })}
-                  required
-                  className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50 transition-all duration-300"
-                />
-              </div>
+          {/* Personality */}
+          <PersonalityForm
+            formData={{ personality: formData.personality }}
+            errors={errors}
+            touched={touched}
+            onChange={handleChange}
+            onBlur={handleBlur}
+          />
 
-              {/* Agent WhatsApp Number with Country Code */}
-              <div className="space-y-2">
-                <Label htmlFor="agent-number" className="text-gray-300">
-                  Agent Number (WhatsApp) <span className="text-red-500">*</span>
-                </Label>
-                <div className="grid grid-cols-[140px_1fr] gap-2">
-                  <Select
-                    value={formData.agentCountryCode}
-                    onValueChange={(value) => setFormData({...formData, agentCountryCode: value})}
-                  >
-                    <SelectTrigger className="bg-white/5 border-white/10 text-white">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="max-h-[300px] bg-[#0a0a0a] border-white/10">
-                      <SelectItem value="+92">🇵🇰 Pakistan (+92)</SelectItem>
-                      <SelectItem value="+1">🇺🇸 United States (+1)</SelectItem>
-                      <SelectItem value="+44">🇬🇧 United Kingdom (+44)</SelectItem>
-                      <SelectItem value="+91">🇮🇳 India (+91)</SelectItem>
-                      <SelectItem value="+971">🇦🇪 UAE (+971)</SelectItem>
-                      <SelectItem value="+966">🇸🇦 Saudi Arabia (+966)</SelectItem>
-                      <SelectItem value="+86">🇨🇳 China (+86)</SelectItem>
-                      <SelectItem value="+81">🇯🇵 Japan (+81)</SelectItem>
-                      <SelectItem value="+82">🇰🇷 South Korea (+82)</SelectItem>
-                      <SelectItem value="+49">🇩🇪 Germany (+49)</SelectItem>
-                      <SelectItem value="+33">🇫🇷 France (+33)</SelectItem>
-                      <SelectItem value="+39">🇮🇹 Italy (+39)</SelectItem>
-                      <SelectItem value="+34">🇪🇸 Spain (+34)</SelectItem>
-                      <SelectItem value="+7">🇷🇺 Russia (+7)</SelectItem>
-                      <SelectItem value="+55">🇧🇷 Brazil (+55)</SelectItem>
-                      <SelectItem value="+52">🇲🇽 Mexico (+52)</SelectItem>
-                      <SelectItem value="+27">🇿🇦 South Africa (+27)</SelectItem>
-                      <SelectItem value="+61">🇦🇺 Australia (+61)</SelectItem>
-                      <SelectItem value="+64">🇳🇿 New Zealand (+64)</SelectItem>
-                      <SelectItem value="+65">🇸🇬 Singapore (+65)</SelectItem>
-                      <SelectItem value="+60">🇲🇾 Malaysia (+60)</SelectItem>
-                      <SelectItem value="+62">🇮🇩 Indonesia (+62)</SelectItem>
-                      <SelectItem value="+63">🇵🇭 Philippines (+63)</SelectItem>
-                      <SelectItem value="+66">🇹🇭 Thailand (+66)</SelectItem>
-                      <SelectItem value="+84">🇻🇳 Vietnam (+84)</SelectItem>
-                      <SelectItem value="+20">🇪🇬 Egypt (+20)</SelectItem>
-                      <SelectItem value="+234">🇳🇬 Nigeria (+234)</SelectItem>
-                      <SelectItem value="+254">🇰🇪 Kenya (+254)</SelectItem>
-                      <SelectItem value="+90">🇹🇷 Turkey (+90)</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Input
-                    id="agent-number"
-                    type="tel"
-                    placeholder="3001234567"
-                    value={formData.agentPhoneNumber}
-                    onChange={(e) => setFormData({...formData, agentPhoneNumber: e.target.value.replace(/\D/g, '')})}
-                    className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50 transition-all duration-300"
-                    required
-                  />
-                </div>
-                <p className="text-xs text-gray-400">WhatsApp number for this agent</p>
-              </div>
+          {/* Instructions */}
+          <InstructionsForm
+            formData={{ instructions: formData.instructions }}
+            errors={errors}
+            touched={touched}
+            onChange={handleChange}
+            onBlur={handleBlur}
+          />
 
+          {/* File Upload Section */}
+          <FileUploadSection
+            files={uploadedFiles}
+            onFilesChange={setUploadedFiles}
+            disabled={isSubmitting}
+          />
 
-              {/* Timezone */}
-              <div className="space-y-2">
-                <Label htmlFor="timezone" className="text-gray-300">
-                  Timezone <span className="text-red-500">*</span>
-                </Label>
-                <Select
-                  value={formData.timezone}
-                  onValueChange={(value) => setFormData({...formData, timezone: value})}
-                >
-                  <SelectTrigger className="bg-white/5 border-white/10 text-white">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent className="max-h-[300px] bg-[#0a0a0a] border-white/10">
-                    {/* Asia/Pacific */}
-                    <SelectItem value="Asia/Karachi">🇵🇰 Pakistan (Asia/Karachi, UTC+5)</SelectItem>
-                    <SelectItem value="Asia/Dubai">🇦🇪 Dubai (Asia/Dubai, UTC+4)</SelectItem>
-                    <SelectItem value="Asia/Riyadh">🇸🇦 Riyadh (Asia/Riyadh, UTC+3)</SelectItem>
-                    <SelectItem value="Asia/Kolkata">🇮🇳 India (Asia/Kolkata, UTC+5:30)</SelectItem>
-                    <SelectItem value="Asia/Shanghai">🇨🇳 China (Asia/Shanghai, UTC+8)</SelectItem>
-                    <SelectItem value="Asia/Tokyo">🇯🇵 Japan (Asia/Tokyo, UTC+9)</SelectItem>
-                    <SelectItem value="Asia/Seoul">🇰🇷 South Korea (Asia/Seoul, UTC+9)</SelectItem>
-                    <SelectItem value="Asia/Singapore">🇸🇬 Singapore (Asia/Singapore, UTC+8)</SelectItem>
-                    <SelectItem value="Asia/Bangkok">🇹🇭 Bangkok (Asia/Bangkok, UTC+7)</SelectItem>
-                    <SelectItem value="Asia/Jakarta">🇮🇩 Jakarta (Asia/Jakarta, UTC+7)</SelectItem>
-                    {/* Europe */}
-                    <SelectItem value="Europe/London">🇬🇧 London (Europe/London, UTC+0)</SelectItem>
-                    <SelectItem value="Europe/Paris">🇫🇷 Paris (Europe/Paris, UTC+1)</SelectItem>
-                    <SelectItem value="Europe/Berlin">🇩🇪 Berlin (Europe/Berlin, UTC+1)</SelectItem>
-                    <SelectItem value="Europe/Rome">🇮🇹 Rome (Europe/Rome, UTC+1)</SelectItem>
-                    <SelectItem value="Europe/Moscow">🇷🇺 Moscow (Europe/Moscow, UTC+3)</SelectItem>
-                    <SelectItem value="Europe/Istanbul">🇹🇷 Istanbul (Europe/Istanbul, UTC+3)</SelectItem>
-                    {/* Americas */}
-                    <SelectItem value="America/New_York">🇺🇸 New York (EST, UTC-5)</SelectItem>
-                    <SelectItem value="America/Chicago">🇺🇸 Chicago (CST, UTC-6)</SelectItem>
-                    <SelectItem value="America/Denver">🇺🇸 Denver (MST, UTC-7)</SelectItem>
-                    <SelectItem value="America/Los_Angeles">🇺🇸 Los Angeles (PST, UTC-8)</SelectItem>
-                    <SelectItem value="America/Toronto">🇨🇦 Toronto (EST, UTC-5)</SelectItem>
-                    <SelectItem value="America/Mexico_City">🇲🇽 Mexico City (CST, UTC-6)</SelectItem>
-                    <SelectItem value="America/Sao_Paulo">🇧🇷 São Paulo (BRT, UTC-3)</SelectItem>
-                    {/* Australia/Oceania */}
-                    <SelectItem value="Australia/Sydney">🇦🇺 Sydney (AEDT, UTC+11)</SelectItem>
-                    <SelectItem value="Australia/Melbourne">🇦🇺 Melbourne (AEDT, UTC+11)</SelectItem>
-                    <SelectItem value="Pacific/Auckland">🇳🇿 Auckland (NZDT, UTC+13)</SelectItem>
-                    {/* Africa */}
-                    <SelectItem value="Africa/Cairo">🇪🇬 Cairo (EET, UTC+2)</SelectItem>
-                    <SelectItem value="Africa/Johannesburg">🇿🇦 Johannesburg (SAST, UTC+2)</SelectItem>
-                    <SelectItem value="Africa/Lagos">🇳🇬 Lagos (WAT, UTC+1)</SelectItem>
-                  </SelectContent>
-                </Select>
-                <p className="text-xs text-gray-400">Agent operates in this timezone</p>
-              </div>
+          {/* Contact Management Section */}
+          <ContactManagementSection
+            contacts={contacts}
+            onContactsChange={setContacts}
+            disabled={isSubmitting}
+          />
 
-              {/* Persona (renamed from Initial Prompt) */}
-              <div className="space-y-2">
-                <Label htmlFor="persona" className="text-gray-300">
-                  Persona <span className="text-gray-400">(Optional)</span>
-                </Label>
-                <Textarea
-                  id="persona"
-                  placeholder="You are a helpful sales assistant who provides product information and helps customers make purchasing decisions..."
-                  value={formData.persona}
-                  onChange={(e) => setFormData({...formData, persona: e.target.value})}
-                  className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50 transition-all duration-300 resize-none min-h-[120px]"
-                />
-                <p className="text-xs text-gray-400">Define your agent's personality and behavior</p>
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* SECTION 3: Company Integration */}
-          <Card className="glass-card shadow-glow border-white/10">
-            <CardHeader className="pb-6">
-              <div className="flex items-center justify-between">
-                <div>
-                  <CardTitle className="text-2xl font-bold text-white mb-2 flex items-center gap-2">
-                    <Building2 className="w-6 h-6 text-primary" />
-                    Company Integration
-                    <Badge variant="secondary" className="ml-2 text-xs">Optional</Badge>
-                  </CardTitle>
-                  <CardDescription className="text-gray-400 text-base">
-                    Connect your business systems (optional)
-                  </CardDescription>
-                </div>
+          {/* Form Actions */}
+          <div className="flex flex-col sm:flex-row justify-end gap-4 pt-6 border-t">
                 <Button
                   type="button"
                   variant="outline"
-                  size="sm"
-                  onClick={() => setFormData({
-                    ...formData,
-                    companyIntegrations: [
-                      ...formData.companyIntegrations,
-                      { endpoint_url: "", access_token: "" }
-                    ]
-                  })}
-                  className="text-white border-white/20 hover:bg-white/10"
-                >
-                  <Plus className="h-4 w-4 mr-2" />
-                  Add Integration
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              {formData.companyIntegrations.map((integration, index) => (
-                <div key={index} className="space-y-4 p-4 rounded-lg border border-white/10 bg-white/5">
-                  <div className="flex items-center justify-between mb-2">
-                    <h4 className="text-sm font-semibold text-white">Integration {index + 1}</h4>
-                    {formData.companyIntegrations.length > 1 && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => {
-                          const updated = formData.companyIntegrations.filter((_, i) => i !== index);
-                          setFormData({
-                            ...formData,
-                            companyIntegrations: updated.length > 0 ? updated : [{ endpoint_url: "", access_token: "" }]
-                          });
-                        }}
-                        className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    )}
-                  </div>
-                  
-                  <div className="space-y-2">
-                    <Label htmlFor={`endpoint-url-${index}`} className="text-gray-300">Endpoint URL</Label>
-                    <Input
-                      id={`endpoint-url-${index}`}
-                      type="url"
-                      className="w-full rounded-md border border-white/10 bg-white/5 text-white px-3 py-2 focus:border-primary focus:ring-primary/50 transition-all duration-300"
-                      placeholder="https://api.yourcompany.com/webhook"
-                      value={integration.endpoint_url}
-                      onChange={(e) => {
-                        const updated = [...formData.companyIntegrations];
-                        updated[index] = { ...updated[index], endpoint_url: e.target.value };
-                        setFormData({ ...formData, companyIntegrations: updated });
-                      }}
-                    />
-                    <p className="text-xs text-gray-400">Webhook URL for company system integration</p>
-                  </div>
-
-                  <div className="space-y-2">
-                    <Label htmlFor={`access-token-${index}`} className="text-gray-300 flex items-center gap-2">
-                      Access Token
-                      <Badge variant="outline" className="text-xs">Optional</Badge>
-                    </Label>
-                    <div className="relative">
-                      <Input
-                        id={`access-token-${index}`}
-                        type={showAccessToken ? "text" : "password"}
-                        className="w-full rounded-md border border-white/10 bg-white/5 text-white px-3 py-2 pr-10 focus:border-primary focus:ring-primary/50 transition-all duration-300"
-                        placeholder="your-access-token-here"
-                        value={integration.access_token}
-                        onChange={(e) => {
-                          const updated = [...formData.companyIntegrations];
-                          updated[index] = { ...updated[index], access_token: e.target.value };
-                          setFormData({ ...formData, companyIntegrations: updated });
-                        }}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowAccessToken(!showAccessToken)}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white transition-colors"
-                        aria-label={showAccessToken ? "Hide access token" : "Show access token"}
-                      >
-                        {showAccessToken ? (
-                          <EyeOff className="h-4 w-4" />
-                        ) : (
-                          <Eye className="h-4 w-4" />
-                        )}
-                      </button>
-                    </div>
-                    <p className="text-xs text-gray-400">Authentication token for your company API (if required)</p>
-                  </div>
-                </div>
-              ))}
-            </CardContent>
-          </Card>
-
-          {/* SECTION 4: Knowledge Base Files */}
-          <Card className="glass-card shadow-glow border-white/10">
-            <CardHeader className="pb-6">
-              <CardTitle className="text-2xl font-bold text-white mb-2 flex items-center gap-2">
-                <FileText className="w-6 h-6 text-primary" />
-                Knowledge Base Files
-                <Badge variant="secondary" className="ml-2 text-xs">Optional</Badge>
-              </CardTitle>
-              <CardDescription className="text-gray-400 text-base">
-                Upload documents to train your agent (PDF, DOC, DOCX)
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <KnowledgeBaseFilesSection
-                files={pendingFiles}
-                onFilesSelected={handleAddFiles}
-                onFileRemove={handleRemoveFile}
-              />
-            </CardContent>
-          </Card>
-
-          {/* SECTION 5: Contact List */}
-          <Card className="glass-card shadow-glow border-white/10">
-            <CardHeader className="pb-6">
-              <CardTitle className="text-2xl font-bold text-white mb-2 flex items-center gap-2">
-                <Users className="w-6 h-6 text-primary" />
-                Contact List
-                <Badge variant="secondary" className="ml-2 text-xs">Optional</Badge>
-              </CardTitle>
-              <CardDescription className="text-gray-400 text-base">
-                Upload contacts for this agent (CSV, VCF, XLSX)
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {/* Show upload area if no file selected */}
-              {!contactFile ? (
-                <div
-                  className="border-2 border-dashed border-white/10 rounded-lg p-8 text-center cursor-pointer hover:border-primary/50 transition-colors"
-                  onClick={() => document.getElementById('contact-file-input')?.click()}
-                >
-                  <Upload className="w-12 h-12 mx-auto text-gray-400 mb-3" />
-                  <p className="text-white mb-2">
-                    Drag & drop contact file here, or click to browse
-                  </p>
-                  <p className="text-sm text-gray-400">
-                    Supported formats: CSV, VCF, XLSX (Max 10MB)
-                  </p>
-                  <input
-                    id="contact-file-input"
-                    type="file"
-                    accept=".csv,.vcf,.xlsx"
-                    onChange={handleContactFileChange}
-                    className="hidden"
-                  />
-                </div>
-              ) : (
-                /* Show selected file with red delete icon (matching Knowledge Base style) */
-                <div className="p-4 bg-white/5 rounded-lg border border-white/10">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3 flex-1">
-                      <div className="w-10 h-10 rounded-lg bg-primary/20 flex items-center justify-center">
-                        <FileText className="w-5 h-5 text-primary" />
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-white font-medium truncate">
-                          {contactFile.name}
-                        </p>
-                        <p className="text-sm text-gray-400">
-                          {(contactFile.size / 1024).toFixed(2)} KB
-                        </p>
-                      </div>
-                    </div>
-                    
-                    {/* Red Delete Icon Button */}
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => setContactFile(null)}
-                      className="hover:bg-red-500/10 text-red-500 hover:text-red-400"
-                    >
-                      <Trash2 className="w-5 h-5" />
+              onClick={() => navigate('/dashboard')}
+              disabled={isSubmitting}
+              className="sm:w-auto w-full"
+            >
+              Cancel
                     </Button>
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Submit Button */}
           <Button 
             type="submit" 
-            className="w-full bg-gradient-primary shadow-glow hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-[1.02] disabled:opacity-50 py-6 text-lg"
-            disabled={isLoading || uploadContacts.isPending}
+              disabled={isSubmitting}
+              className="sm:w-auto w-full"
           >
-            {isLoading ? (
+              {isSubmitting ? (
               <>
-                <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" aria-hidden="true" />
                 Creating Agent...
               </>
             ) : (
-              "Create Agent"
+                'Create Agent'
             )}
           </Button>
+          </div>
         </form>
         </div>
-      </div>
-    </div>
-  );
-};
-
-// Navigation Button Component
-interface NavButtonProps {
-  icon: React.ReactNode;
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}
-
-const NavButton: React.FC<NavButtonProps> = ({ icon, label, active, onClick }) => (
-  <Button
-    variant="ghost"
-    className={`
-      w-full justify-start gap-3 h-10 px-3 text-sm font-medium
-      transition-all duration-200
-      ${active 
-        ? "bg-violet-500/10 text-violet-400 border-l-2 border-violet-500 rounded-l-none" 
-        : "text-gray-400 hover:text-white hover:bg-white/5"
-      }
-    `}
-    onClick={onClick}
-  >
-    {icon}
-    {label}
-  </Button>
+    </AppLayout>
 );
-
-export default CreateAgent;
+}

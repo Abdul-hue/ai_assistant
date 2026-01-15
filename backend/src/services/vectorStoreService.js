@@ -161,13 +161,16 @@ async function processAndStoreToPinecone({ agentId, content, fileMetadata }) {
   }
 
   const vectors = [];
+  let failedChunks = 0;
+
+  console.log(`[PINECONE] Generating embeddings for ${safeChunks.length} chunk(s)`);
 
   for (let i = 0; i < safeChunks.length; i += 1) {
     const chunkText = safeChunks[i];
     try {
       const embedding = await generateEmbedding(chunkText);
       vectors.push({
-        id: `${agentId}_chunk_${i}`,
+        id: `${agentId}_chunk_${i}_${Date.now()}`,
         values: embedding,
         metadata: {
           agent_id: agentId,
@@ -182,28 +185,49 @@ async function processAndStoreToPinecone({ agentId, content, fileMetadata }) {
           content_type: fileMetadata?.type ?? null
         }
       });
+      console.log(`[PINECONE] ✅ Generated embedding for chunk ${i + 1}/${safeChunks.length}`);
     } catch (error) {
-      console.error(`[PINECONE] Failed to embed chunk ${i}:`, error.message);
-      throw error;
+      console.error(`[PINECONE] ❌ Failed to embed chunk ${i + 1}/${safeChunks.length}:`, {
+        error: error.message,
+        chunkLength: chunkText.length,
+      });
+      failedChunks++;
+      // Continue processing other chunks instead of throwing
     }
   }
 
   if (vectors.length === 0) {
-    throw new Error('No vectors generated for Pinecone upsert');
+    throw new Error(`No vectors generated for Pinecone upsert (${failedChunks} chunks failed)`);
   }
 
-  const index = await getPineconeIndex();
-  const namespace = getNamespace(agentId);
-  const target = namespace ? index.namespace(namespace) : index;
+  if (failedChunks > 0) {
+    console.warn(`[PINECONE] ⚠️ ${failedChunks} chunk(s) failed to embed, but ${vectors.length} chunk(s) succeeded`);
+  }
 
-  await target.upsert(vectors);
+  try {
+    const index = await getPineconeIndex();
+    const namespace = getNamespace(agentId);
+    const target = namespace ? index.namespace(namespace) : index;
 
-  console.log(`[PINECONE] Stored ${vectors.length} chunks for agent ${agentId}${namespace ? ` in namespace ${namespace}` : ''}`);
+    console.log(`[PINECONE] Upserting ${vectors.length} vector(s) to Pinecone${namespace ? ` in namespace ${namespace}` : ''}`);
+    await target.upsert(vectors);
 
-  return {
-    success: true,
-    chunksStored: vectors.length
-  };
+    console.log(`[PINECONE] ✅ Successfully stored ${vectors.length} chunk(s) for agent ${agentId}${namespace ? ` in namespace ${namespace}` : ''}`);
+
+    return {
+      success: true,
+      chunksStored: vectors.length,
+      chunksFailed: failedChunks,
+      totalChunks: safeChunks.length
+    };
+  } catch (error) {
+    console.error(`[PINECONE] ❌ Failed to upsert vectors to Pinecone:`, {
+      error: error.message,
+      vectorsCount: vectors.length,
+      namespace,
+    });
+    throw new Error(`Pinecone upsert failed: ${error.message}`);
+  }
 }
 
 async function queryAgentDocuments(agentId, query, topK = 5) {

@@ -164,7 +164,7 @@ router.delete('/:agentId/files/:fileId', authMiddleware, validateUUID('agentId')
       // Continue with other deletions
     }
 
-    // 3. Delete from agent_document_contents table
+    // 3. Delete from agent_document_contents table (if table exists)
     console.log(`🗑️ [DATABASE] Deleting from agent_document_contents table`, {
       agentId,
       fileId,
@@ -178,12 +178,20 @@ router.delete('/:agentId/files/:fileId', authMiddleware, validateUUID('agentId')
       .select();
 
     if (contentError) {
-      console.error(`❌ [DATABASE] Error deleting from agent_document_contents:`, {
-        error: contentError.message,
-        code: contentError.code,
-        agentId,
-        fileId,
-      });
+      // Handle missing table gracefully (PGRST205 = table not found in schema cache)
+      if (contentError.code === 'PGRST205') {
+        console.warn(`⚠️ [DATABASE] agent_document_contents table not found, skipping deletion (this is OK if migration hasn't run yet)`, {
+          agentId,
+          fileId,
+        });
+      } else {
+        console.error(`❌ [DATABASE] Error deleting from agent_document_contents:`, {
+          error: contentError.message,
+          code: contentError.code,
+          agentId,
+          fileId,
+        });
+      }
     } else {
       console.log(`✅ [DATABASE] Deleted from agent_document_contents:`, {
         rowsDeleted: deletedContent?.length || 0,

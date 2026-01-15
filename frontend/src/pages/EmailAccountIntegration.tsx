@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
+import { AppLayout } from "@/components/layout/AppLayout";
 import {
   Mail,
   CheckCircle2,
@@ -12,8 +13,17 @@ import {
   ArrowRight,
   Settings,
   Plus,
-  LayoutDashboard,
+  Sparkles,
+  Zap,
+  Clock,
+  Info,
+  Shield,
+  Check,
+  AlertCircle,
 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   getImapSmtpAccounts,
   disconnectImapSmtpAccount,
@@ -60,20 +70,6 @@ const EmailAccountIntegration = () => {
 
   // Gmail OAuth removed - using IMAP/SMTP only
 
-  const handleImapSmtpClick = () => {
-    if (imapAccounts.length > 0) {
-      // If multiple accounts, show selection
-      if (imapAccounts.length > 1) {
-        navigate("/email-integration/select");
-      } else {
-        // Single IMAP account, go directly
-        navigate(`/emails/${imapAccounts[0].id}`);
-      }
-    } else {
-      navigate("/email-integration/imap-smtp/connect");
-    }
-  };
-
   const handleDisconnectClick = (e: React.MouseEvent, account: { id: string; email: string; type: 'imap' }) => {
     e.stopPropagation();
     setAccountToDisconnect(account);
@@ -107,207 +103,287 @@ const EmailAccountIntegration = () => {
     }
   };
 
-  if (loading) {
-    return (
-      <div className="container mx-auto p-6 max-w-4xl">
-        <div className="flex items-center justify-center py-12">
-          <Loader2 className="h-8 w-8 animate-spin" />
-        </div>
-      </div>
-    );
-  }
-
   const hasAnyConnection = imapAccounts.length > 0;
+  const activeCount = imapAccounts.filter(acc => acc.is_active && !acc.needs_reconnection).length;
+
+  // Format time helper
+  const formatTime = (dateString?: string) => {
+    if (!dateString) return 'Never';
+    const date = new Date(dateString);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMins / 60);
+    const diffDays = Math.floor(diffHours / 24);
+    
+    if (diffMins < 1) return 'Just now';
+    if (diffMins < 60) return `${diffMins}m ago`;
+    if (diffHours < 24) return `${diffHours}h ago`;
+    if (diffDays < 7) return `${diffDays}d ago`;
+    return date.toLocaleDateString();
+  };
 
   return (
-    <div className="container mx-auto p-6 max-w-4xl">
-      <div className="mb-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-3xl font-bold">Email Account Integration</h1>
-            <p className="text-muted-foreground mt-2">
-              Connect and manage your email accounts
+    <AppLayout>
+      <div className="w-full">
+        {/* Background Pattern */}
+        <div className="fixed inset-0 opacity-5 dark:opacity-10 pointer-events-none z-0">
+          <div className="absolute inset-0" style={{
+            backgroundImage: `radial-gradient(circle at 2px 2px, currentColor 1px, transparent 0)`,
+            backgroundSize: '40px 40px'
+          }}></div>
+        </div>
+
+        <div className="container mx-auto px-6 py-12 max-w-6xl relative z-10">
+          {/* Header Section */}
+          <div className="mb-8">
+            <div className="flex items-center justify-between flex-wrap gap-4 mb-2">
+              <h1 className="text-4xl font-bold bg-gradient-to-r from-purple-600 to-blue-600 bg-clip-text text-transparent">
+                Email Accounts
+              </h1>
+            </div>
+            <p className="text-gray-700 dark:text-gray-300 text-lg font-medium">
+              Manage your connected email accounts in one place
             </p>
           </div>
-          <Button
-            variant="outline"
-            onClick={() => navigate("/dashboard")}
-            className="flex items-center gap-2"
-          >
-            <LayoutDashboard className="h-4 w-4" />
-            Dashboard
-          </Button>
-        </div>
-      </div>
 
-      {!hasAnyConnection && (
-        <Card className="mb-6 border-dashed">
-          <CardContent className="flex flex-col items-center justify-center py-12">
-            <Mail className="h-12 w-12 text-muted-foreground mb-4" />
-            <p className="text-lg font-semibold mb-2">No email accounts connected</p>
-            <p className="text-sm text-muted-foreground text-center">
-              Click on a connection option below to get started
-            </p>
-          </CardContent>
-        </Card>
-      )}
-
-      <div className="grid gap-6 md:grid-cols-1">
-        {/* IMAP/SMTP Card */}
-        <Card 
-          className={`cursor-pointer transition-all hover:shadow-lg hover:scale-[1.02] h-full flex flex-col ${
-            imapAccounts.length > 0 ? 'border-green-500 bg-green-500/5' : 'hover:border-primary'
-          }`}
-          onClick={handleImapSmtpClick}
-        >
-          <CardHeader className="flex-shrink-0">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className={`p-2 rounded-lg ${
-                  imapAccounts.length > 0 ? 'bg-green-500/10' : 'bg-muted'
-                }`}>
-                  <Key className={`h-5 w-5 ${
-                    imapAccounts.length > 0 ? 'text-green-500' : 'text-muted-foreground'
-                  }`} />
-                </div>
-                <div>
-                  <CardTitle>IMAP/SMTP</CardTitle>
-                  <CardDescription>
-                    Connect any email provider via IMAP/SMTP
-                  </CardDescription>
-                </div>
-              </div>
-              {imapAccounts.length > 0 ? (
-                <CheckCircle2 className="h-6 w-6 text-green-500 flex-shrink-0" />
-              ) : (
-                <XCircle className="h-6 w-6 text-muted-foreground flex-shrink-0" />
-              )}
+        {/* Loading State with Skeleton */}
+        {loading ? (
+          <div className="space-y-6">
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-2">
+              {[1, 2].map((n) => (
+                <Card key={n} className="animate-pulse">
+                  <CardContent className="p-6">
+                    <div className="flex items-center gap-3 mb-4">
+                      <Skeleton className="h-12 w-12 rounded-full" />
+                      <div className="flex-1 space-y-2">
+                        <Skeleton className="h-4 w-3/4" />
+                        <Skeleton className="h-3 w-1/2" />
+                      </div>
+                    </div>
+                    <div className="space-y-2 mb-4">
+                      <Skeleton className="h-3 w-full" />
+                      <Skeleton className="h-3 w-2/3" />
+                    </div>
+                    <Skeleton className="h-10 w-full rounded-lg" />
+                  </CardContent>
+                </Card>
+              ))}
             </div>
-          </CardHeader>
-          <CardContent className="flex-1 flex flex-col justify-between">
-            <div className="space-y-3">
-              <div className="flex items-center justify-between text-sm">
-                <span className="text-muted-foreground">Status:</span>
-                <span className={imapAccounts.length > 0 ? "text-green-500 font-medium" : "text-muted-foreground"}>
-                  {imapAccounts.length > 0 ? `Connected (${imapAccounts.length})` : "Not Connected"}
-                </span>
+          </div>
+        ) : hasAnyConnection ? (
+          <div className="space-y-6">
+            {/* Quick Stats Bar */}
+            <div className="bg-gradient-to-r from-purple-50 to-blue-50 dark:from-purple-950/50 dark:to-blue-950/50 rounded-xl p-6 border border-purple-200 dark:border-purple-800">
+              <div className="flex items-center justify-between flex-wrap gap-4">
+                <div className="flex items-center gap-8">
+                  <div>
+                    <p className="text-sm font-semibold text-gray-600 dark:text-gray-300 mb-1">Total Accounts</p>
+                    <p className="text-3xl font-bold text-gray-900 dark:text-white">{imapAccounts.length}</p>
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold text-gray-600 dark:text-gray-300 mb-1">Active</p>
+                    <p className="text-3xl font-bold text-green-600 dark:text-green-400">{activeCount}</p>
+                  </div>
+                  {imapAccounts.filter(acc => acc.needs_reconnection).length > 0 && (
+                    <div>
+                      <p className="text-sm font-semibold text-gray-600 dark:text-gray-300 mb-1">Needs Attention</p>
+                      <p className="text-3xl font-bold text-orange-600 dark:text-orange-400">
+                        {imapAccounts.filter(acc => acc.needs_reconnection).length}
+                      </p>
+                    </div>
+                  )}
+                </div>
               </div>
-              {imapAccounts.length > 0 && (
-                <div className="text-xs text-muted-foreground space-y-1 min-h-[20px]">
-                  {imapAccounts.map(acc => (
-                    <div key={acc.id} className="flex items-center justify-between group">
-                      <span className="truncate flex-1">{acc.email}</span>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity"
-                        onClick={(e) => handleDisconnectClick(e, { id: acc.id, email: acc.email, type: 'imap' })}
-                        disabled={disconnectingAccount === acc.id}
+            </div>
+
+            {/* Account Cards Grid */}
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-2">
+              {imapAccounts.map((account, index) => (
+                <Card 
+                  key={account.id} 
+                  className="group hover:shadow-lg transition-all duration-200 border-2 border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 hover:border-blue-400 dark:hover:border-blue-500"
+                  style={{ animationDelay: `${index * 50}ms` }}
+                >
+                  <CardContent className="p-6">
+                    {/* Account Header */}
+                    <div className="flex items-start justify-between mb-4">
+                      <div className="flex items-center gap-3 flex-1 min-w-0">
+                        {/* Avatar with status indicator */}
+                        <div className="relative">
+                          <div className="h-12 w-12 rounded-full bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center text-white font-semibold text-lg shadow-lg">
+                            {account.email.charAt(0).toUpperCase()}
+                          </div>
+                          {/* Active status dot */}
+                          {account.is_active && !account.needs_reconnection && (
+                            <div className="absolute -bottom-1 -right-1 h-4 w-4 bg-green-500 rounded-full border-2 border-white dark:border-gray-900 shadow-sm" />
+                          )}
+                          {account.needs_reconnection && (
+                            <div className="absolute -bottom-1 -right-1 h-4 w-4 bg-orange-500 rounded-full border-2 border-white dark:border-gray-900 shadow-sm" />
+                          )}
+                        </div>
+                        
+                        <div className="flex-1 min-w-0">
+                          {/* EMAIL ADDRESS - HIGH CONTRAST - WHITE IN DARK MODE */}
+                          <p className="font-semibold text-lg text-gray-900 dark:text-white truncate">
+                            {account.email}
+                          </p>
+                          <div className="flex items-center gap-2 mt-2">
+                            {/* BADGE - HIGH CONTRAST WITH VISIBLE TEXT */}
+                            <Badge className="bg-purple-100 dark:bg-purple-500/30 text-purple-700 dark:text-purple-200 border border-purple-300 dark:border-purple-400/50 text-xs font-semibold px-2.5 py-1">
+                              {account.provider || 'IMAP/SMTP'}
+                            </Badge>
+                            {account.needs_reconnection && (
+                              <Badge variant="destructive" className="text-xs font-semibold px-2.5 py-1">
+                                Reconnect
+                              </Badge>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Account Info - HIGH CONTRAST - VISIBLE TEXT */}
+                    <div className="mb-4 space-y-2">
+                      {account.imap_host && (
+                        <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                          <Key className="h-4 w-4 text-gray-600 dark:text-gray-400" />
+                          <span className="truncate font-semibold">{account.imap_host}</span>
+                        </div>
+                      )}
+                      {account.last_connection_attempt && (
+                        <div className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
+                          <Clock className="h-4 w-4 text-gray-600 dark:text-gray-400" />
+                          <span className="font-semibold">Last attempt: {formatTime(account.last_connection_attempt)}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Error Message */}
+                    {account.last_error && (
+                      <Alert variant="destructive" className="mb-4 py-3">
+                        <AlertCircle className="h-4 w-4" />
+                        <AlertDescription className="text-sm font-medium text-red-900 dark:text-red-100">
+                          {account.last_error}
+                        </AlertDescription>
+                      </Alert>
+                    )}
+
+                    {/* Quick Actions */}
+                    <div className="flex items-center gap-2">
+                      <Button 
+                        className="flex-1 bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 text-white font-semibold text-base h-11 shadow-lg" 
+                        onClick={() => navigate(`/emails/${account.id}`)}
                       >
-                        {disconnectingAccount === acc.id ? (
-                          <Loader2 className="h-3 w-3 animate-spin" />
+                        <Mail className="h-4 w-4 mr-2" />
+                        Open Inbox
+                      </Button>
+                      <Button 
+                        variant="outline" 
+                        size="icon"
+                        className="border-2 border-gray-300 dark:border-gray-600 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 text-gray-700 dark:text-gray-200 hover:text-blue-600 dark:hover:text-blue-400"
+                        onClick={() => navigate(`/emails/${account.id}`)}
+                        title="View Settings"
+                      >
+                        <Settings className="h-4 w-4" />
+                      </Button>
+                      <Button 
+                        variant="outline" 
+                        size="icon"
+                        className="border-2 border-gray-300 dark:border-gray-600 hover:border-red-500 dark:hover:border-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 text-gray-700 dark:text-gray-200 hover:text-red-600 dark:hover:text-red-400"
+                        onClick={(e) => handleDisconnectClick(e, { id: account.id, email: account.email, type: 'imap' })}
+                        disabled={disconnectingAccount === account.id}
+                        title="Disconnect"
+                      >
+                        {disconnectingAccount === account.id ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
                         ) : (
-                          <Trash2 className="h-3 w-3 text-destructive" />
+                          <Trash2 className="h-4 w-4" />
                         )}
                       </Button>
                     </div>
-                  ))}
-                </div>
-              )}
-            </div>
-            <div className="w-full mt-4 space-y-2">
-              <Button 
-                className="w-full" 
-                variant={imapAccounts.length > 0 ? "outline" : "default"}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleImapSmtpClick();
-                }}
-              >
-                {imapAccounts.length > 0 ? (
-                  <>
-                    <Settings className="mr-2 h-4 w-4" />
-                    Open Inbox
-                  </>
-                ) : (
-                  <>
-                    <Key className="mr-2 h-4 w-4" />
-                    Connect IMAP/SMTP
-                  </>
-                )}
-                <ArrowRight className="ml-2 h-4 w-4" />
-              </Button>
-              {hasAnyConnection && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="w-full text-xs"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    navigate("/email-integration/imap-smtp/connect");
-                  }}
-                >
-                  <Plus className="mr-2 h-3 w-3" />
-                  Add Another IMAP/SMTP Account
-                </Button>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Connected Accounts Management Section */}
-      {hasAnyConnection && (
-        <Card className="mt-6">
-          <CardHeader>
-            <CardTitle>Connected Accounts</CardTitle>
-            <CardDescription>
-              Manage your connected email accounts
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-3">
-              {/* Gmail OAuth removed - using IMAP/SMTP only */}
-
-              {/* IMAP/SMTP Accounts */}
-              {imapAccounts.map((account) => (
-                <div key={account.id} className="flex items-center justify-between p-3 border rounded-lg">
-                  <div className="flex items-center gap-3">
-                    <Key className="h-5 w-5 text-green-500" />
-                    <div>
-                      <p className="font-medium">{account.email}</p>
-                      <p className="text-sm text-muted-foreground">
-                        {account.provider || 'IMAP/SMTP'} • {account.imap_host || 'Not configured'}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => navigate(`/emails/${account.id}`)}
-                    >
-                      Open
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={(e) => handleDisconnectClick(e, { id: account.id, email: account.email, type: 'imap' })}
-                      disabled={disconnectingAccount === account.id}
-                    >
-                      {disconnectingAccount === account.id ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Trash2 className="h-4 w-4" />
-                      )}
-                    </Button>
-                  </div>
-                </div>
+                  </CardContent>
+                </Card>
               ))}
             </div>
-          </CardContent>
-        </Card>
-      )}
+
+            {/* Add Account Button */}
+            <Button 
+              variant="outline" 
+              className="w-full h-20 border-dashed border-2 border-gray-300 dark:border-gray-600 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30 transition-all duration-200 rounded-xl text-base font-semibold text-gray-700 dark:text-gray-200 hover:text-blue-700 dark:hover:text-blue-200"
+              onClick={() => navigate("/email-integration/imap-smtp/connect")}
+            >
+              <Plus className="h-5 w-5 mr-2" />
+              Add Another Email Account
+            </Button>
+
+            {/* Contextual Help */}
+            <Alert className="bg-blue-50 dark:bg-blue-950/50 border-blue-200 dark:border-blue-800">
+              <Info className="h-5 w-5 text-blue-600 dark:text-blue-400 flex-shrink-0" />
+              <AlertTitle className="text-base font-semibold text-blue-900 dark:text-blue-50">
+                Need help connecting your email?
+              </AlertTitle>
+              <AlertDescription className="text-sm font-medium text-blue-800 dark:text-blue-200 mt-1">
+                Check our setup guide for step-by-step instructions on connecting Gmail, Outlook, and other providers.
+              </AlertDescription>
+            </Alert>
+          </div>
+        ) : (
+          /* Empty State */
+          <div className="flex flex-col items-center justify-center py-20 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            {/* Illustration/Icon */}
+            <div className="relative mb-8">
+              <div className="h-32 w-32 rounded-full bg-gradient-to-br from-purple-100 to-blue-100 dark:from-purple-900 dark:to-blue-900 flex items-center justify-center shadow-xl">
+                <Mail className="h-16 w-16 text-purple-600 dark:text-purple-400" />
+              </div>
+              <div className="absolute -bottom-2 -right-2 h-12 w-12 rounded-full bg-white dark:bg-gray-800 shadow-lg flex items-center justify-center border-2 border-purple-200 dark:border-purple-800">
+                <Plus className="h-6 w-6 text-purple-600 dark:text-purple-400" />
+              </div>
+            </div>
+
+            {/* Text Content */}
+            <h2 className="text-2xl font-bold mb-3 text-gray-900 dark:text-gray-50">No Email Accounts Connected</h2>
+            <p className="text-gray-700 dark:text-gray-300 text-center max-w-md mb-8 text-base font-medium">
+              Connect your email accounts to manage all your emails in one place. 
+              We support Gmail, Outlook, and any provider via IMAP/SMTP.
+            </p>
+
+            {/* Primary CTA */}
+            <Button 
+              size="lg" 
+              className="bg-gradient-to-r from-purple-600 to-blue-600 hover:from-purple-700 hover:to-blue-700 text-white shadow-lg hover:shadow-xl h-12 px-8 text-base font-semibold transition-all duration-200 hover:scale-105"
+              onClick={() => navigate("/email-integration/imap-smtp/connect")}
+            >
+              <Plus className="h-5 w-5 mr-2" />
+              Connect Your First Email Account
+            </Button>
+
+            {/* Secondary Info */}
+            <div className="mt-12 grid grid-cols-3 gap-8 text-center max-w-2xl">
+              <div>
+                <div className="h-12 w-12 rounded-full bg-purple-100 dark:bg-purple-900 flex items-center justify-center mx-auto mb-2">
+                  <Shield className="h-6 w-6 text-purple-600 dark:text-purple-400" />
+                </div>
+                <p className="text-sm font-semibold text-gray-900 dark:text-gray-50 mb-1">Secure</p>
+                <p className="text-xs text-gray-700 dark:text-gray-300 font-medium">End-to-end encrypted</p>
+              </div>
+              <div>
+                <div className="h-12 w-12 rounded-full bg-blue-100 dark:bg-blue-900 flex items-center justify-center mx-auto mb-2">
+                  <Zap className="h-6 w-6 text-blue-600 dark:text-blue-400" />
+                </div>
+                <p className="text-sm font-semibold text-gray-900 dark:text-gray-50 mb-1">Fast</p>
+                <p className="text-xs text-gray-700 dark:text-gray-300 font-medium">Real-time sync</p>
+              </div>
+              <div>
+                <div className="h-12 w-12 rounded-full bg-purple-100 dark:bg-purple-900 flex items-center justify-center mx-auto mb-2">
+                  <Check className="h-6 w-6 text-purple-600 dark:text-purple-400" />
+                </div>
+                <p className="text-sm font-semibold text-gray-900 dark:text-gray-50 mb-1">Easy</p>
+                <p className="text-xs text-gray-700 dark:text-gray-300 font-medium">Setup in minutes</p>
+              </div>
+            </div>
+          </div>
+        )}
 
       {/* Disconnect Confirmation Dialog */}
       <AlertDialog open={disconnectDialogOpen} onOpenChange={setDisconnectDialogOpen}>
@@ -330,7 +406,9 @@ const EmailAccountIntegration = () => {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-    </div>
+        </div>
+      </div>
+    </AppLayout>
   );
 };
 

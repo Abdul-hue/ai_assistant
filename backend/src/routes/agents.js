@@ -1008,6 +1008,102 @@ router.get('/:agentId/whatsapp-status', authMiddleware, validateUUID('agentId'),
   }
 });
 
+// POST /api/agents/:agentId/process-files
+// Process multiple files for an agent
+router.post('/:agentId/process-files', authMiddleware, validateUUID('agentId'), async (req, res) => {
+  const { agentId } = req.params;
+  const userId = req.user.id;
+  const { fileIds } = req.body || {};
+
+  console.log(`[PROCESS-FILES] Processing files for agent ${agentId.substring(0, 8)}...`);
+
+  try {
+    // Verify agent ownership
+    const agentResult = await pool.query(
+      'SELECT id, user_id, uploaded_files FROM agents WHERE id = $1 AND user_id = $2',
+      [agentId, userId]
+    );
+
+    if (!agentResult || agentResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'Agent not found',
+      });
+    }
+
+    const agentRecord = agentResult.rows[0];
+    const { processAgentFile, normalizeUploadedFiles } = require('../services/agentFileProcessingService');
+
+    // If fileIds provided, process each file; otherwise process all files
+    // Use normalizeUploadedFiles to handle both JSON string and object formats
+    const uploadedFiles = normalizeUploadedFiles(agentRecord.uploaded_files);
+    const filesToProcess = fileIds && Array.isArray(fileIds) && fileIds.length > 0
+      ? uploadedFiles.filter(f => fileIds.includes(f.id))
+      : uploadedFiles;
+
+    if (filesToProcess.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No files to process',
+      });
+    }
+
+    const results = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    // Process files sequentially to avoid overwhelming the system
+    for (const fileMetadata of filesToProcess) {
+      try {
+        console.log(`[PROCESS-FILES] Processing file: ${fileMetadata.name} (${fileMetadata.id})`);
+        const result = await processAgentFile({
+          agentId,
+          fileId: fileMetadata.id,
+          agentRecord,
+          skipAgentFetch: true,
+        });
+        console.log(`[PROCESS-FILES] ✅ Successfully processed file: ${fileMetadata.name}`, {
+          chunksStored: result.chunksStored,
+          contentLength: result.contentLength,
+        });
+        results.push({
+          fileId: fileMetadata.id,
+          fileName: fileMetadata.name,
+          success: true,
+          chunksStored: result.chunksStored || 0,
+          contentLength: result.contentLength,
+        });
+        successCount++;
+      } catch (error) {
+        console.error(`[PROCESS-FILES] ❌ Failed to process file ${fileMetadata.id} (${fileMetadata.name}):`, {
+          error: error.message,
+          stack: error.stack,
+        });
+        results.push({
+          fileId: fileMetadata.id,
+          fileName: fileMetadata.name,
+          success: false,
+          error: error.message,
+        });
+        failureCount++;
+      }
+    }
+
+    res.json({
+      success: true,
+      successCount,
+      failureCount,
+      results,
+    });
+  } catch (error) {
+    console.error(`[PROCESS-FILES] Error:`, error);
+    res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to process files',
+    });
+  }
+});
+
 // GET /api/agents/:agentId/whatsapp/stream - Server Sent Events for QR/status updates
 router.get('/:agentId/whatsapp/stream', authMiddleware, validateUUID('agentId'), async (req, res) => {
   const { agentId } = req.params;

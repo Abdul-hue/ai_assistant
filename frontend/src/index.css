@@ -2,6 +2,115 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Email Content Readability Styles */
+.email-content {
+  color: #e5e7eb !important;
+  font-size: 15px !important;
+  line-height: 1.6 !important;
+  background-color: transparent !important;
+}
+
+.email-content * {
+  color: #e5e7eb !important;
+}
+
+.email-content *[style*="color"] {
+  color: #e5e7eb !important;
+}
+
+.email-content p[style*="color"],
+.email-content div[style*="color"],
+.email-content span[style*="color"],
+.email-content td[style*="color"],
+.email-content th[style*="color"] {
+  color: #e5e7eb !important;
+}
+
+.email-content p {
+  color: #e5e7eb !important;
+  margin-bottom: 1em !important;
+}
+
+.email-content a {
+  color: #60a5fa !important;
+  text-decoration: underline !important;
+}
+
+.email-content a:hover {
+  color: #93c5fd !important;
+}
+
+.email-content strong,
+.email-content b {
+  color: #f3f4f6 !important;
+  font-weight: 600 !important;
+}
+
+.email-content h1,
+.email-content h2,
+.email-content h3,
+.email-content h4,
+.email-content h5,
+.email-content h6 {
+  color: #f9fafb !important;
+  font-weight: 700 !important;
+  margin-top: 1.5em !important;
+  margin-bottom: 0.5em !important;
+}
+
+.email-content code {
+  color: #f3f4f6 !important;
+  background-color: rgba(255, 255, 255, 0.1) !important;
+  padding: 0.2em 0.4em !important;
+  border-radius: 0.25rem !important;
+}
+
+.email-content pre {
+  color: #f3f4f6 !important;
+  background-color: rgba(255, 255, 255, 0.05) !important;
+  padding: 1em !important;
+  border-radius: 0.5rem !important;
+  overflow-x: auto !important;
+}
+
+.email-content blockquote {
+  color: #d1d5db !important;
+  border-left: 4px solid #60a5fa !important;
+  padding-left: 1em !important;
+  margin: 1em 0 !important;
+}
+
+.email-content ul,
+.email-content ol {
+  color: #e5e7eb !important;
+  margin: 1em 0 !important;
+  padding-left: 2em !important;
+}
+
+.email-content li {
+  color: #e5e7eb !important;
+  margin: 0.5em 0 !important;
+}
+
+.email-content table {
+  color: #e5e7eb !important;
+  border-collapse: collapse !important;
+  width: 100% !important;
+  margin: 1em 0 !important;
+}
+
+.email-content th,
+.email-content td {
+  color: #e5e7eb !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  padding: 0.5em !important;
+}
+
+.email-content th {
+  background-color: rgba(255, 255, 255, 0.05) !important;
+  font-weight: 600 !important;
+}
+
 /* Definition of the design system. All colors, gradients, fonts, etc should be defined here. 
 All colors MUST be HSL.
 */
@@ -153,7 +262,78 @@ All colors MUST be HSL.
   }
 }
 
+@layer base {
+  /* Remove default outline */
+  *:focus {
+    outline: none;
+  }
+
+  /* Add custom focus ring for keyboard navigation */
+  *:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+    border-radius: 0.25rem;
+  }
+
+  /* Button focus */
+  button:focus-visible,
+  a:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+
+  /* Input focus */
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 0;
+    box-shadow: 0 0 0 3px hsl(var(--ring) / 0.1);
+  }
+}
+
 @layer utilities {
+  /* Screen reader only utility */
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border-width: 0;
+  }
+
+  .sr-only-focusable:focus {
+    position: static;
+    width: auto;
+    height: auto;
+    padding: 1rem;
+    margin: 0;
+    overflow: visible;
+    clip: auto;
+    white-space: normal;
+  }
+
+  /* Skip link */
+  .skip-link {
+    @apply sr-only sr-only-focusable;
+    top: 0;
+    left: 0;
+    z-index: 9999;
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+    padding: 1rem;
+    text-decoration: none;
+    border-radius: 0 0 0.25rem 0;
+  }
+
+  .skip-link:focus {
+    position: absolute;
+  }
+
   /* Glassmorphism utility */
   .glass {
     @apply bg-white/5 backdrop-blur-md border border-white/10;
@@ -170,6 +350,27 @@ All colors MUST be HSL.
     animation: shimmer 3s linear infinite;
   }
 
+  @keyframes shimmer {
+    to {
+      background-position: 200% center;
+    }
+  }
+
+  /* Animate gradient utility */
+  .animate-gradient {
+    background-size: 200% auto;
+    animation: gradient 3s linear infinite;
+  }
+
+  @keyframes gradient {
+    0%, 100% {
+      background-position: 0% center;
+    }
+    50% {
+      background-position: 100% center;
+    }
+  }
+
   /* Glow effect utility */
   .glow-effect {
     @apply shadow-[0_0_20px_hsl(var(--primary)/0.3)];
@@ -178,5 +379,53 @@ All colors MUST be HSL.
 
   .glow-effect:hover {
     @apply shadow-[0_0_30px_hsl(var(--primary)/0.5)];
+  }
+
+  /* Chat Interface Improvements */
+  .message-bubble-enter {
+    animation: messageSlideIn 0.3s ease-out;
+  }
+
+  @keyframes messageSlideIn {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  /* Custom scrollbar for chat */
+  .chat-messages::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .chat-messages::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .chat-messages::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.3);
+    border-radius: 3px;
+  }
+
+  .chat-messages::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.5);
+  }
+
+  /* Message bubble hover effect */
+  .message-bubble {
+    transition: transform 0.2s ease;
+  }
+
+  .message-bubble:hover {
+    transform: translateY(-1px);
+  }
+
+  /* Smooth scroll behavior */
+  .chat-messages {
+    scroll-behavior: smooth;
   }
 }

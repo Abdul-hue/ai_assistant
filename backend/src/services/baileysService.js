@@ -16,6 +16,10 @@ const { supabaseAdmin } = require('../config/supabase');
 const axios = require('axios');
 const lockfile = require('proper-lockfile');
 const https = require('https');
+const {
+  syncContactsForAgent,
+  setupContactUpdateListeners,
+} = require('./contactSyncService');
 
 const STORAGE_BUCKET = 'agent-files';
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
@@ -57,6 +61,13 @@ const last401Failure = new Map(); // agentId -> timestamp ms (prevents auto-retr
 // Cache for @lid JID to actual phone number mapping (for linked device messages)
 // Format: "@lid JID" -> "phone@s.whatsapp.net"
 const lidToPhoneCache = new Map();
+// In-memory cache for validation results
+const validationCache = new Map(); // phoneNumber -> {isOnWhatsApp, timestamp, expiresAt}
+const VALIDATION_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+// Rate limiter per agent
+const validationRateLimiters = new Map(); // agentId -> {count, resetAt}
+const VALIDATION_RATE_LIMIT = 15; // Max 15 validations per minute per agent
+const VALIDATION_RATE_WINDOW = 60 * 1000; // 1 minute
 const COOLDOWN_MS = 5000; // 5 seconds between connection attempts
 const FAILURE_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes after 401 errors before allowing retry
 const MESSAGE_FORWARD_TIMEOUT_MS = 10000;
@@ -2380,6 +2391,34 @@ async function initializeWhatsApp(agentId, userId = null) {
           connectionLocks.delete(agentId);
           console.log(`[BAILEYS] 🔓 Initialization lock released (connected)`);
           
+          // ━━━ CONTACT SYNCHRONIZATION ━━━
+          // Sync WhatsApp contacts when connection is established
+          try {
+            console.log(`[BAILEYS] 📇 Starting contact synchronization...`);
+            
+            // Setup real-time contact update listeners
+            setupContactUpdateListeners(agentId, sock);
+            
+            // Trigger initial contact sync (non-blocking)
+            // Note: Baileys loads contacts incrementally, so initial sync may be limited
+            // Real-time listeners will handle most contacts as they're loaded
+            syncContactsForAgent(agentId, sock)
+              .then((result) => {
+                if (result.total > 0) {
+                  console.log(`[BAILEYS] ✅ Initial contact sync: ${result.success}/${result.total} contacts synced`);
+                } else {
+                  console.log(`[BAILEYS] ℹ️ Contacts will be synced via real-time events as they load`);
+                }
+              })
+              .catch((syncError) => {
+                console.error(`[BAILEYS] ⚠️ Contact sync error (non-critical):`, syncError.message);
+                // Don't fail connection if sync fails
+              });
+          } catch (syncError) {
+            console.error(`[BAILEYS] ⚠️ Contact sync setup error (non-critical):`, syncError.message);
+            // Don't fail connection if sync setup fails
+          }
+          
           // ━━━ START MONITORING ━━━
           // Disconnection detection via:
           // 1. Connection events (immediate) - Baileys fires 'close' on disconnect
@@ -4596,6 +4635,107 @@ async function sendMessage(agentId, to, message) {
   console.log(`[BAILEYS] ✅ Text message sent to ${to}`);
 }
 
+/**
+ * Check rate limit for WhatsApp number validation
+ * @param {string} agentId - Agent UUID
+ * @throws {Error} If rate limit exceeded
+ */
+function checkValidationRateLimit(agentId) {
+  const limiter = validationRateLimiters.get(agentId) || { count: 0, resetAt: Date.now() + VALIDATION_RATE_WINDOW };
+  
+  if (Date.now() > limiter.resetAt) {
+    limiter.count = 0;
+    limiter.resetAt = Date.now() + VALIDATION_RATE_WINDOW;
+  }
+  
+  if (limiter.count >= VALIDATION_RATE_LIMIT) {
+    throw new Error('Rate limit exceeded. Please try again in a moment.');
+  }
+  
+  limiter.count++;
+  validationRateLimiters.set(agentId, limiter);
+}
+
+/**
+ * Check if a phone number is registered on WhatsApp
+ * @param {string} agentId - Agent UUID
+ * @param {string} phoneNumber - Phone number to check (sanitized, digits only)
+ * @param {boolean} useCache - Whether to use cache (default: true)
+ * @returns {Promise<{isOnWhatsApp: boolean, jid?: string, error?: string}>}
+ */
+async function isNumberOnWhatsApp(agentId, phoneNumber, useCache = true) {
+  const logPrefix = `[BAILEYS][VALIDATION][${agentId.substring(0, 8)}]`;
+  
+  // Get session
+  const session = activeSessions.get(agentId);
+  
+  if (!session || !session.isConnected || !session.socket) {
+    throw new Error('WhatsApp not connected');
+  }
+  
+  // Check cache first
+  const cacheKey = `${agentId}:${phoneNumber}`;
+  if (useCache && validationCache.has(cacheKey)) {
+    const cached = validationCache.get(cacheKey);
+    if (Date.now() < cached.expiresAt) {
+      console.log(`${logPrefix} Using cached result for ${phoneNumber.substring(0, 8)}...`);
+      return cached.result;
+    }
+    // Cache expired, remove it
+    validationCache.delete(cacheKey);
+  }
+  
+  // Format phone number as JID
+  const jid = phoneNumber.includes('@') 
+    ? phoneNumber 
+    : `${phoneNumber}@s.whatsapp.net`;
+  
+  try {
+    // Check rate limit
+    checkValidationRateLimit(agentId);
+    
+    console.log(`${logPrefix} Checking if ${phoneNumber.substring(0, 8)}... is on WhatsApp`);
+    
+    // Use Baileys onWhatsApp method
+    const result = await session.socket.onWhatsApp(jid);
+    
+    console.log(`${logPrefix} Validation result:`, {
+      phone: phoneNumber.substring(0, 8) + '...',
+      exists: result && result.length > 0 && result[0].exists !== false
+    });
+    
+    const validationResult = {
+      isOnWhatsApp: result && result.length > 0 && result[0].exists !== false,
+      jid: result && result.length > 0 ? result[0].jid : jid
+    };
+    
+    // Cache result (24 hours)
+    if (useCache) {
+      validationCache.set(cacheKey, {
+        result: validationResult,
+        expiresAt: Date.now() + VALIDATION_CACHE_TTL
+      });
+      console.log(`${logPrefix} Cached validation result for ${phoneNumber.substring(0, 8)}...`);
+    }
+    
+    return validationResult;
+  } catch (error) {
+    console.error(`${logPrefix} Error checking WhatsApp status for ${phoneNumber.substring(0, 8)}...:`, error.message);
+    
+    // If it's a rate limit error, throw it
+    if (error.message.includes('Rate limit')) {
+      throw error;
+    }
+    
+    // For other errors, return false but don't block the message
+    return {
+      isOnWhatsApp: false,
+      jid: jid,
+      error: error.message
+    };
+  }
+}
+
 // Cleanup expired QR codes
 setInterval(async () => {
   try {
@@ -5000,6 +5140,7 @@ module.exports = {
   getSessionStatus,
   getWhatsAppStatus,
   sendMessage,
+  isNumberOnWhatsApp,
   uploadAgentFile,
   updateAgentFiles,
   deleteAgentFile,

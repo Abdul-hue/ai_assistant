@@ -1,7 +1,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const { supabaseAdmin } = require('../config/supabase');
-const { sendMessage, getWhatsAppStatus, safeInitializeWhatsApp, activeSessions } = require('../services/baileysService');
+const { sendMessage, getWhatsAppStatus, safeInitializeWhatsApp, activeSessions, isNumberOnWhatsApp } = require('../services/baileysService');
 
 const router = express.Router();
 
@@ -86,6 +86,48 @@ router.post('/', async (req, res) => {
         error: 'Invalid or missing phone number',
         details: 'Phone number must contain at least 10 digits'
       });
+    }
+
+    // ✅ NEW: Check if number is on WhatsApp BEFORE attempting to send
+    try {
+      console.log(`${logPrefix} 🔍 Validating if number is on WhatsApp...`);
+      const whatsappCheck = await isNumberOnWhatsApp(agentId, sanitizedTo);
+      
+      if (!whatsappCheck.isOnWhatsApp) {
+        console.warn(`${logPrefix} ⚠️ Number not on WhatsApp: ${sanitizedTo.substring(0, 8)}...`);
+        
+        // Return 200 status with success: false
+        return res.status(200).json({
+          success: false,
+          error: 'NUMBER_NOT_ON_WHATSAPP',
+          errorType: 'NUMBER_NOT_ON_WHATSAPP',
+          details: `The number ${sanitizedTo} is not registered on WhatsApp`,
+          message: `I couldn't send your message because ${sanitizedTo} is not registered on WhatsApp. Ask them to register on WhatsApp first`,
+          phoneNumber: sanitizedTo,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+      console.log(`${logPrefix} ✅ Number verified on WhatsApp: ${sanitizedTo.substring(0, 8)}...`);
+    } catch (validationError) {
+      // Handle rate limiting
+      if (validationError.message.includes('Rate limit')) {
+        console.warn(`${logPrefix} ⚠️ Validation rate limit exceeded`);
+        return res.status(200).json({
+          success: false,
+          error: 'RATE_LIMIT_EXCEEDED',
+          errorType: 'RATE_LIMIT_EXCEEDED',
+          details: 'Too many validation requests. Please try again in a moment.',
+          message: 'I\'ve checked too many numbers recently. Please wait about a minute and try again.',
+          retryAfter: 60,
+          timestamp: new Date().toISOString()
+        });
+      }
+      
+      // For other validation errors, log but continue with sending
+      // This prevents false negatives from blocking legitimate messages
+      console.error(`${logPrefix} ⚠️ WhatsApp validation error (continuing anyway):`, validationError.message);
+      // Continue with sending - validation is a nice-to-have, not a blocker
     }
 
     // Validate message

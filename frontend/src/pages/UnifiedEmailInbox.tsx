@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { formatDistanceToNow } from "date-fns";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ import {
   Reply,
   Forward,
   ArrowLeft,
+  ArrowRight,
   AlertCircle,
   Key,
   Folder,
@@ -546,21 +547,85 @@ const UnifiedEmailInbox = () => {
   const handleDeleteEmail = async (email: ImapSmtpEmail) => {
     if (!accountId) return;
 
+    // Store original email for potential restoration
+    const emailToDelete = email;
+    const currentIndex = filteredEmails.findIndex(e => e.id === email.id || e.uid === email.uid);
+    const isSelectedEmail = selectedEmail && (selectedEmail.id === email.id || selectedEmail.uid === email.uid);
+
     try {
+      // Optimistic UI update - remove email from list immediately
+      setEmails(prev => prev.filter(e => e.id !== email.id && e.uid !== email.uid));
+      
+      // If this is the selected email, navigate to next/previous or close
+      if (isSelectedEmail) {
+        // Try to show next email
+        if (currentIndex < filteredEmails.length - 1 && filteredEmails[currentIndex + 1]) {
+          setSelectedEmail(filteredEmails[currentIndex + 1]);
+        } 
+        // Try to show previous email
+        else if (currentIndex > 0 && filteredEmails[currentIndex - 1]) {
+          setSelectedEmail(filteredEmails[currentIndex - 1]);
+        } 
+        // No more emails, close viewer
+        else {
+          setSelectedEmail(null);
+        }
+      }
+
+      // Call delete API
       const result = await deleteImapSmtpEmail(accountId, email.uid, currentFolder);
+      
       if (result.success) {
         toast({
           title: "Success",
           description: "Email deleted",
         });
-        loadImapEmails();
-        if (selectedEmail?.uid === email.uid) {
-          setSelectedEmail(null);
-        }
+        // Optionally reload emails to sync with backend (but UI is already updated)
+        // loadImapEmails();
       } else {
+        // If deletion failed, restore the email to the list
+        setEmails(prev => {
+          const exists = prev.some(e => e.id === email.id || e.uid === email.uid);
+          if (!exists) {
+            // Re-insert email, maintaining sort order (newest first)
+            const restored = [...prev, emailToDelete].sort((a, b) => {
+              const dateA = new Date(a.date || 0).getTime();
+              const dateB = new Date(b.date || 0).getTime();
+              return dateB - dateA;
+            });
+            return restored;
+          }
+          return prev;
+        });
+        
+        // Restore selected email if it was the deleted one
+        if (isSelectedEmail) {
+          setSelectedEmail(emailToDelete);
+        }
+        
         throw new Error(result.error || "Failed to delete email");
       }
     } catch (error: any) {
+      // Restore email on error
+      setEmails(prev => {
+        const exists = prev.some(e => e.id === email.id || e.uid === email.uid);
+        if (!exists) {
+          // Re-insert email, maintaining sort order
+          const restored = [...prev, emailToDelete].sort((a, b) => {
+            const dateA = new Date(a.date || 0).getTime();
+            const dateB = new Date(b.date || 0).getTime();
+            return dateB - dateA;
+          });
+          return restored;
+        }
+        return prev;
+      });
+      
+      // Restore selected email if it was the deleted one
+      if (isSelectedEmail) {
+        setSelectedEmail(emailToDelete);
+      }
+      
       toast({
         variant: "destructive",
         title: "Error",
@@ -632,6 +697,58 @@ const UnifiedEmailInbox = () => {
       email.body?.toLowerCase().includes(query)
     );
   });
+
+  // Get current email index for navigation
+  const getCurrentEmailIndex = useCallback(() => {
+    if (!selectedEmail || filteredEmails.length === 0) return -1;
+    return filteredEmails.findIndex(e => e.id === selectedEmail.id || e.uid === selectedEmail.uid);
+  }, [selectedEmail, filteredEmails]);
+
+  const currentEmailIndex = getCurrentEmailIndex();
+  const canNavigatePrevious = currentEmailIndex > 0;
+  const canNavigateNext = currentEmailIndex >= 0 && currentEmailIndex < filteredEmails.length - 1;
+
+  // Navigation functions for email viewer
+  const navigateToPreviousEmail = useCallback(() => {
+    if (!selectedEmail || filteredEmails.length === 0) return;
+    
+    const currentIndex = getCurrentEmailIndex();
+    if (currentIndex > 0) {
+      setSelectedEmail(filteredEmails[currentIndex - 1]);
+    }
+  }, [selectedEmail, filteredEmails, getCurrentEmailIndex]);
+
+  const navigateToNextEmail = useCallback(() => {
+    if (!selectedEmail || filteredEmails.length === 0) return;
+    
+    const currentIndex = getCurrentEmailIndex();
+    if (currentIndex < filteredEmails.length - 1) {
+      setSelectedEmail(filteredEmails[currentIndex + 1]);
+    }
+  }, [selectedEmail, filteredEmails, getCurrentEmailIndex]);
+
+  // Keyboard shortcuts for email navigation
+  useEffect(() => {
+    if (!selectedEmail) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Only handle if dialog is open and not typing in an input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      if (e.key === 'ArrowLeft' && canNavigatePrevious) {
+        e.preventDefault();
+        navigateToPreviousEmail();
+      } else if (e.key === 'ArrowRight' && canNavigateNext) {
+        e.preventDefault();
+        navigateToNextEmail();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedEmail, canNavigatePrevious, canNavigateNext, navigateToPreviousEmail, navigateToNextEmail]);
 
   // Clean folder name - remove [Gmail] prefix and other prefixes
   const cleanFolderName = (folderName: string) => {
@@ -721,20 +838,20 @@ const UnifiedEmailInbox = () => {
   };
 
   return (
-    <div className="flex h-screen bg-background">
+    <div className="flex h-screen bg-gradient-to-br from-gray-50 via-white to-gray-50 dark:from-gray-900 dark:via-gray-800 dark:to-gray-900 overflow-hidden">
       {/* Sidebar */}
-      <div className="w-64 border-r bg-gradient-to-b from-background to-muted/20 p-4 space-y-4">
-        <div className="space-y-2">
-          <div className="flex items-center justify-between mb-2">
-            <div className="flex items-center gap-2">
-              <div className="p-1.5 rounded-md bg-primary/10">
-                <Mail className="h-4 w-4 text-primary" />
+      <div className="hidden md:flex w-64 lg:w-72 border-r border-gray-200 dark:border-gray-700 bg-white/80 dark:bg-gray-800/80 backdrop-blur-xl p-4 lg:p-6 space-y-4 lg:space-y-6 flex flex-col">
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 shadow-lg">
+                <Mail className="h-5 w-5 text-white" />
               </div>
-              <div className="flex items-center gap-2">
-                <h2 className="font-semibold text-sm">Folders</h2>
+              <div>
+                <h2 className="font-bold text-base text-gray-900 dark:text-gray-100">Folders</h2>
                 {accountInfo && (
                   <span className="text-xs text-muted-foreground font-medium">
-                    • {getProviderDisplayName(accountInfo.provider)}
+                    {getProviderDisplayName(accountInfo.provider)}
                   </span>
                 )}
               </div>
@@ -742,23 +859,28 @@ const UnifiedEmailInbox = () => {
             <Button
               variant="ghost"
               size="icon"
-              className="h-7 w-7"
+              className="h-9 w-9 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-all duration-200 hover:scale-110"
               onClick={() => navigate("/email-integration")}
             >
-              <ArrowLeft className="h-3.5 w-3.5" />
+              <ArrowLeft className="h-4 w-4" />
             </Button>
           </div>
           
           {accountInfo && (
-            <div className="px-2 py-1.5 rounded-md bg-primary/5 border border-primary/10">
-              <p className="text-xs text-muted-foreground truncate">
-                {accountInfo.email}
-              </p>
+            <div className="px-4 py-3 rounded-xl bg-gradient-to-r from-blue-50 to-purple-50 dark:from-blue-950/30 dark:to-purple-950/30 border border-blue-200 dark:border-blue-800">
+              <div className="flex items-center gap-3">
+                <div className="h-10 w-10 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-bold text-sm shadow-lg">
+                  {accountInfo.email.charAt(0).toUpperCase()}
+                </div>
+                <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate flex-1">
+                  {accountInfo.email}
+                </p>
+              </div>
             </div>
           )}
         </div>
 
-        <div className="space-y-1 max-h-[calc(100vh-300px)] overflow-y-auto">
+        <div className="space-y-1 flex-1 overflow-y-auto pr-2 -mr-2">
           {folders.length > 0 ? (
             folders.map((folder) => {
               const cleanedName = cleanFolderName(folder.name);
@@ -770,11 +892,11 @@ const UnifiedEmailInbox = () => {
               return (
                 <Button
                   key={folder.name}
-                  variant={isActive ? "secondary" : "ghost"}
-                  className={`w-full justify-start h-9 ${
+                  variant="ghost"
+                  className={`w-full justify-start h-11 rounded-xl transition-all duration-200 ${
                     isActive 
-                      ? "bg-primary/10 text-primary font-medium border-l-2 border-primary" 
-                      : "hover:bg-muted/50"
+                      ? "bg-gradient-to-r from-blue-500 to-purple-600 text-white font-semibold shadow-lg hover:shadow-xl scale-105" 
+                      : "hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300 hover:scale-105"
                   }`}
                   onClick={() => {
                     // Store the actual IMAP folder name for fetching
@@ -782,31 +904,35 @@ const UnifiedEmailInbox = () => {
                     // Emails will be reloaded via useEffect when currentFolder changes
                   }}
                 >
-                  <FolderIcon className={`mr-2 h-4 w-4 ${
-                    isActive ? "text-primary" : "text-muted-foreground"
+                  <FolderIcon className={`mr-3 h-5 w-5 ${
+                    isActive ? "text-white" : "text-gray-500 dark:text-gray-400"
                   }`} />
-                  <span className="flex-1 text-left truncate">{cleanedName}</span>
+                  <span className="flex-1 text-left truncate font-medium">{cleanedName}</span>
                 </Button>
               );
             })
           ) : (
             <Button
-              variant={currentFolder === "INBOX" ? "secondary" : "ghost"}
-              className="w-full justify-start h-9"
+              variant={currentFolder === "INBOX" ? "default" : "ghost"}
+              className={`w-full justify-start h-11 rounded-xl transition-all duration-200 ${
+                currentFolder === "INBOX"
+                  ? "bg-gradient-to-r from-blue-500 to-purple-600 text-white font-semibold shadow-lg"
+                  : "hover:bg-gray-100 dark:hover:bg-gray-700"
+              }`}
               onClick={() => setCurrentFolder("INBOX")}
             >
-              <Inbox className="mr-2 h-4 w-4" />
+              <Inbox className="mr-3 h-5 w-5" />
               INBOX
             </Button>
           )}
         </div>
 
-        <div className="pt-4 border-t space-y-2">
+        <div className="pt-4 border-t border-gray-200 dark:border-gray-700 space-y-3">
           <Button
-            className="w-full bg-primary hover:bg-primary/90"
+            className="w-full h-12 bg-gradient-to-r from-blue-500 to-purple-600 hover:from-blue-600 hover:to-purple-700 text-white font-semibold shadow-lg hover:shadow-xl transition-all duration-200 hover:scale-105 rounded-xl"
             onClick={() => setComposeOpen(true)}
           >
-            <Plus className="mr-2 h-4 w-4" />
+            <Plus className="mr-2 h-5 w-5" />
             Compose
           </Button>
           {lastRefresh && (
@@ -818,15 +944,15 @@ const UnifiedEmailInbox = () => {
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 flex flex-col">
+      <div className="flex-1 flex flex-col bg-white dark:bg-gray-900 overflow-hidden">
         {/* Sync Status Banner */}
         {comprehensiveSyncStatus === 'in_progress' && (
-          <div className="bg-blue-50 border-b border-blue-200 p-4">
+          <div className="bg-gradient-to-r from-blue-500 to-purple-600 text-white p-4 shadow-lg">
             <div className="flex items-center gap-3">
-              <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-blue-600"></div>
+              <div className="animate-spin rounded-full h-5 w-5 border-2 border-white border-t-transparent"></div>
               <div className="flex-1">
-                <p className="font-medium text-blue-900">Initial Sync in Progress</p>
-                <p className="text-sm text-blue-700">
+                <p className="font-semibold">Initial Sync in Progress</p>
+                <p className="text-sm text-blue-100">
                   Syncing all folders for the first time...
                 </p>
               </div>
@@ -835,10 +961,10 @@ const UnifiedEmailInbox = () => {
         )}
         
         {/* Header */}
-        <div className="border-b p-4 space-y-4">
-          <div className="flex items-center justify-between">
+        <div className="border-b border-gray-200 dark:border-gray-700 bg-gradient-to-r from-white to-gray-50 dark:from-gray-900 dark:to-gray-800 p-6 space-y-4">
+          <div className="flex items-center justify-between flex-wrap gap-4">
             <div>
-              <h1 className="text-2xl font-bold">
+              <h1 className="text-3xl font-bold bg-gradient-to-r from-blue-600 to-purple-600 bg-clip-text text-transparent">
                 {accountInfo ? `${getProviderDisplayName(accountInfo.provider)} Inbox` : 'Email Inbox'}
               </h1>
               {accountInfo && (
@@ -847,31 +973,35 @@ const UnifiedEmailInbox = () => {
                 </p>
               )}
             </div>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={() => {
-                setLastRefresh(new Date());
-                loadImapEmails();
-              }}
-              disabled={loading}
-              title="Refresh emails (auto-refreshes every 15 minutes)"
-            >
-              <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                console.log('🔄 Manual sync from IMAP triggered');
-                triggerInitialSync();
-              }}
-              disabled={loading}
-              title="Sync emails from IMAP server"
-            >
-              <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
-              Sync from IMAP
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="icon"
+                className="h-10 w-10 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-110"
+                onClick={() => {
+                  setLastRefresh(new Date());
+                  loadImapEmails();
+                }}
+                disabled={loading}
+                title="Refresh emails (auto-refreshes every 15 minutes)"
+              >
+                <RefreshCw className={`h-5 w-5 ${loading ? "animate-spin" : ""}`} />
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-10 px-4 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-105 font-medium"
+                onClick={() => {
+                  console.log('🔄 Manual sync from IMAP triggered');
+                  triggerInitialSync();
+                }}
+                disabled={loading}
+                title="Sync emails from IMAP server"
+              >
+                <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
+                Sync from IMAP
+              </Button>
+            </div>
           </div>
 
           {/* Authentication Error Alert */}
@@ -910,63 +1040,88 @@ const UnifiedEmailInbox = () => {
 
           <div className="flex gap-2">
             <div className="relative flex-1">
-              <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <Search className="absolute left-4 top-1/2 transform -translate-y-1/2 h-5 w-5 text-gray-400 dark:text-gray-500" />
               <Input
                 placeholder="Search emails..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="pl-10"
+                className="pl-12 h-12 rounded-full border-2 border-gray-200 dark:border-gray-700 focus:border-blue-500 dark:focus:border-blue-400 focus:ring-4 focus:ring-blue-100 dark:focus:ring-blue-900/20 bg-gray-50 dark:bg-gray-800 text-base transition-all duration-200"
               />
             </div>
           </div>
         </div>
 
         {/* Email List */}
-        <div className="flex-1 overflow-y-auto">
+        <div className="flex-1 overflow-y-auto bg-gray-50 dark:bg-gray-900/50">
           {loading ? (
             <div className="flex items-center justify-center h-full">
-              <Loader2 className="h-8 w-8 animate-spin" />
+              <div className="flex flex-col items-center gap-4">
+                <Loader2 className="h-10 w-10 animate-spin text-blue-500" />
+                <p className="text-sm text-muted-foreground">Loading emails...</p>
+              </div>
             </div>
           ) : filteredEmails.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
-              <Mail className="h-12 w-12 mb-4" />
-              <p>No emails found</p>
+            <div className="flex flex-col items-center justify-center h-full text-muted-foreground p-8">
+              <div className="relative mb-6">
+                <div className="absolute inset-0 bg-blue-500/20 rounded-full blur-2xl animate-pulse"></div>
+                <Mail className="h-16 w-16 text-blue-500 dark:text-blue-400 relative z-10" />
+              </div>
+              <p className="text-lg font-semibold text-gray-900 dark:text-gray-100 mb-2">No emails found</p>
               {searchQuery && (
-                <p className="text-sm mt-2">Try a different search term</p>
+                <p className="text-sm">Try a different search term</p>
               )}
             </div>
           ) : (
-            <div className="divide-y">
-              {filteredEmails.map((email) => (
+            <div className="p-4 space-y-2">
+              {filteredEmails.map((email, index) => (
                 <div
                   key={email.id}
-                  className="p-4 hover:bg-muted/50 cursor-pointer transition-colors"
+                  className={`group p-6 rounded-xl cursor-pointer transition-all duration-200 hover:shadow-lg hover:-translate-y-1 ${
+                    !email.isRead 
+                      ? 'bg-gradient-to-r from-blue-50 to-purple-50 dark:from-blue-950/20 dark:to-purple-950/20 border-l-4 border-blue-500 shadow-md' 
+                      : 'bg-white dark:bg-gray-800 border-l-4 border-transparent hover:border-gray-300 dark:hover:border-gray-600 shadow-sm'
+                  }`}
                   onClick={() => handleEmailClick(email)}
+                  style={{ animationDelay: `${index * 30}ms` }}
                 >
-                  <div className="flex items-start justify-between">
+                  <div className="flex items-start justify-between gap-4">
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1">
-                        <p className="font-semibold truncate">
-                          {email.from || email.fromEmail || "Unknown"}
-                        </p>
-                        {!email.isRead && (
-                          <Badge variant="default" className="h-2 w-2 p-0 rounded-full" />
-                        )}
+                      <div className="flex items-center gap-3 mb-2">
+                        <div className={`h-10 w-10 rounded-full bg-gradient-to-br from-blue-400 to-purple-500 flex items-center justify-center text-white font-bold text-sm flex-shrink-0 shadow-md ${
+                          !email.isRead ? 'ring-2 ring-blue-400 ring-offset-2' : ''
+                        }`}>
+                          {(email.from || email.fromEmail || "U").charAt(0).toUpperCase()}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <p className={`font-semibold truncate ${
+                              !email.isRead ? 'text-gray-900 dark:text-gray-100 text-lg' : 'text-gray-700 dark:text-gray-300'
+                            }`}>
+                              {email.from || email.fromEmail || "Unknown"}
+                            </p>
+                            {!email.isRead && (
+                              <div className="h-2 w-2 rounded-full bg-blue-500 animate-pulse flex-shrink-0"></div>
+                            )}
+                          </div>
+                          <p className={`text-base font-medium truncate mb-2 ${
+                            !email.isRead ? 'text-gray-900 dark:text-gray-100' : 'text-gray-600 dark:text-gray-400'
+                          }`}>
+                            {email.subject || "(No subject)"}
+                          </p>
+                          <p className="text-sm text-muted-foreground line-clamp-2">
+                            {email.body?.substring(0, 120) || ""}
+                          </p>
+                        </div>
                       </div>
-                      <p className="text-sm font-medium truncate mb-1">
-                        {email.subject || "(No subject)"}
-                      </p>
-                      <p className="text-sm text-muted-foreground line-clamp-2">
-                        {email.body?.substring(0, 100) || ""}
-                      </p>
                     </div>
-                    <div className="ml-4 flex items-center gap-2">
-                      <span className="text-xs text-muted-foreground whitespace-nowrap">
+                    <div className="flex flex-col items-end gap-2 flex-shrink-0">
+                      <span className="text-xs text-muted-foreground whitespace-nowrap font-medium">
                         {formatEmailDate(email.date)}
                       </span>
                       <Button
                         variant="ghost"
                         size="icon"
+                        className="h-8 w-8 rounded-lg opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-red-100 dark:hover:bg-red-900/20 hover:text-red-600 dark:hover:text-red-400"
                         onClick={(e) => {
                           e.stopPropagation();
                           handleDeleteEmail(email);
@@ -986,52 +1141,106 @@ const UnifiedEmailInbox = () => {
       {/* Email Detail View */}
       {selectedEmail && (
         <Dialog open={!!selectedEmail} onOpenChange={() => setSelectedEmail(null)}>
-          <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
-            <DialogHeader>
-              <DialogTitle>{selectedEmail.subject || "(No subject)"}</DialogTitle>
+          <DialogContent className="max-w-5xl max-h-[90vh] overflow-y-auto rounded-2xl border-2 shadow-2xl">
+            <DialogHeader className="pb-4 border-b border-gray-200 dark:border-gray-700 bg-gradient-to-r from-blue-50 to-purple-50 dark:from-blue-950/20 dark:to-purple-950/20 -m-6 mb-4 p-6 rounded-t-2xl">
+              <div className="flex items-center justify-between gap-4">
+                <DialogTitle className="flex-1 text-2xl font-bold text-gray-900 dark:text-gray-100 pr-4">
+                  {selectedEmail.subject || "(No subject)"}
+                </DialogTitle>
+                {/* Navigation Arrows */}
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={navigateToPreviousEmail}
+                    disabled={!canNavigatePrevious}
+                    title="Previous email (←)"
+                    className="h-10 w-10 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-110 disabled:opacity-50"
+                  >
+                    <ArrowLeft className="h-5 w-5" />
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={navigateToNextEmail}
+                    disabled={!canNavigateNext}
+                    title="Next email (→)"
+                    className="h-10 w-10 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-110 disabled:opacity-50"
+                  >
+                    <ArrowRight className="h-5 w-5" />
+                  </Button>
+                </div>
+              </div>
             </DialogHeader>
-            <div className="space-y-4">
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="font-semibold">
-                      From: {selectedEmail.from || selectedEmail.fromEmail}
-                    </p>
-                    <p className="text-sm text-muted-foreground">
-                      To: {selectedEmail.to || "Unknown"}
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      {formatEmailDate(selectedEmail.date)}
-                    </p>
+            <div className="space-y-6 pt-4">
+              <div className="space-y-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div className="flex-1 space-y-3">
+                    <div className="flex items-center gap-3">
+                      <div className="h-12 w-12 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-bold text-lg shadow-lg">
+                        {(selectedEmail.from || selectedEmail.fromEmail || "U").charAt(0).toUpperCase()}
+                      </div>
+                      <div>
+                        <p className="font-semibold text-lg text-gray-900 dark:text-gray-100">
+                          {selectedEmail.from || selectedEmail.fromEmail}
+                        </p>
+                        <p className="text-sm text-muted-foreground">
+                          {formatEmailDate(selectedEmail.date)}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="pl-[60px] space-y-1">
+                      <p className="text-sm text-muted-foreground">
+                        <span className="font-medium">To:</span> {selectedEmail.to || "Unknown"}
+                      </p>
+                    </div>
                   </div>
                   <div className="flex gap-2">
-                    <Button variant="outline" size="icon">
-                      <Reply className="h-4 w-4" />
+                    <Button 
+                      variant="outline" 
+                      size="icon"
+                      className="h-10 w-10 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-110"
+                    >
+                      <Reply className="h-5 w-5" />
                     </Button>
-                    <Button variant="outline" size="icon">
-                      <Forward className="h-4 w-4" />
+                    <Button 
+                      variant="outline" 
+                      size="icon"
+                      className="h-10 w-10 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-110"
+                    >
+                      <Forward className="h-5 w-5" />
                     </Button>
                     <Button
                       variant="outline"
                       size="icon"
+                      className="h-10 w-10 rounded-xl border-2 hover:border-red-500 dark:hover:border-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition-all duration-200 hover:scale-110"
                       onClick={() => {
                         handleDeleteEmail(selectedEmail);
                         setSelectedEmail(null);
                       }}
                     >
-                      <Trash2 className="h-4 w-4" />
+                      <Trash2 className="h-5 w-5" />
                     </Button>
                   </div>
                 </div>
               </div>
-              <div className="border-t pt-4">
+              <div className="border-t border-gray-200 dark:border-gray-700 pt-6">
                 {selectedEmail.bodyHtml ? (
-                  <div
-                    dangerouslySetInnerHTML={{ __html: selectedEmail.bodyHtml }}
-                    className="prose max-w-none"
-                  />
+                  <div className="bg-gray-950 dark:bg-gray-950 rounded-lg p-6 -mx-6">
+                    <div
+                      dangerouslySetInnerHTML={{ __html: selectedEmail.bodyHtml }}
+                      className="email-content prose prose-sm dark:prose-invert max-w-none"
+                      style={{
+                        color: '#e5e7eb !important',
+                        fontSize: '15px',
+                        lineHeight: '1.6'
+                      }}
+                    />
+                  </div>
                 ) : (
-                  <p className="whitespace-pre-wrap">{selectedEmail.body}</p>
+                  <div className="whitespace-pre-wrap text-gray-200 dark:text-gray-200 text-base leading-relaxed font-sans bg-gray-950 dark:bg-gray-950 rounded-lg p-6 -mx-6">
+                    {selectedEmail.body || 'No content available'}
+                  </div>
                 )}
               </div>
             </div>

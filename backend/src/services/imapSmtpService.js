@@ -1352,14 +1352,60 @@ async function deleteEmail(accountId, uid, folder = 'INBOX') {
       }
     });
     
-    // Open mailbox
-    await connection.openBox(folder);
+    // Open mailbox (read-write mode for deletion)
+    await connection.openBox(folder, false);
     
-    // Delete message
-    await connection.deleteMessage(uid);
+    // Delete message - imap-simple's deleteMessage marks message as deleted
+    // Convert uid to array format (imap-simple expects array)
+    const uidArray = Array.isArray(uid) ? uid : [uid.toString()];
+    await connection.deleteMessage(uidArray);
     
-    // Expunge to permanently delete
-    await connection.expunge();
+    // Expunge to permanently delete - try both methods
+    try {
+      // Method 1: Try connection.expunge() if available (imap-simple method)
+      if (typeof connection.expunge === 'function') {
+        await connection.expunge();
+        console.log('[DELETE-EMAIL] ✅ Email expunged via connection.expunge()');
+      } 
+      // Method 2: Use underlying node-imap connection
+      else if (connection.imap && connection.imap.state === 'authenticated') {
+        await new Promise((resolve, reject) => {
+          connection.imap.expunge((err) => {
+            if (err) {
+              console.warn('[DELETE-EMAIL] Expunge error (non-critical):', err.message);
+              resolve(); // Don't reject - deletion is already marked
+            } else {
+              console.log('[DELETE-EMAIL] ✅ Email expunged via connection.imap.expunge()');
+              resolve();
+            }
+          });
+        });
+      } else {
+        console.log('[DELETE-EMAIL] ⚠️ Expunge not available - email marked as deleted, will be removed on server sync');
+      }
+    } catch (expungeError) {
+      // Expunge is optional - deletion is already marked via deleteMessage
+      console.warn('[DELETE-EMAIL] Expunge failed (non-critical, email is still marked as deleted):', expungeError.message);
+    }
+    
+    // Mark as deleted in database
+    try {
+      const { error: dbError } = await supabaseAdmin
+        .from('emails')
+        .update({ is_deleted: true })
+        .eq('email_account_id', accountId)
+        .eq('uid', uid)
+        .eq('folder_name', folder);
+      
+      if (dbError) {
+        console.warn('[DELETE-EMAIL] Failed to update database:', dbError.message);
+      } else {
+        console.log('[DELETE-EMAIL] ✅ Email marked as deleted in database');
+      }
+    } catch (dbError) {
+      console.warn('[DELETE-EMAIL] Database update error (non-critical):', dbError.message);
+      // Don't fail the whole operation if DB update fails
+    }
     
     connection.end();
     

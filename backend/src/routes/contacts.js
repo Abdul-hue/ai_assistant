@@ -6,6 +6,8 @@ const { z } = require('zod');
 const { authMiddleware } = require('../middleware/auth');
 const contactsService = require('../services/contactsService');
 const { supabaseAdmin } = require('../config/supabase');
+const { syncContactsForAgent } = require('../services/contactSyncService');
+const { activeSessions } = require('../services/baileysService');
 
 const logger = pino();
 const router = express.Router();
@@ -462,6 +464,75 @@ router.get('/:agentId/contacts/count', authMiddleware, async (req, res) => {
   } catch (error) {
     logger.error({ error: error.message }, '❌ Failed to fetch contact count');
     return res.status(500).json({ error: 'Failed to fetch contact count' });
+  }
+});
+
+/**
+ * POST /api/agents/:agentId/contacts/sync
+ * Manually trigger WhatsApp contact synchronization
+ */
+router.post('/:agentId/contacts/sync', authMiddleware, async (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const userId = req.user.id;
+
+    // Verify agent ownership
+    const { data: agent, error: agentError } = await supabaseAdmin
+      .from('agents')
+      .select('id, agent_name')
+      .eq('id', agentId)
+      .eq('user_id', userId)
+      .single();
+
+    if (agentError || !agent) {
+      logger.warn({ agentId, userId, error: agentError }, '🚫 Agent not found or unauthorized for contact sync');
+      return res.status(404).json({ error: 'Agent not found or unauthorized' });
+    }
+
+    // Get active WhatsApp session
+    const session = activeSessions.get(agentId);
+
+    if (!session || !session.socket || !session.isConnected) {
+      logger.warn({ agentId }, '⚠️ WhatsApp not connected - cannot sync contacts');
+      return res.status(400).json({ 
+        error: 'WhatsApp not connected',
+        message: 'Please connect your WhatsApp account first via QR code'
+      });
+    }
+
+    logger.info({ agentId, agentName: agent.agent_name }, '🔄 Manual contact sync triggered');
+
+    // Trigger contact sync (non-blocking)
+    syncContactsForAgent(agentId, session.socket)
+      .then((result) => {
+        logger.info(
+          {
+            agentId,
+            success: result.success,
+            failed: result.failed,
+            total: result.total,
+          },
+          '✅ Contact sync completed'
+        );
+      })
+      .catch((syncError) => {
+        logger.error(
+          { agentId, error: syncError.message },
+          '❌ Contact sync failed'
+        );
+      });
+
+    // Return immediately (sync happens in background)
+    return res.json({
+      message: 'Contact synchronization started',
+      note: 'Contacts will be synced in the background. Check back in a few moments.',
+    });
+  } catch (error) {
+    logger.error(
+      { error: error.message, stack: error.stack },
+      '❌ Unexpected error triggering contact sync'
+    );
+    return res.status(500).json({ error: 'Failed to trigger contact sync' });
   }
 });
 

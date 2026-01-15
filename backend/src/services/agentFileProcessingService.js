@@ -170,43 +170,51 @@ async function ensureDocumentContentTable() {
 }
 
 async function persistDocumentContent({ agentId, fileMetadata, content, contentType, storagePath }) {
-  await ensureDocumentContentTable();
+  const { supabaseAdmin } = require('../config/supabase');
+  
+  const logPrefix = `[PERSIST-CONTENT][${agentId}][${fileMetadata.id}]`;
+  console.log(`${logPrefix} Storing document content`, {
+    fileName: fileMetadata.name,
+    contentLength: content.length,
+    contentType,
+  });
 
-  const insertId = randomUUID();
+  try {
+    // Ensure content_type is not too long (safeguard, though DB now uses TEXT)
+    const safeContentType = contentType 
+      ? (contentType.length > 255 ? contentType.substring(0, 255) : contentType)
+      : 'text/plain';
 
-  const params = [
-    insertId,
-    agentId,
-    fileMetadata.id,
-    fileMetadata.name || fileMetadata.fileName || null,
-    `${BUCKET_NAME}/${storagePath}`,
-    content,
-    contentType || 'text/plain',
-  ];
+    const { data, error } = await supabaseAdmin
+      .from('agent_document_contents')
+      .upsert({
+        id: randomUUID(),
+        agent_id: agentId,
+        file_id: fileMetadata.id,
+        file_name: fileMetadata.name || fileMetadata.fileName || null,
+        storage_path: `${BUCKET_NAME}/${storagePath}`,
+        content: content,
+        content_type: safeContentType,
+        extracted_at: new Date().toISOString(),
+      }, {
+        onConflict: 'agent_id,file_id',
+      })
+      .select()
+      .single();
 
-  await pool.query(
-    `
-      INSERT INTO agent_document_contents (
-        id,
-        agent_id,
-        file_id,
-        file_name,
-        storage_path,
-        content,
-        content_type,
-        extracted_at
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-      ON CONFLICT (agent_id, file_id)
-      DO UPDATE SET
-        file_name = EXCLUDED.file_name,
-        storage_path = EXCLUDED.storage_path,
-        content = EXCLUDED.content,
-        content_type = EXCLUDED.content_type,
-        extracted_at = NOW()
-    `,
-    params
-  );
+    if (error) {
+      console.error(`${logPrefix} Failed to store document content:`, error);
+      throw new Error(`Failed to store document content: ${error.message}`);
+    }
+
+    console.log(`${logPrefix} ✅ Document content stored successfully`, {
+      id: data?.id,
+      contentLength: content.length,
+    });
+  } catch (error) {
+    console.error(`${logPrefix} ❌ Error in persistDocumentContent:`, error);
+    throw error;
+  }
 }
 
 async function handlePineconeUpsert({ agentId, content, fileMetadata }) {
@@ -217,10 +225,22 @@ async function handlePineconeUpsert({ agentId, content, fileMetadata }) {
       fileMetadata,
     });
 
-    return result?.chunksStored ?? result?.chunks ?? 0;
+    const chunksStored = result?.chunksStored ?? result?.chunks ?? 0;
+    console.log(`[AGENT-FILE] ✅ Pinecone vectors stored successfully`, {
+      agentId,
+      fileId: fileMetadata.id,
+      chunksStored,
+    });
+    return chunksStored;
   } catch (error) {
-    console.error('[AGENT-FILE] Pinecone storage failed:', error.message);
-    throw new Error(`Failed to store vectors in Pinecone: ${error.message}`);
+    console.error('[AGENT-FILE] ❌ Pinecone storage failed:', {
+      error: error.message,
+      agentId,
+      fileId: fileMetadata.id,
+    });
+    // Don't throw - allow processing to continue even if Pinecone fails
+    // The content is still saved in agent_document_contents
+    return 0;
   }
 }
 
@@ -290,13 +310,21 @@ async function processAgentFile({ agentId, fileId, agentRecord = null, skipAgent
     storagePath,
   });
 
-  const chunksStored = await handlePineconeUpsert({
-    agentId,
-    content: extractedContent,
-    fileMetadata,
-  });
+  let chunksStored = 0;
+  try {
+    chunksStored = await handlePineconeUpsert({
+      agentId,
+      content: extractedContent,
+      fileMetadata,
+    });
+    console.log(`${logPrefix} ✅ Pinecone vectors stored`, { chunksStored });
+  } catch (pineconeError) {
+    console.error(`${logPrefix} ❌ Pinecone storage failed:`, pineconeError);
+    // Don't throw - we still want to save the content even if Pinecone fails
+    // The content is already saved in agent_document_contents
+  }
 
-  console.log(`${logPrefix} Processing complete`, {
+  console.log(`${logPrefix} ✅ Processing complete`, {
     fileId: fileMetadata.id,
     fileName: fileMetadata.name,
     contentLength: extractedContent.length,
