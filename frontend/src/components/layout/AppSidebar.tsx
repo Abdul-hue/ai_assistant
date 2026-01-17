@@ -8,7 +8,8 @@ import {
   Settings,
   Home,
   Key,
-  Sparkles
+  Sparkles,
+  Activity
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import ProfileAvatarMenu from '@/components/ProfileAvatarMenu';
@@ -51,6 +52,12 @@ const navItems: NavItem[] = [
     icon: Key, 
     label: 'Email Integration',
     ariaLabel: 'Email integration settings'
+  },
+  { 
+    to: '/monitoring', 
+    icon: Activity, 
+    label: 'System Monitoring',
+    ariaLabel: 'View system monitoring dashboard'
   },
 ];
 

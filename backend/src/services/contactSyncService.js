@@ -194,18 +194,19 @@ async function handleContactUpdate(agentId, contacts) {
 }
 
 /**
- * Main sync function - fetches all contacts from WhatsApp and syncs to database
+ * Main sync function - Baileys uses EVENTS, not stores!
+ * This function is called on connection, but contacts come via events.
+ * We just verify connection and let event listeners handle the sync.
  * @param {string} agentId - Agent UUID
  * @param {object} sock - Baileys WASocket instance
- * @param {boolean} isRetry - Whether this is a retry attempt (for logging)
  * @returns {Promise<{success: number, failed: number, total: number, errors: Array}>}
  */
-async function syncContactsForAgent(agentId, sock, isRetry = false) {
+async function syncContactsForAgent(agentId, sock) {
   if (!sock || !agentId) {
     throw new Error('Invalid parameters: sock and agentId are required');
   }
 
-  console.log(`[CONTACT-SYNC] 🔄 Starting contact sync for agent ${agentId.substring(0, 8)}...`);
+  console.log(`[CONTACT-SYNC] 🔄 Contact sync initialized for agent ${agentId.substring(0, 8)}...`);
 
   try {
     // Check if socket is connected
@@ -219,173 +220,26 @@ async function syncContactsForAgent(agentId, sock, isRetry = false) {
       };
     }
 
-    // Fetch contacts from WhatsApp
-    // Baileys loads contacts incrementally, so we need to access them from the store
-    // Contacts are typically available through sock.store.contacts or via events
+    // CRITICAL: Baileys uses EVENTS, not stores!
+    // sock.store.contacts is NEVER populated - contacts come via events:
+    // - contacts.set: ALL contacts sent 10-30s after connection (main event)
+    // - contacts.update: Real-time updates when contacts change
+    // - contacts.upsert: When new contacts are added
     
-    let contacts = [];
+    console.log(`[CONTACT-SYNC] ✅ Connection verified - waiting for contacts.set event (usually 10-30s after connection)`);
+    console.log(`[CONTACT-SYNC] ℹ️ Event listeners are active - contacts will sync automatically when WhatsApp sends them`);
     
-    try {
-      // Method 1: Try sock.store.contacts.all() - this is the standard Baileys method (used in baileysService.js:3332)
-      if (sock.store && sock.store.contacts) {
-        try {
-          if (typeof sock.store.contacts.all === 'function') {
-            contacts = await sock.store.contacts.all();
-            if (contacts && contacts.length > 0) {
-              console.log(`[CONTACT-SYNC] 📋 Retrieved ${contacts.length} contacts via sock.store.contacts.all()`);
-            }
-          } else {
-            // Try calling it as a function first
-            try {
-              const contactStore = await sock.store.contacts();
-              if (contactStore && typeof contactStore.all === 'function') {
-                contacts = await contactStore.all();
-                if (contacts && contacts.length > 0) {
-                  console.log(`[CONTACT-SYNC] 📋 Retrieved ${contacts.length} contacts via sock.store.contacts().all()`);
-                }
-              }
-            } catch (funcError) {
-              // Ignore - try next method
-            }
-          }
-        } catch (allError) {
-          console.warn(`[CONTACT-SYNC] ⚠️ sock.store.contacts.all() failed:`, allError.message);
-        }
-      }
-
-      // Method 2: Try to get contacts from store if available (alternative patterns)
-      if (contacts.length === 0 && sock.store) {
-        // Baileys store structure: sock.store.contacts might be a function or object
-        if (typeof sock.store.contacts === 'function') {
-          try {
-            const contactStore = await sock.store.contacts();
-            if (contactStore) {
-              if (typeof contactStore.all === 'function') {
-                contacts = await contactStore.all();
-              } else if (Array.isArray(contactStore)) {
-                contacts = contactStore;
-              } else if (typeof contactStore === 'object') {
-                // Convert object/map to array
-                contacts = Object.values(contactStore);
-              }
-            }
-          } catch (funcError) {
-            console.warn(`[CONTACT-SYNC] ⚠️ sock.store.contacts() function call failed:`, funcError.message);
-          }
-        } else if (sock.store.contacts && typeof sock.store.contacts === 'object') {
-          // Direct access to contacts object
-          if (Array.isArray(sock.store.contacts)) {
-            contacts = sock.store.contacts;
-          } else {
-            contacts = Object.values(sock.store.contacts);
-          }
-        }
-      }
-      
-      // Method 3: Try alternative store access patterns
-      if (contacts.length === 0 && sock.store?.contacts) {
-        try {
-          // Some Baileys versions expose contacts differently
-          const storeContacts = sock.store.contacts;
-          if (storeContacts && typeof storeContacts === 'object') {
-            if (storeContacts.contacts) {
-              contacts = Object.values(storeContacts.contacts);
-            } else if (Array.isArray(storeContacts)) {
-              contacts = storeContacts;
-            }
-          }
-        } catch (altError) {
-          // Ignore alternative access errors
-        }
-      }
-    } catch (storeError) {
-      console.warn(`[CONTACT-SYNC] ⚠️ Could not fetch from store:`, storeError.message);
-    }
-
-    // Baileys loads contacts incrementally as they're needed
-    // If we don't have contacts in store yet, schedule a delayed retry
-    if (contacts.length === 0) {
-      console.log(`[CONTACT-SYNC] ℹ️ No contacts in store yet (normal - Baileys loads incrementally)`);
-      console.log(`[CONTACT-SYNC] ⏰ Scheduling delayed contact fetch in 5 seconds...`);
-      
-      // Schedule a delayed retry to fetch contacts after Baileys has loaded them
-      setTimeout(async () => {
-        try {
-          console.log(`[CONTACT-SYNC] 🔄 Retrying contact fetch after 5s delay...`);
-          const retryResult = await syncContactsForAgent(agentId, sock, true);
-          if (retryResult.total > 0) {
-            console.log(`[CONTACT-SYNC] ✅ Delayed fetch successful: ${retryResult.success}/${retryResult.total} contacts synced`);
-          } else {
-            console.log(`[CONTACT-SYNC] ℹ️ Contacts still not loaded after 5s - will sync via real-time events`);
-          }
-        } catch (retryError) {
-          console.warn(`[CONTACT-SYNC] ⚠️ Delayed fetch failed:`, retryError.message);
-        }
-      }, 5000); // Retry after 5 seconds
-      
-      // Also schedule another retry after 15 seconds for contacts that load later
-      setTimeout(async () => {
-        try {
-          console.log(`[CONTACT-SYNC] 🔄 Second retry for contacts that loaded later (15s)...`);
-          const retryResult = await syncContactsForAgent(agentId, sock, true);
-          if (retryResult.total > 0) {
-            console.log(`[CONTACT-SYNC] ✅ Second fetch successful: ${retryResult.success}/${retryResult.total} contacts synced`);
-          }
-        } catch (retryError) {
-          // Silently ignore - contacts will sync via events
-        }
-      }, 15000); // Second retry after 15 seconds
-      
-      // Final retry after 30 seconds for any remaining contacts
-      setTimeout(async () => {
-        try {
-          console.log(`[CONTACT-SYNC] 🔄 Final retry for remaining contacts (30s)...`);
-          const retryResult = await syncContactsForAgent(agentId, sock, true);
-          if (retryResult.total > 0) {
-            console.log(`[CONTACT-SYNC] ✅ Final fetch successful: ${retryResult.success}/${retryResult.total} contacts synced`);
-          }
-        } catch (retryError) {
-          // Silently ignore - contacts will sync via events
-        }
-      }, 30000); // Final retry after 30 seconds
-      
-      console.log(`[CONTACT-SYNC] ℹ️ Contacts will also be synced automatically via real-time events as they load`);
-      // Return early - contacts will be synced via events and delayed retries
-      return {
-        success: 0,
-        failed: 0,
-        total: 0,
-        errors: [],
-        note: 'Contacts will be synced via real-time events and delayed retries as they are loaded by Baileys',
-      };
-    }
-
-    console.log(`[CONTACT-SYNC] 📋 Found ${contacts.length} contacts to sync`);
-
-    // Sync contacts to database
-    const result = await handleContactUpdate(agentId, contacts);
-
-    // Update last_synced_at timestamp (if you add this column to contacts table)
-    try {
-      await supabaseAdmin
-        .from('agents')
-        .update({
-          // You can add a last_contacts_synced_at field to agents table
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', agentId);
-    } catch (updateError) {
-      console.warn(`[CONTACT-SYNC] ⚠️ Could not update sync timestamp:`, updateError.message);
-    }
-
-    console.log(`[CONTACT-SYNC] ✅ Sync complete: ${result.success} succeeded, ${result.failed} failed`);
-
+    // Return immediately - no polling, no retries, no infinite loops!
+    // Contacts will be synced via events handled by setupContactUpdateListeners()
     return {
-      ...result,
-      total: contacts.length,
+      success: 0,
+      failed: 0,
+      total: 0,
+      errors: [],
+      note: 'Contacts will be synced automatically via contacts.set event (usually 10-30s after connection)',
     };
   } catch (error) {
-    console.error(`[CONTACT-SYNC] ❌ Sync failed:`, error);
+    console.error(`[CONTACT-SYNC] ❌ Sync initialization failed:`, error);
     return {
       success: 0,
       failed: 0,
@@ -408,7 +262,54 @@ function setupContactUpdateListeners(agentId, sock) {
 
   console.log(`[CONTACT-SYNC] 🎧 Setting up real-time contact update listeners for agent ${agentId.substring(0, 8)}...`);
 
-  // Listen for contact updates
+  // CRITICAL: Listen for contacts.set - this is the MAIN event that sends ALL contacts
+  // WhatsApp sends this 10-30 seconds after connection opens
+  sock.ev.on('contacts.set', async ({ contacts }) => {
+    try {
+      if (!contacts || contacts.length === 0) {
+        return;
+      }
+
+      // Handle both array and Set/Map
+      const contactArray = Array.isArray(contacts) 
+        ? contacts 
+        : contacts instanceof Set 
+          ? Array.from(contacts)
+          : contacts instanceof Map
+            ? Array.from(contacts.values())
+            : Object.values(contacts);
+
+      console.log(`[CONTACT-SYNC] 📥 Received contacts.set event: ${contactArray.length} contact(s)`);
+      console.log(`[CONTACT-SYNC] 🔄 Syncing all contacts to database...`);
+
+      const result = await handleContactUpdate(agentId, contactArray);
+
+      if (result.success > 0) {
+        console.log(`[CONTACT-SYNC] ✅ Initial sync complete: ${result.success}/${contactArray.length} contacts synced`);
+        
+        // Update sync timestamp
+        try {
+          await supabaseAdmin
+            .from('agents')
+            .update({
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', agentId);
+        } catch (updateError) {
+          // Ignore timestamp update errors
+        }
+      }
+
+      if (result.failed > 0) {
+        console.warn(`[CONTACT-SYNC] ⚠️ Failed to sync ${result.failed} contact(s)`);
+      }
+    } catch (error) {
+      console.error(`[CONTACT-SYNC] ❌ Error handling contacts.set:`, error);
+      // Don't throw - we want to continue listening
+    }
+  });
+
+  // Listen for contact updates (when existing contacts change)
   sock.ev.on('contacts.update', async (updates) => {
     try {
       if (!updates || (Array.isArray(updates) && updates.length === 0)) {

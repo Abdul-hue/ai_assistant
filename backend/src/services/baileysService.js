@@ -7,11 +7,22 @@ const {
   makeCacheableSignalKeyStore,
   downloadMediaMessage
 } = require('@whiskeysockets/baileys');
-const pino = require('pino');
+const pino = require('pino'); // For Baileys internal logging only
+const promClient = require('prom-client');
 const fs = require('fs');
 const path = require('path');
 const { randomUUID } = require('crypto');
+const crypto = require('crypto');
+const pLimit = require('p-limit');
+const LRU = require('lru-cache');
+const redisCache = require('./redisCache');
+const instanceManager = require('./instanceManager');
+const sessionCache = require('./sessionCache');
 const EventEmitter = require('events');
+const { initializeMetrics, OperationTracker } = require('../middleware/performanceTracking');
+const PerformanceReporter = require('./performanceReporting');
+const { ErrorTracker, ERROR_CATEGORIES, ERROR_SEVERITY, errorRateCounter, errorPatternGauge } = require('./errorTracking');
+const { AlertingService, ALERT_TYPES } = require('./alerting');
 const { supabaseAdmin } = require('../config/supabase');
 const axios = require('axios');
 const lockfile = require('proper-lockfile');
@@ -35,7 +46,7 @@ let audioBucketName = process.env.AUDIO_BUCKET || DEFAULT_AUDIO_BUCKET;
 const DEFAULT_AUDIO_SIGNED_URL_TTL = 60 * 60 * 24 * 7; // 7 days
 let audioBucketChecked = false;
 const QR_EXPIRY_MS = 3 * 60 * 1000; // 3 minutes - WhatsApp QR code validity
-const QR_EXPIRATION_MS = 60 * 1000; // 60 seconds - QR expiration for cleanup
+const QR_EXPIRATION_MS = 180 * 1000; // 180 seconds (3 minutes) - QR expiration for cleanup
 const MAX_QR_PENDING_MS = 5 * 60 * 1000; // 5 minutes - Max time in qr_pending before reset
 
 // SECURITY: Generate unique instance ID for multi-instance prevention
@@ -58,11 +69,68 @@ const qrGenerationTracker = new Map();
 const connectionLocks = new Map(); // agentId -> boolean
 const lastConnectionAttempt = new Map(); // agentId -> timestamp ms
 const last401Failure = new Map(); // agentId -> timestamp ms (prevents auto-retry after 401)
-// Cache for @lid JID to actual phone number mapping (for linked device messages)
-// Format: "@lid JID" -> "phone@s.whatsapp.net"
-const lidToPhoneCache = new Map();
-// In-memory cache for validation results
-const validationCache = new Map(); // phoneNumber -> {isOnWhatsApp, timestamp, expiresAt}
+// ============================================
+// CACHE MANAGEMENT
+// Added: 2025-01-15 - Phase 2 Memory Optimization
+// ============================================
+
+// Cache statistics tracking (defined first for use in dispose callbacks)
+const cacheStats = {
+  validation: { hits: 0, misses: 0, evictions: 0 },
+  lidToPhone: { hits: 0, misses: 0, evictions: 0 },
+  session: { hits: 0, misses: 0, evictions: 0 }
+};
+
+// Helper to record eviction metrics (defined as function for hoisting)
+function recordEvictionMetric(cacheType) {
+  // Check if metrics are available (may not be initialized yet)
+  if (typeof recordMetric === 'function' && cacheMetrics?.evictions) {
+    recordMetric(() => {
+      cacheMetrics.evictions.labels(cacheType).inc();
+    });
+  }
+}
+
+// LRU cache configuration
+const CACHE_CONFIG = {
+  validation: {
+    max: 1000,          // Max 1000 entries
+    ttl: 5 * 60 * 1000, // 5 minutes (v7 uses ttl)
+    updateAgeOnGet: true,
+    // dispose callback for tracking evictions (v7 API)
+    dispose: (key, value) => {
+      cacheStats.validation.evictions++;
+      recordEvictionMetric('validation');
+    }
+  },
+  lidToPhone: {
+    max: 5000,          // Max 5000 phone number mappings
+    ttl: 15 * 60 * 1000, // 15 minutes (v7 uses ttl)
+    updateAgeOnGet: true,
+    // dispose callback for tracking evictions (v7 API)
+    dispose: (key, value) => {
+      cacheStats.lidToPhone.evictions++;
+      recordEvictionMetric('lidToPhone');
+    }
+  },
+  session: {
+    max: 500,           // Max 500 session credentials
+    ttl: 5 * 60 * 1000, // 5 minutes (v7 uses ttl)
+    updateAgeOnGet: true,
+    // dispose callback for tracking evictions (v7 API)
+    dispose: (key, value) => {
+      cacheStats.session.evictions++;
+      recordEvictionMetric('session');
+    }
+  }
+};
+
+// Create LRU caches with size limits
+const validationCache = new LRU(CACHE_CONFIG.validation);
+const lidToPhoneCache = new LRU(CACHE_CONFIG.lidToPhone);
+const SESSION_CACHE = new LRU(CACHE_CONFIG.session); // For credential caching
+
+// Legacy TTL constant (kept for backward compatibility if needed)
 const VALIDATION_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 // Rate limiter per agent
 const validationRateLimiters = new Map(); // agentId -> {count, resetAt}
@@ -74,8 +142,599 @@ const MESSAGE_FORWARD_TIMEOUT_MS = 10000;
 const DEFAULT_MESSAGE_WEBHOOK_TEST = 'https://auto.nsolbpo.com/webhook-test/a18ff948-9380-4abe-a8d8-0912dae2d8ab';
 const DEFAULT_MESSAGE_WEBHOOK_PROD = 'https://auto.nsolbpo.com/webhook/a18ff948-9380-4abe-a8d8-0912dae2d8ab';
 
+// ============================================
+// CREDENTIALS ENCRYPTION
+// Added: 2025-01-15 - Phase 1 Security
+// ============================================
+
+const ENCRYPTION_CONFIG = {
+  algorithm: 'aes-256-gcm',
+  keyLength: 32,
+  ivLength: 16,
+  key: process.env.CREDENTIALS_ENCRYPTION_KEY
+};
+
+// Validate encryption key exists
+if (!ENCRYPTION_CONFIG.key) {
+  console.error('[SECURITY] ❌ CREDENTIALS_ENCRYPTION_KEY not set in environment!');
+  console.error('[SECURITY] Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+  throw new Error('Missing CREDENTIALS_ENCRYPTION_KEY environment variable');
+}
+
+// Validate key length
+if (ENCRYPTION_CONFIG.key.length !== 64) { // 32 bytes = 64 hex characters
+  throw new Error('CREDENTIALS_ENCRYPTION_KEY must be 64 hex characters (32 bytes)');
+}
+
+// ============================================
+// PARALLEL PROCESSING CONFIGURATION
+// Added: 2025-01-15 - Phase 2 Performance
+// ============================================
+
+const CONCURRENCY_CONFIG = {
+  maxConcurrent: parseInt(process.env.MAX_CONCURRENT_CONNECTIONS) || 10,
+  connectionDelay: 500, // ms stagger between connection starts
+  batchSize: 100        // for database operations
+};
+
+// ============================================
+// PROMETHEUS METRICS CONFIGURATION
+// Added: 2025-01-15 - Phase 3 Metrics Collection
+// ============================================
+
+const METRICS_CONFIG = {
+  enabled: process.env.PROMETHEUS_METRICS_ENABLED !== 'false', // Default: true
+  prefix: 'pa_agent_',
+  defaultLabels: { instance: INSTANCE_HOSTNAME },
+  collectInterval: 5000 // 5 seconds
+};
+
+// Initialize Prometheus registry and default metrics
+let metricsRegistry = null;
+
+try {
+  if (METRICS_CONFIG.enabled) {
+    metricsRegistry = new promClient.Registry();
+    
+    // Configure default metrics collection
+    promClient.collectDefaultMetrics({
+      register: metricsRegistry,
+      prefix: METRICS_CONFIG.prefix,
+      labels: METRICS_CONFIG.defaultLabels,
+      gcDurationBuckets: [0.001, 0.01, 0.1, 1, 2, 5]
+    });
+    
+    // Initialize performance tracking metrics with this registry
+    initializeMetrics(metricsRegistry);
+    
+    // Register error tracking metrics
+    if (errorRateCounter && errorPatternGauge) {
+      metricsRegistry.registerMetric(errorRateCounter);
+      metricsRegistry.registerMetric(errorPatternGauge);
+    }
+  }
+} catch (error) {
+  // Graceful degradation: continue without metrics if initialization fails
+  console.warn('[METRICS] Prometheus metrics initialization failed:', error.message);
+  metricsRegistry = null;
+}
+
+// ============================================
+// CUSTOM PROMETHEUS METRICS
+// Added: 2025-01-15 - Phase 3 Metrics Collection
+// ============================================
+
+// Connection Metrics
+const connectionMetrics = metricsRegistry ? {
+  total: new promClient.Counter({
+    name: `${METRICS_CONFIG.prefix}connections_total`,
+    help: 'Total connection attempts',
+    labelNames: ['agent_id', 'user_id', 'result'],
+    registers: [metricsRegistry]
+  }),
+  active: new promClient.Gauge({
+    name: `${METRICS_CONFIG.prefix}connections_active`,
+    help: 'Currently active connections',
+    registers: [metricsRegistry]
+  }),
+  duration: new promClient.Histogram({
+    name: `${METRICS_CONFIG.prefix}connection_duration_seconds`,
+    help: 'Connection establishment duration',
+    labelNames: ['agent_id'],
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 30],
+    registers: [metricsRegistry]
+  }),
+  failures: new promClient.Counter({
+    name: `${METRICS_CONFIG.prefix}connection_failures_total`,
+    help: 'Failed connection attempts',
+    labelNames: ['agent_id', 'reason', 'retryable'],
+    registers: [metricsRegistry]
+  })
+} : null;
+
+// Message Metrics
+const messageMetrics = metricsRegistry ? {
+  received: new promClient.Counter({
+    name: `${METRICS_CONFIG.prefix}messages_received_total`,
+    help: 'Total messages received',
+    labelNames: ['agent_id', 'message_type'],
+    registers: [metricsRegistry]
+  }),
+  sent: new promClient.Counter({
+    name: `${METRICS_CONFIG.prefix}messages_sent_total`,
+    help: 'Total messages sent',
+    labelNames: ['agent_id', 'message_type'],
+    registers: [metricsRegistry]
+  }),
+  processingDuration: new promClient.Histogram({
+    name: `${METRICS_CONFIG.prefix}message_processing_duration_seconds`,
+    help: 'Message processing duration',
+    labelNames: ['agent_id', 'operation'],
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5],
+    registers: [metricsRegistry]
+  }),
+  batchSize: new promClient.Histogram({
+    name: `${METRICS_CONFIG.prefix}message_batch_size`,
+    help: 'Message batch sizes',
+    buckets: [1, 5, 10, 25, 50, 100, 250],
+    registers: [metricsRegistry]
+  })
+} : null;
+
+// Cache Metrics
+const cacheMetrics = metricsRegistry ? {
+  hits: new promClient.Counter({
+    name: `${METRICS_CONFIG.prefix}cache_hits_total`,
+    help: 'Cache hits',
+    labelNames: ['cache_type'],
+    registers: [metricsRegistry]
+  }),
+  misses: new promClient.Counter({
+    name: `${METRICS_CONFIG.prefix}cache_misses_total`,
+    help: 'Cache misses',
+    labelNames: ['cache_type'],
+    registers: [metricsRegistry]
+  }),
+  size: new promClient.Gauge({
+    name: `${METRICS_CONFIG.prefix}cache_size`,
+    help: 'Current cache size',
+    labelNames: ['cache_type'],
+    registers: [metricsRegistry]
+  }),
+  evictions: new promClient.Counter({
+    name: `${METRICS_CONFIG.prefix}cache_evictions_total`,
+    help: 'Cache evictions',
+    labelNames: ['cache_type'],
+    registers: [metricsRegistry]
+  })
+} : null;
+
+// Database Metrics
+const databaseMetrics = metricsRegistry ? {
+  queryDuration: new promClient.Histogram({
+    name: `${METRICS_CONFIG.prefix}db_query_duration_seconds`,
+    help: 'Database query duration',
+    labelNames: ['operation', 'table'],
+    buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 2],
+    registers: [metricsRegistry]
+  }),
+  queryTotal: new promClient.Counter({
+    name: `${METRICS_CONFIG.prefix}db_queries_total`,
+    help: 'Total database queries',
+    labelNames: ['operation', 'table', 'result'],
+    registers: [metricsRegistry]
+  })
+} : null;
+
+// Error Metrics
+const errorMetrics = metricsRegistry ? {
+  total: new promClient.Counter({
+    name: `${METRICS_CONFIG.prefix}errors_total`,
+    help: 'Total errors',
+    labelNames: ['type', 'severity', 'component'],
+    registers: [metricsRegistry]
+  })
+} : null;
+
+// Helper function to safely record metrics
+function recordMetric(metricFn, ...args) {
+  if (!METRICS_CONFIG.enabled || !metricsRegistry) return;
+  try {
+    metricFn(...args);
+  } catch (error) {
+    loggers.perf.error({ error: error.message }, 'Failed to record metric');
+  }
+}
+
+// Create concurrency limiter for connections
+const connectionLimit = pLimit(CONCURRENCY_CONFIG.maxConcurrent);
+
+// ============================================
+// STRUCTURED LOGGING
+// Updated: 2025-01-15 - Phase 3: Use shared logger
+// ============================================
+
+const logger = require('./logger');
+
+// Create child loggers for different components
+const loggers = {
+  connection: logger.child({ component: 'connection', service: 'baileys' }),
+  reconnect: logger.child({ component: 'reconnect', service: 'baileys' }),
+  qr: logger.child({ component: 'qr', service: 'baileys' }),
+  security: logger.child({ component: 'security', service: 'baileys' }),
+  health: logger.child({ component: 'health', service: 'baileys' }),
+  database: logger.child({ component: 'database', service: 'baileys' }),
+  perf: logger.child({ component: 'performance', service: 'baileys' }),
+  messages: logger.child({ component: 'messages', service: 'baileys' }),
+  cache: logger.child({ component: 'cache', service: 'baileys' })
+};
+
+// Helper to get short agent ID
+const shortId = (agentId) => agentId ? agentId.substring(0, 8) : 'unknown';
+
+// Initialize performance reporter
+const performanceReporter = new PerformanceReporter(loggers.perf);
+
+// Initialize error tracker
+const errorTracker = new ErrorTracker(loggers.perf);
+
+// Initialize alerting service
+const alertingService = new AlertingService(loggers.perf);
+
+/**
+ * Track function execution time
+ * @param {Function} fn - Async function to track
+ * @param {string} operation - Operation name
+ * @param {Object} context - Additional context
+ * @returns {Promise} Function result
+ */
+async function trackPerformance(fn, operation, context = {}) {
+  const startTime = Date.now();
+  
+  try {
+    const result = await fn();
+    const duration = Date.now() - startTime;
+    
+    loggers.perf.info({
+      operation,
+      durationMs: duration,
+      ...context
+    }, `${operation} completed`);
+    
+    return result;
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    
+    loggers.perf.error({
+      operation,
+      durationMs: duration,
+      error: error.message,
+      stack: error.stack,
+      ...context
+    }, `${operation} failed`);
+    
+    throw error;
+  }
+}
+
+// Log configuration on startup
+logger.info({
+  logLevel: process.env.LOG_LEVEL || 'info',
+  nodeEnv: process.env.NODE_ENV || 'development',
+  components: Object.keys(loggers)
+}, 'Logging configured');
+
+loggers.perf.info({ maxConcurrent: CONCURRENCY_CONFIG.maxConcurrent }, 'Parallel processing enabled');
+
+// Log cache statistics periodically
+setInterval(() => {
+  const stats = {
+    validation: {
+      size: validationCache.size,
+      hits: cacheStats.validation.hits,
+      misses: cacheStats.validation.misses,
+      hitRate: cacheStats.validation.hits + cacheStats.validation.misses > 0
+        ? parseFloat((cacheStats.validation.hits / (cacheStats.validation.hits + cacheStats.validation.misses) * 100).toFixed(1))
+        : 0
+    },
+    lidToPhone: {
+      size: lidToPhoneCache.size,
+      hits: cacheStats.lidToPhone.hits,
+      misses: cacheStats.lidToPhone.misses,
+      hitRate: cacheStats.lidToPhone.hits + cacheStats.lidToPhone.misses > 0
+        ? parseFloat((cacheStats.lidToPhone.hits / (cacheStats.lidToPhone.hits + cacheStats.lidToPhone.misses) * 100).toFixed(1))
+        : 0
+    },
+    session: {
+      size: SESSION_CACHE.size,
+      hits: cacheStats.session.hits,
+      misses: cacheStats.session.misses,
+      hitRate: cacheStats.session.hits + cacheStats.session.misses > 0
+        ? parseFloat((cacheStats.session.hits / (cacheStats.session.hits + cacheStats.session.misses) * 100).toFixed(1))
+        : 0
+    }
+  };
+  
+  logger.info({ caches: stats }, 'Cache statistics');
+}, 5 * 60 * 1000); // Every 5 minutes
+
+// ============================================
+// RECONNECTION SYSTEM
+// Added: 2025-01-15 - Phase 1 Optimization
+// ============================================
+
+// Track reconnection attempts and state
+const RECONNECTION_ATTEMPTS = new Map();  // agentId -> number of attempts
+const RECONNECTION_DELAYS = new Map();    // agentId -> current delay in ms
+const RECONNECTION_TIMERS = new Map();    // agentId -> setTimeout ID
+const QR_EXPIRATION_TIMERS = new Map();   // agentId -> setTimeout ID for QR cleanup
+
+// Configuration from environment
+const RECONNECTION_CONFIG = {
+  maxAttempts: parseInt(process.env.RECONNECTION_MAX_ATTEMPTS) || 10,
+  baseDelay: parseInt(process.env.RECONNECTION_BASE_DELAY_MS) || 2000,
+  maxDelay: 60000, // 60 seconds maximum
+  nonRetryableCodes: [440, 401, 403, 428] // Stream conflict, auth errors
+};
+
 const agentEventEmitter = new EventEmitter();
-agentEventEmitter.setMaxListeners(0);
+agentEventEmitter.setMaxListeners(100); // Reasonable limit per agent
+
+// Track event listeners per agent for cleanup
+const agentListeners = new Map(); // agentId -> Set<eventName>
+
+/**
+ * Track event listener registration
+ * Phase 3C.3 - Memory leak prevention
+ */
+function trackListener(agentId, eventName) {
+  if (!agentListeners.has(agentId)) {
+    agentListeners.set(agentId, new Set());
+  }
+  agentListeners.get(agentId).add(eventName);
+  
+  loggers.perf.debug({ 
+    agentId: shortId(agentId), 
+    eventName,
+    totalListeners: agentListeners.get(agentId).size
+  }, 'Event listener tracked');
+}
+
+/**
+ * Remove all tracked listeners for an agent
+ * Phase 3C.3 - Memory leak prevention
+ */
+function removeTrackedListeners(agentId) {
+  const listeners = agentListeners.get(agentId);
+  
+  if (!listeners || listeners.size === 0) {
+    return;
+  }
+  
+  loggers.perf.info({ 
+    agentId: shortId(agentId), 
+    listenerCount: listeners.size 
+  }, 'Removing event listeners');
+  
+  // Remove all listeners for this agent
+  for (const eventName of listeners) {
+    const fullEventName = `${agentId}:${eventName}`;
+    agentEventEmitter.removeAllListeners(fullEventName);
+    
+    loggers.perf.debug({ 
+      agentId: shortId(agentId), 
+      eventName 
+    }, 'Event listener removed');
+  }
+  
+  // Clear tracking
+  agentListeners.delete(agentId);
+  
+  loggers.perf.info({ 
+    agentId: shortId(agentId) 
+  }, 'All event listeners removed');
+}
+
+/**
+ * Get event listener statistics
+ * Phase 3C.3 - Memory leak prevention
+ */
+function getEventListenerStats() {
+  const stats = {};
+  let totalListeners = 0;
+  
+  for (const [agentId, listeners] of agentListeners.entries()) {
+    stats[shortId(agentId)] = listeners.size;
+    totalListeners += listeners.size;
+  }
+  
+  return {
+    totalAgents: agentListeners.size,
+    totalListeners,
+    averagePerAgent: agentListeners.size > 0 
+      ? (totalListeners / agentListeners.size).toFixed(2)
+      : 0,
+    agentBreakdown: stats
+  };
+}
+
+/**
+ * Message batch queue system
+ * Phase 3C.4 - Message processing optimization
+ * Queues messages for batch insertion to reduce database load
+ */
+const MESSAGE_BATCH_SIZE = 100;
+const MESSAGE_BATCH_TIMEOUT = 1000; // 1 second
+const messageBatchQueue = new Map(); // agentId -> messages[]
+const batchFlushTimers = new Map();  // agentId -> timer
+
+/**
+ * Queue a message for batch insertion
+ */
+function queueMessageForBatch(agentId, message) {
+  try {
+    // Initialize queue for agent if needed
+    if (!messageBatchQueue.has(agentId)) {
+      messageBatchQueue.set(agentId, []);
+    }
+    
+    const queue = messageBatchQueue.get(agentId);
+    queue.push(message);
+    
+    loggers.messages.debug({
+      agentId: shortId(agentId),
+      queueSize: queue.length,
+      batchSize: MESSAGE_BATCH_SIZE
+    }, 'Message queued for batch');
+    
+    // Clear existing timer
+    if (batchFlushTimers.has(agentId)) {
+      clearTimeout(batchFlushTimers.get(agentId));
+    }
+    
+    // Flush immediately if batch size reached
+    if (queue.length >= MESSAGE_BATCH_SIZE) {
+      loggers.messages.info({
+        agentId: shortId(agentId),
+        queueSize: queue.length
+      }, 'Batch size reached, flushing immediately');
+      
+      flushMessageBatch(agentId);
+      return;
+    }
+    
+    // Otherwise, schedule flush after timeout
+    const timer = setTimeout(() => {
+      loggers.messages.debug({
+        agentId: shortId(agentId),
+        queueSize: queue.length
+      }, 'Batch timeout reached, flushing');
+      
+      flushMessageBatch(agentId);
+    }, MESSAGE_BATCH_TIMEOUT);
+    
+    batchFlushTimers.set(agentId, timer);
+    
+  } catch (error) {
+    loggers.messages.error({
+      agentId: shortId(agentId),
+      error: error.message
+    }, 'Error queuing message');
+    
+    // Try to insert immediately as fallback
+    insertMessageImmediately(message);
+  }
+}
+
+/**
+ * Flush message batch for an agent
+ */
+async function flushMessageBatch(agentId) {
+  const messageTracker = new OperationTracker('message_batch_process', loggers.messages, 2000);
+  try {
+    const queue = messageBatchQueue.get(agentId);
+    
+    if (!queue || queue.length === 0) {
+      messageTracker.end({ messageCount: 0 });
+      return;
+    }
+    
+    // Clear timer
+    if (batchFlushTimers.has(agentId)) {
+      clearTimeout(batchFlushTimers.get(agentId));
+      batchFlushTimers.delete(agentId);
+    }
+    
+    // Get and clear queue
+    const messages = [...queue];
+    messageBatchQueue.set(agentId, []);
+    
+    loggers.messages.info({
+      agentId: shortId(agentId),
+      messageCount: messages.length
+    }, 'Flushing message batch');
+    
+    const startTime = Date.now();
+    
+    // Use existing batchInsert function
+    const result = await batchInsert('message_log', messages, MESSAGE_BATCH_SIZE);
+    
+    const duration = Date.now() - startTime;
+    
+    loggers.messages.info({
+      agentId: shortId(agentId),
+      inserted: result.inserted,
+      failed: result.failed,
+      duration,
+      throughput: `${(messages.length / (duration / 1000)).toFixed(2)} msg/s`
+    }, 'Message batch flushed');
+    
+  } catch (error) {
+    loggers.messages.error({
+      agentId: shortId(agentId),
+      error: error.message
+    }, 'Error flushing message batch');
+    
+    // Track error
+    errorTracker.trackError(error, {
+      agentId: shortId(agentId),
+      operation: 'message_processing'
+    });
+    
+    messageTracker.end({ messageCount: 0, error: error.message });
+    
+    // Try individual inserts as fallback
+    const queue = messageBatchQueue.get(agentId);
+    if (queue && queue.length > 0) {
+      for (const message of queue) {
+        await insertMessageImmediately(message);
+      }
+      messageBatchQueue.set(agentId, []);
+    }
+  }
+}
+
+/**
+ * Flush all pending message batches
+ */
+async function flushAllMessageBatches() {
+  loggers.messages.info({
+    agentCount: messageBatchQueue.size
+  }, 'Flushing all message batches');
+  
+  const flushPromises = [];
+  
+  for (const agentId of messageBatchQueue.keys()) {
+    flushPromises.push(flushMessageBatch(agentId));
+  }
+  
+  await Promise.allSettled(flushPromises);
+  
+  loggers.messages.info('All message batches flushed');
+}
+
+/**
+ * Insert message immediately (fallback)
+ */
+async function insertMessageImmediately(message) {
+  try {
+    const { error } = await supabaseAdmin
+      .from('message_log')
+      .insert(message);
+    
+    if (error) throw error;
+    
+    loggers.messages.debug({
+      messageId: message.id
+    }, 'Message inserted immediately');
+    
+  } catch (error) {
+    loggers.messages.error({
+      messageId: message.id,
+      error: error.message
+    }, 'Failed to insert message');
+  }
+}
 
 function emitAgentEvent(agentId, type, payload = {}) {
   agentEventEmitter.emit(`agent:${agentId}`, {
@@ -86,10 +745,127 @@ function emitAgentEvent(agentId, type, payload = {}) {
   });
 }
 
+/**
+ * Get user ID by agent ID (with caching)
+ * @param {string} agentId - Agent UUID
+ * @returns {Promise<string|null>} User ID or null
+ */
+async function getUserIdByAgentId(agentId) {
+  try {
+    // Check cache first
+    const cachedUserId = await sessionCache.getCachedUserId(agentId);
+    if (cachedUserId) {
+      loggers.database.debug({ 
+        agentId: shortId(agentId),
+        source: 'cache'
+      }, 'User ID from cache');
+      return cachedUserId;
+    }
+    
+    // Fetch from database
+    const { data, error } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('user_id')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    if (error) throw error;
+    if (!data) return null;
+    
+    // Cache for future use
+    await sessionCache.setCachedUserId(agentId, data.user_id)
+      .catch(cacheError => loggers.cache.warn({ error: cacheError.message }, 'Failed to cache user ID'));
+    
+    loggers.database.debug({ 
+      agentId: shortId(agentId),
+      source: 'database',
+      cached: true
+    }, 'User ID from database and cached');
+    
+    return data.user_id;
+    
+  } catch (error) {
+    loggers.database.error({ 
+      agentId: shortId(agentId),
+      error: error.message
+    }, 'Error fetching user ID');
+    return null;
+  }
+}
+
 function subscribeToAgentEvents(agentId, listener) {
   const key = `agent:${agentId}`;
   agentEventEmitter.on(key, listener);
+  trackListener(agentId, 'agent');
   return () => agentEventEmitter.off(key, listener);
+}
+
+/**
+ * Encrypt credentials using AES-256-GCM
+ * @param {Object} creds - Credentials object to encrypt
+ * @returns {Object} Encrypted data with iv and authTag
+ */
+function encryptCredentials(creds) {
+  try {
+    const iv = crypto.randomBytes(ENCRYPTION_CONFIG.ivLength);
+    const cipher = crypto.createCipheriv(
+      ENCRYPTION_CONFIG.algorithm,
+      Buffer.from(ENCRYPTION_CONFIG.key, 'hex'),
+      iv
+    );
+    
+    let encrypted = cipher.update(JSON.stringify(creds), 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    
+    const authTag = cipher.getAuthTag();
+    
+    return {
+      encrypted,
+      iv: iv.toString('hex'),
+      authTag: authTag.toString('hex'),
+      version: 1 // For future key rotation
+    };
+  } catch (error) {
+    loggers.security.error({
+      error: error.message,
+      stack: error.stack
+    }, 'Error encrypting credentials');
+    throw new Error('Credential encryption failed');
+  }
+}
+
+/**
+ * Decrypt credentials using AES-256-GCM
+ * @param {Object} encryptedData - Encrypted data with iv and authTag
+ * @returns {Object} Decrypted credentials object
+ */
+function decryptCredentials(encryptedData) {
+  try {
+    // Check if data is already decrypted (backward compatibility)
+    if (!encryptedData.encrypted || !encryptedData.iv || !encryptedData.authTag) {
+      loggers.security.warn({}, 'Credentials not encrypted, returning as-is (legacy data)');
+      return encryptedData;
+    }
+    
+    const decipher = crypto.createDecipheriv(
+      ENCRYPTION_CONFIG.algorithm,
+      Buffer.from(ENCRYPTION_CONFIG.key, 'hex'),
+      Buffer.from(encryptedData.iv, 'hex')
+    );
+    
+    decipher.setAuthTag(Buffer.from(encryptedData.authTag, 'hex'));
+    
+    let decrypted = decipher.update(encryptedData.encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    
+    return JSON.parse(decrypted);
+  } catch (error) {
+    loggers.security.error({
+      error: error.message,
+      stack: error.stack
+    }, 'Error decrypting credentials');
+    throw new Error('Credential decryption failed');
+  }
 }
 
 function getInboundMessageWebhook() {
@@ -162,6 +938,274 @@ async function checkIfRecentDashboardMessage({ content, fromNumber, timestamp, t
   } catch (error) {
     console.error('[BAILEYS][DUPLICATE-CHECK] Exception in checkIfRecentDashboardMessage:', error.message);
     return false; // On exception, allow webhook to be sent (fail open)
+  }
+}
+
+/**
+ * Batch insert records into database
+ * @param {string} table - Table name
+ * @param {Array} records - Array of records to insert
+ * @param {number} batchSize - Batch size (default from config)
+ * @returns {Promise<Object>} Result with success count
+ */
+async function batchInsert(table, records, batchSize = CONCURRENCY_CONFIG.batchSize) {
+  const tracker = new OperationTracker('batch_insert', loggers.database, 1000);
+  if (!records || records.length === 0) {
+    tracker.end({ table, records: 0, batches: 0, inserted: 0, failed: 0 });
+    return { success: true, inserted: 0 };
+  }
+
+  loggers.database.info({
+    table,
+    totalRecords: records.length,
+    batchSize
+  }, 'Starting batch insert');
+  
+  // Record batch size metric (for message batches)
+  if (table === 'message_log' && messageMetrics?.batchSize) {
+    recordMetric(() => {
+      messageMetrics.batchSize.observe(records.length);
+    });
+  }
+  
+  const startTime = Date.now();
+  let totalInserted = 0;
+  const errors = [];
+  
+  // Track query duration
+  const queryTimer = databaseMetrics?.queryDuration
+    ? databaseMetrics.queryDuration.startTimer({ operation: 'insert', table })
+    : null;
+
+  try {
+    // Process in batches
+    for (let i = 0; i < records.length; i += batchSize) {
+      const batch = records.slice(i, i + batchSize);
+      const batchNum = Math.floor(i / batchSize) + 1;
+      const totalBatches = Math.ceil(records.length / batchSize);
+      
+      try {
+        const { data, error } = await supabaseAdmin
+          .from(table)
+          .insert(batch);
+        
+        if (error) {
+          loggers.database.error({
+            table,
+            batch: batchNum,
+            totalBatches,
+            error: error.message
+          }, 'Batch insert failed');
+          errors.push({ batch: batchNum, error: error.message, records: batch.length });
+          
+          // Record failed query
+          recordMetric(() => {
+            if (databaseMetrics?.queryTotal) {
+              databaseMetrics.queryTotal.labels('insert', table, 'error').inc();
+            }
+          });
+        } else {
+          totalInserted += batch.length;
+          
+          // Record successful query
+          recordMetric(() => {
+            if (databaseMetrics?.queryTotal) {
+              databaseMetrics.queryTotal.labels('insert', table, 'success').inc();
+            }
+          });
+          
+          loggers.database.debug({
+            table,
+            batch: batchNum,
+            totalBatches,
+            inserted: batch.length
+          }, 'Batch inserted');
+        }
+      } catch (batchError) {
+        loggers.database.error({
+          table,
+          batch: batchNum,
+          totalBatches,
+          error: batchError.message,
+          stack: batchError.stack
+        }, 'Batch insert exception');
+        errors.push({ batch: batchNum, error: batchError.message, records: batch.length });
+      }
+    }
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    const successRate = ((totalInserted / records.length) * 100).toFixed(1);
+    
+    // Stop query timer
+    if (queryTimer) {
+      queryTimer();
+    }
+    
+    loggers.database.info({
+      table,
+      inserted: totalInserted,
+      total: records.length,
+      successRate: parseFloat(successRate),
+      durationSeconds: parseFloat(duration),
+      ratePerSecond: parseFloat((totalInserted / parseFloat(duration)).toFixed(0)),
+      errors: errors.length
+    }, 'Batch insert complete');
+
+    const result = {
+      success: errors.length === 0,
+      inserted: totalInserted,
+      failed: records.length - totalInserted,
+      duration: parseFloat(duration),
+      errors
+    };
+    
+    tracker.end({ 
+      table,
+      records: records.length, 
+      batches: Math.ceil(records.length / batchSize),
+      inserted: totalInserted,
+      failed: records.length - totalInserted
+    });
+    
+    return result;
+    
+  } catch (error) {
+    tracker.end({ 
+      table,
+      records: records.length,
+      inserted: totalInserted,
+      failed: records.length - totalInserted,
+      error: error.message
+    });
+    // Stop query timer on error
+    if (queryTimer) {
+      queryTimer();
+    }
+    
+    loggers.database.error({
+      table,
+      error: error.message,
+      stack: error.stack,
+      inserted: totalInserted
+    }, 'Fatal error in batch insert');
+    return {
+      success: false,
+      inserted: totalInserted,
+      error: error.message
+    };
+  }
+}
+
+/**
+ * Batch update records in database
+ * @param {string} table - Table name  
+ * @param {Array} updates - Array of {filter, data} objects
+ * @param {number} batchSize - Batch size
+ * @returns {Promise<Object>} Result with success count
+ */
+async function batchUpdate(table, updates, batchSize = CONCURRENCY_CONFIG.batchSize) {
+  const tracker = new OperationTracker('batch_update', loggers.database, 2000);
+  if (!updates || updates.length === 0) {
+    tracker.end({ table, records: 0, updated: 0, failed: 0 });
+    return { success: true, updated: 0 };
+  }
+
+  loggers.database.info({
+    table,
+    totalUpdates: updates.length
+  }, 'Starting batch update');
+  
+  const startTime = Date.now();
+  let totalUpdated = 0;
+  const errors = [];
+
+  try {
+    // Process updates in parallel with concurrency limit
+    const updateLimit = pLimit(10); // Limit concurrent updates
+    
+    const results = await Promise.allSettled(
+      updates.map((update, index) =>
+        updateLimit(async () => {
+          try {
+            const { data, error } = await supabaseAdmin
+              .from(table)
+              .update(update.data)
+              .match(update.filter);
+            
+            if (error) {
+              errors.push({ index, error: error.message });
+              return { success: false };
+            }
+            
+            return { success: true };
+          } catch (error) {
+            errors.push({ index, error: error.message });
+            return { success: false };
+          }
+        })
+      )
+    );
+
+    totalUpdated = results.filter(r => 
+      r.status === 'fulfilled' && r.value.success
+    ).length;
+
+    const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+    const successRate = ((totalUpdated / updates.length) * 100).toFixed(1);
+    
+    loggers.database.info({
+      table,
+      updated: totalUpdated,
+      total: updates.length,
+      successRate: parseFloat(successRate),
+      durationSeconds: parseFloat(duration),
+      errors: errors.length
+    }, 'Batch update complete');
+
+    const result = {
+      success: errors.length === 0,
+      updated: totalUpdated,
+      failed: updates.length - totalUpdated,
+      duration: parseFloat(duration),
+      errors
+    };
+    
+    tracker.end({ 
+      table,
+      records: updates.length,
+      updated: totalUpdated,
+      failed: updates.length - totalUpdated
+    });
+    
+    return result;
+    
+  } catch (error) {
+    tracker.end({ 
+      table,
+      records: updates.length,
+      updated: totalUpdated,
+      failed: updates.length - totalUpdated,
+      error: error.message
+    });
+    loggers.database.error({
+      table,
+      error: error.message,
+      stack: error.stack,
+      updated: totalUpdated
+    }, 'Fatal error in batch update');
+    const errorResult = {
+      success: false,
+      updated: totalUpdated,
+      error: error.message
+    };
+    tracker.end({ 
+      table,
+      records: updates.length,
+      updated: totalUpdated,
+      failed: updates.length - totalUpdated,
+      error: error.message
+    });
+    return errorResult;
   }
 }
 
@@ -530,6 +1574,7 @@ async function saveAudioFile(buffer, agentId, messageId, mimetype = 'audio/ogg')
 // Sync credentials from files to database
 // Called after every creds.update event to ensure database has latest credentials
 async function syncCredsToDatabase(agentId) {
+  const tracker = new OperationTracker('sync_credentials', loggers.database, 500);
   console.log(`[BAILEYS] 💾 Syncing credentials to database for ${agentId.substring(0, 40)}`);
   
   const authPath = path.join(__dirname, '../../auth_sessions', agentId);
@@ -546,12 +1591,14 @@ async function syncCredsToDatabase(agentId) {
         console.log(`[BAILEYS] 📁 Created auth directory for sync: ${authPath}`);
       } catch (mkdirError) {
         console.error(`[BAILEYS] ❌ Error creating auth directory for sync:`, mkdirError);
+        tracker.end({ agentId: shortId(agentId), success: false, reason: 'mkdir_failed' });
         return;
       }
     }
     
     if (!fs.existsSync(credsPath)) {
       console.log(`[BAILEYS] ℹ️ No credentials file to sync`);
+      tracker.end({ agentId: shortId(agentId), success: false, reason: 'no_creds_file' });
       return;
     }
     
@@ -568,6 +1615,7 @@ async function syncCredsToDatabase(agentId) {
     } catch (lockError) {
       console.error('[BAILEYS] ❌ Could not acquire file lock (file might be corrupted):', lockError.message);
       // Don't sync if we can't get lock - file might be mid-write
+      tracker.end({ agentId: shortId(agentId), success: false, reason: 'lock_failed' });
       return;
     }
     
@@ -576,6 +1624,7 @@ async function syncCredsToDatabase(agentId) {
     
     if (!rawCreds || rawCreds.trim().length === 0) {
       console.warn('[BAILEYS] ⚠️ Credentials file is empty - skipping sync');
+      tracker.end({ agentId: shortId(agentId), success: false, reason: 'empty_file' });
       return;
     }
     
@@ -584,27 +1633,66 @@ async function syncCredsToDatabase(agentId) {
       credsData = JSON.parse(rawCreds);
     } catch (parseError) {
       console.error('[BAILEYS] ❌ Failed to parse creds.json, skipping sync:', parseError.message);
+      tracker.end({ agentId: shortId(agentId), success: false, reason: 'parse_failed' });
       return;
     }
     
     // REMOVED: Strict validation - Baileys has already validated these credentials
     // Trust Baileys' internal format (Buffer objects, not base64 strings)
     
+    // Encrypt credentials before storing
+    const encryptedCreds = encryptCredentials(credsData);
+    
     // Save to database
     const { error } = await supabaseAdmin
       .from('whatsapp_sessions')
       .upsert({
         agent_id: agentId,
-        session_data: { creds: credsData },
+        session_data: { creds: encryptedCreds, encrypted: true }, // Mark as encrypted
         updated_at: new Date().toISOString()
       }, { onConflict: 'agent_id' });
       
     if (error) throw error;
     
-    console.log(`[BAILEYS] ✅ Credentials synced to database successfully`);
+    loggers.security.info({ agentId: shortId(agentId) }, 'Credentials encrypted');
+    loggers.database.info({ agentId: shortId(agentId) }, 'Credentials synced to database');
+    
+    // Update session cache after successful database sync
+    await sessionCache.setCachedCredentials(agentId, credsData)
+      .catch(error => loggers.cache.warn({ error: error.message }, 'Failed to update session cache'));
+    
+    loggers.database.debug({ 
+      agentId: shortId(agentId),
+      syncedToDb: true,
+      cached: true
+    }, 'Credentials synced to database and cache');
+    
+    tracker.end({ agentId: shortId(agentId), encrypted: true });
+    
+    // Cache credentials in Redis for faster access
+    if (redisCache.isReady()) {
+      await redisCache.cacheSession(agentId, encryptedCreds)
+        .catch(error => loggers.cache.warn({ error: error.message }, 'Failed to cache in Redis'));
+    }
     
   } catch (error) {
     console.error(`[BAILEYS] ❌ Error syncing to database:`, error);
+    
+    // Track error
+    errorTracker.trackError(error, {
+      agentId: shortId(agentId),
+      operation: 'sync_credentials'
+    });
+    
+    // Invalidate cache on sync failure
+    await sessionCache.invalidateSession(agentId)
+      .catch(cacheError => loggers.cache.warn({ error: cacheError.message }, 'Failed to invalidate cache'));
+    
+    loggers.database.error({ 
+      agentId: shortId(agentId),
+      error: error.message,
+      cacheInvalidated: true
+    }, 'Failed to sync credentials, cache invalidated');
   } finally {
     // Always release lock
     if (release) {
@@ -851,6 +1939,128 @@ function startHeartbeat(agentId, session) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Helper: Remove agent from active sessions and unassign from instance manager
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async function removeAgentFromActiveSessions(agentId) {
+  // Remove all event listeners for this agent
+  removeTrackedListeners(agentId);
+  
+  // Flush any pending message batches
+  await flushMessageBatch(agentId);
+  
+  loggers.messages.debug({
+    agentId: shortId(agentId)
+  }, 'Message batch flushed on cleanup');
+  
+  // Invalidate all caches for this agent
+  await sessionCache.invalidateSession(agentId)
+    .catch(error => loggers.cache.warn({ error: error.message }, 'Failed to invalidate session cache'));
+  
+  loggers.connection.debug({ 
+    agentId: shortId(agentId),
+    cacheCleared: true
+  }, 'Session cache invalidated on cleanup');
+  
+  // Clean up agent-specific cache entries
+  try {
+    // Clean validation cache entries for this agent
+    const validationKeys = Array.from(validationCache.keys());
+    for (const key of validationKeys) {
+      if (key.includes(agentId)) {
+        validationCache.delete(key);
+        loggers.perf.debug({ 
+          agentId: shortId(agentId), 
+          cacheKey: key 
+        }, 'Removed validation cache entry');
+      }
+    }
+    
+    // Clean LID cache entries for this agent
+    const lidKeys = Array.from(lidToPhoneCache.keys());
+    for (const key of lidKeys) {
+      if (key.includes(agentId)) {
+        lidToPhoneCache.delete(key);
+        loggers.perf.debug({ 
+          agentId: shortId(agentId), 
+          cacheKey: key 
+        }, 'Removed LID cache entry');
+      }
+    }
+    
+    // Clean session cache entry
+    SESSION_CACHE.delete(agentId);
+    
+    loggers.perf.debug({ 
+      agentId: shortId(agentId) 
+    }, 'Agent-specific cache entries cleaned');
+    
+  } catch (error) {
+    loggers.perf.error({ 
+      agentId: shortId(agentId), 
+      error: error.message 
+    }, 'Error cleaning agent cache entries');
+  }
+  
+  activeSessions.delete(agentId);
+  
+  // Unassign from instance manager
+  if (instanceManager.isActive) {
+    try {
+      await instanceManager.unassignAgent(agentId);
+    } catch (error) {
+      loggers.connection.warn({ error: error.message, agentId: shortId(agentId) }, 'Failed to unassign agent from instance');
+    }
+  }
+}
+
+/**
+ * Batch update session statuses
+ * Phase 3C.2 optimization
+ * @param {Array} updates - Array of {agentId, status, error?} objects
+ * @returns {Promise<Object>} {success: number, failed: number}
+ */
+async function batchUpdateSessionStatus(updates) {
+  if (!updates || updates.length === 0) return { success: 0, failed: 0 };
+  
+  try {
+    const limit = pLimit(10); // Max 10 concurrent updates
+    
+    const results = await Promise.allSettled(
+      updates.map(update =>
+        limit(async () => {
+          const { error } = await supabaseAdmin
+            .from('whatsapp_sessions')
+            .update({
+              status: update.status,
+              last_error: update.error || null,
+              updated_at: new Date().toISOString()
+            })
+            .eq('agent_id', update.agentId);
+          
+          if (error) throw error;
+          return { success: true, agentId: update.agentId };
+        })
+      )
+    );
+    
+    const successful = results.filter(r => r.status === 'fulfilled').length;
+    const failed = results.length - successful;
+    
+    loggers.database.info({
+      successful,
+      failed,
+      total: updates.length
+    }, 'Batch status update complete');
+    
+    return { success: successful, failed };
+    
+  } catch (error) {
+    loggers.database.error({ error: error.message }, 'Batch update failed');
+    return { success: 0, failed: updates.length };
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Cleanup all monitoring for an agent
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 function cleanupMonitoring(agentId) {
@@ -952,110 +2162,136 @@ async function backupCredentials(agentId) {
   }
 }
 
+// FIX 3: Smart status check to determine if credentials should be deleted
+// Returns true if credentials should be deleted, false if they should be kept
+async function shouldDeleteCredentials(agentId) {
+  try {
+    // Get current database status
+    const { data: agent, error } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status, updated_at')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    if (error) {
+      console.warn(`[BAILEYS] ⚠️ Error checking status for credential deletion:`, error.message);
+      // On error, be conservative and keep credentials
+      return false;
+    }
+    
+    if (!agent) {
+      // No agent record - safe to delete (fresh start)
+      return true;
+    }
+    
+    // If status is 'disconnected' AND last update was > 5 minutes ago
+    // Then it's a real disconnect, delete credentials
+    if (agent.status === 'disconnected') {
+      const lastUpdate = new Date(agent.updated_at);
+      const now = new Date();
+      const minutesSinceUpdate = (now - lastUpdate) / 1000 / 60;
+      
+      if (minutesSinceUpdate > 5) {
+        loggers.connection.info({
+          agentId: shortId(agentId),
+          minutesSinceUpdate: minutesSinceUpdate.toFixed(1)
+        }, 'Old disconnect detected, clearing credentials');
+        return true;
+      }
+      
+      loggers.connection.info({
+        agentId: shortId(agentId),
+        minutesSinceUpdate: minutesSinceUpdate.toFixed(1)
+      }, 'Recent disconnect, keeping credentials for reconnect');
+      return false;
+    }
+    
+    // For 'connected', 'authenticated', or other statuses, keep credentials
+    loggers.connection.debug({
+      agentId: shortId(agentId),
+      status: agent.status
+    }, 'Keeping credentials - status is not disconnected');
+    return false;
+  } catch (error) {
+    console.error(`[BAILEYS] ❌ Error in shouldDeleteCredentials:`, error.message);
+    // On error, be conservative and keep credentials
+    return false;
+  }
+}
+
 // Validate credential freshness before using existing credentials
 // Returns { valid: boolean, reason: string }
 async function validateCredentialFreshness(agentId, creds) {
   console.log(`[BAILEYS] 🔍 Validating credential freshness for ${agentId.substring(0, 40)}...`);
   
   try {
-    // CRITICAL: Add timeout to prevent hanging on slow database queries
-    const DB_QUERY_TIMEOUT_MS = 5000; // 5 seconds
-    
-    let sessionData, statusError;
-    try {
-      // Create timeout promise
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Database query timeout')), DB_QUERY_TIMEOUT_MS)
-      );
-      
-      // Race database query against timeout
-      const queryPromise = supabaseAdmin
-        .from('whatsapp_sessions')
-        .select('status, is_active, disconnected_at, updated_at')
-        .eq('agent_id', agentId)
-        .maybeSingle();
-      
-      const result = await Promise.race([queryPromise, timeoutPromise]);
-      sessionData = result.data;
-      statusError = result.error;
-    } catch (timeoutError) {
-      if (timeoutError.message === 'Database query timeout') {
-        console.error(`[BAILEYS] ❌ Database query timeout after ${DB_QUERY_TIMEOUT_MS}ms`);
-        // On timeout, be conservative and reject credentials
-        return {
-          valid: false,
-          reason: `Database query timeout - cannot verify credential freshness`
-        };
-      }
-      // Re-throw other errors
-      throw timeoutError;
-    }
+    // Simplified query without timeout complexity
+    const { data: sessionData, error: statusError } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status, is_active, disconnected_at, updated_at')
+      .eq('agent_id', agentId)
+      .maybeSingle();
     
     if (statusError) {
       console.warn(`[BAILEYS] ⚠️ Error checking session status:`, statusError);
-      // If we can't check status, be conservative and reject credentials
+      // On error, allow credentials (fail open for connection attempts)
       return {
-        valid: false,
-        reason: `Database status check failed: ${statusError.message}`
+        valid: true,
+        reason: 'Cannot verify status - allowing connection attempt'
       };
     }
     
     if (sessionData) {
-      // CRITICAL: If status is 'disconnected' or 'conflict', credentials are stale
+      // Check if disconnected recently
       if (sessionData.status === 'disconnected') {
-        console.log(`[BAILEYS] ❌ Credentials rejected: Session status is 'disconnected' (manual disconnect)`);
-        return {
-          valid: false,
-          reason: 'Session was manually disconnected - credentials are stale'
-        };
+        const disconnectTime = sessionData.disconnected_at 
+          ? new Date(sessionData.disconnected_at).getTime()
+          : new Date(sessionData.updated_at).getTime();
+        
+        const minutesSinceDisconnect = (Date.now() - disconnectTime) / 1000 / 60;
+        
+        // Only reject if disconnected > 30 minutes ago (more lenient)
+        if (minutesSinceDisconnect > 30) {
+          console.log(`[BAILEYS] ❌ Credentials rejected: Disconnected ${minutesSinceDisconnect.toFixed(1)} minutes ago`);
+          return {
+            valid: false,
+            reason: `Session was disconnected ${minutesSinceDisconnect.toFixed(0)} minutes ago`
+          };
+        } else {
+          console.log(`[BAILEYS] ✅ Recent disconnect (${minutesSinceDisconnect.toFixed(1)} min) - allowing credentials`);
+        }
       }
       
       if (sessionData.status === 'conflict') {
-        console.log(`[BAILEYS] ❌ Credentials rejected: Session status is 'conflict' (401/440 error)`);
+        console.log(`[BAILEYS] ❌ Credentials rejected: Session has conflict status`);
         return {
           valid: false,
           reason: 'Session has conflict status - credentials are invalidated'
         };
       }
-      
-      // Check if credentials are older than disconnect timestamp (if available)
-      if (sessionData.disconnected_at && creds) {
-        const disconnectTime = new Date(sessionData.disconnected_at).getTime();
-        // If we have a way to timestamp credentials, check them
-        // For now, we rely on status check above
-      }
     }
     
-    // Check 2: Credential structure - must have me.id to be valid
+    // Basic credential structure check
     if (!creds || typeof creds !== 'object') {
-      console.log(`[BAILEYS] ❌ Credentials rejected: Invalid structure (not an object)`);
+      console.log(`[BAILEYS] ❌ Credentials rejected: Invalid structure`);
       return {
         valid: false,
         reason: 'Invalid credential structure'
       };
     }
     
+    // Must have device ID to be valid
     if (!creds.me || !creds.me.id) {
-      console.log(`[BAILEYS] ❌ Credentials rejected: Missing device ID (me.id)`);
+      console.log(`[BAILEYS] ❌ Credentials rejected: Missing device ID`);
       return {
         valid: false,
         reason: 'Credentials missing device ID - not paired'
       };
     }
     
-    // Check 3: Registration state - if registered=false AND status is disconnected, credentials are stale
-    // Note: registered=false is normal after QR pairing, so we only check this in combination with status
-    if (creds.registered === false && sessionData?.status === 'disconnected') {
-      console.log(`[BAILEYS] ❌ Credentials rejected: Unregistered credentials from disconnected session`);
-      return {
-        valid: false,
-        reason: 'Unregistered credentials from disconnected session'
-      };
-    }
-    
     // All checks passed
     console.log(`[BAILEYS] ✅ Credentials validated: Fresh and valid`);
-    console.log(`[BAILEYS] Device ID: ${creds.me.id.split(':')[0]}, Registered: ${creds.registered}, Status: ${sessionData?.status || 'unknown'}`);
+    console.log(`[BAILEYS] Device ID: ${creds.me.id.split(':')[0]}, Status: ${sessionData?.status || 'unknown'}`);
     return {
       valid: true,
       reason: 'Credentials are fresh and valid'
@@ -1063,10 +2299,10 @@ async function validateCredentialFreshness(agentId, creds) {
     
   } catch (error) {
     console.error(`[BAILEYS] ❌ Error validating credentials:`, error);
-    // On error, be conservative and reject credentials
+    // On error, allow credentials (fail open)
     return {
-      valid: false,
-      reason: `Validation error: ${error.message}`
+      valid: true,
+      reason: `Validation error - allowing connection attempt: ${error.message}`
     };
   }
 }
@@ -1074,9 +2310,79 @@ async function validateCredentialFreshness(agentId, creds) {
 // Restore credentials from database to files
 // Called when local files don't exist but database might have saved credentials
 async function restoreCredsFromDatabase(agentId) {
-  console.log(`[BAILEYS] 🔄 Attempting to restore credentials from database...`);
+  const tracker = new OperationTracker('restore_credentials', loggers.database, 500);
+  const startTime = Date.now();
+  loggers.database.info({ agentId: shortId(agentId) }, 'Attempting to restore credentials from database');
   
   try {
+    // Step 1: Check session cache first (fastest, reduces DB queries by 70%)
+    try {
+      const cached = await sessionCache.getCachedCredentials(agentId);
+      if (cached) {
+        loggers.database.info({ 
+          agentId: shortId(agentId),
+          source: 'session-cache',
+          latency: Date.now() - startTime
+        }, 'Credentials restored from session cache');
+        
+        // Also cache in LRU for faster subsequent access
+        SESSION_CACHE.set(agentId, cached);
+        cacheStats.session.hits++;
+        recordMetric(() => {
+          if (cacheMetrics?.hits) {
+            cacheMetrics.hits.labels('session').inc();
+          }
+        });
+        
+        tracker.end({ agentId: shortId(agentId), cached: true, source: 'session-cache' });
+        return cached;
+      }
+      
+      loggers.database.debug({ agentId: shortId(agentId) }, 'Cache miss: credentials');
+    } catch (cacheError) {
+      loggers.cache.warn({ error: cacheError.message }, 'Session cache error, falling back to Redis');
+    }
+    
+    // Step 2: Try Redis cache (distributed)
+    if (redisCache.isReady()) {
+      try {
+        const redisCached = await redisCache.getSession(agentId);
+        if (redisCached) {
+          cacheStats.session.hits++;
+          loggers.cache.debug({ agentId: shortId(agentId), source: 'redis' }, 'Session cache hit');
+          
+          // Also cache in LRU for faster subsequent access
+          SESSION_CACHE.set(agentId, redisCached);
+          
+          tracker.end({ agentId: shortId(agentId), cached: true, source: 'redis' });
+          return redisCached;
+        }
+      } catch (error) {
+        loggers.cache.warn({ error: error.message }, 'Redis cache error, falling back to LRU');
+      }
+    }
+    
+    // Fall back to LRU cache (local)
+    const cached = SESSION_CACHE.get(agentId);
+    if (cached) {
+      cacheStats.session.hits++;
+      recordMetric(() => {
+        if (cacheMetrics?.hits) {
+          cacheMetrics.hits.labels('session').inc();
+        }
+      });
+      loggers.cache.debug({ agentId: shortId(agentId), source: 'lru' }, 'Session cache hit');
+      tracker.end({ agentId: shortId(agentId), cached: true, source: 'lru' });
+      return cached;
+    } else {
+      cacheStats.session.misses++;
+      recordMetric(() => {
+        if (cacheMetrics?.misses) {
+          cacheMetrics.misses.labels('session').inc();
+        }
+      });
+    }
+    
     // CRITICAL: Check session status first - don't restore if corrupted/conflict
     const { data: sessionStatus, error: statusError } = await supabaseAdmin
       .from('whatsapp_sessions')
@@ -1085,13 +2391,19 @@ async function restoreCredsFromDatabase(agentId) {
       .maybeSingle();
     
     if (statusError) {
-      console.error(`[BAILEYS] ⚠️ Error checking session status:`, statusError);
+      loggers.database.error({
+        agentId: shortId(agentId),
+        error: statusError.message
+      }, 'Error checking session status');
       // Continue to try restore, but log warning
     } else if (sessionStatus) {
       // Don't restore if session is in conflict or disconnected state
       if (sessionStatus.status === 'conflict' || sessionStatus.status === 'disconnected') {
-        console.log(`[BAILEYS] ⚠️ Session is in ${sessionStatus.status} state - skipping credential restore`);
-        console.log(`[BAILEYS] This indicates corrupted/invalid credentials - will generate fresh QR`);
+        loggers.database.warn({
+          agentId: shortId(agentId),
+          status: sessionStatus.status
+        }, 'Session in conflict/disconnected state - skipping credential restore');
+        tracker.end({ agentId: shortId(agentId), success: false, reason: 'conflict_state' });
         return false;
       }
     }
@@ -1105,22 +2417,45 @@ async function restoreCredsFromDatabase(agentId) {
     if (error) throw error;
     
     if (!data || !data.session_data?.creds) {
-      console.log(`[BAILEYS] ℹ️ No credentials in database to restore`);
+      loggers.database.info({ agentId: shortId(agentId) }, 'No credentials in database to restore');
+      tracker.end({ agentId: shortId(agentId), success: false, reason: 'no_credentials' });
       return false;
     }
     
+    // Get credentials and decrypt if encrypted
+    let creds = data.session_data.creds;
+    
+    // Decrypt if encrypted
+    if (data.session_data.encrypted) {
+      try {
+        creds = decryptCredentials(creds);
+        loggers.security.info({ agentId: shortId(agentId) }, 'Credentials decrypted');
+      } catch (error) {
+        loggers.security.error({
+          agentId: shortId(agentId),
+          error: error.message,
+          stack: error.stack
+        }, 'Failed to decrypt credentials');
+        tracker.end({ agentId: shortId(agentId), success: false, reason: 'decrypt_failed' });
+        return false;
+      }
+    }
+    
     // Validate credentials structure before restoring
-    const creds = data.session_data.creds;
     if (!creds || typeof creds !== 'object') {
-      console.log(`[BAILEYS] ⚠️ Invalid credentials structure in database - skipping restore`);
+      loggers.database.warn({ agentId: shortId(agentId) }, 'Invalid credentials structure in database - skipping restore');
+      tracker.end({ agentId: shortId(agentId), success: false, reason: 'invalid_structure' });
       return false;
     }
     
     // CRITICAL: Validate credential freshness before restoring
     const validation = await validateCredentialFreshness(agentId, creds);
     if (!validation.valid) {
-      console.log(`[BAILEYS] ⚠️ Credentials in database are stale: ${validation.reason}`);
-      console.log(`[BAILEYS] Will not restore - will generate fresh QR instead`);
+      loggers.database.warn({
+        agentId: shortId(agentId),
+        reason: validation.reason
+      }, 'Credentials in database are stale - will generate fresh QR instead');
+      tracker.end({ agentId: shortId(agentId), success: false, reason: 'stale_credentials' });
       return false;
     }
     
@@ -1135,12 +2470,47 @@ async function restoreCredsFromDatabase(agentId) {
     // Write credentials to file
     fs.writeFileSync(credsPath, JSON.stringify(creds, null, 2));
     
-    console.log(`[BAILEYS] ✅ Credentials restored from database to ${credsPath}`);
-    console.log(`[BAILEYS] Restored creds: has me=${!!creds.me}, registered=${creds.registered}`);
+    // Cache in session cache (primary), LRU (local), and Redis (distributed)
+    await sessionCache.setCachedCredentials(agentId, creds);
+    SESSION_CACHE.set(agentId, creds);
+
+    // Also cache in Redis for other instances
+    if (redisCache.isReady()) {
+      await redisCache.cacheSession(agentId, creds)
+        .catch(error => loggers.cache.warn({ error: error.message }, 'Failed to cache session in Redis'));
+    }
+
+    const queryTime = Date.now() - startTime;
+    loggers.database.info({ 
+      agentId: shortId(agentId),
+      source: 'database',
+      queryTime,
+      cached: true
+    }, 'Credentials restored from database and cached');
+    loggers.cache.debug({ agentId: shortId(agentId) }, 'Session cached in session cache, LRU and Redis');
     
-    return true;
+    loggers.database.info({
+      agentId: shortId(agentId),
+      hasMe: !!creds.me,
+      registered: creds.registered
+    }, 'Credentials restored from database');
+    
+    tracker.end({ agentId: shortId(agentId), cached: false, source: 'database' });
+    return creds;
   } catch (error) {
-    console.error(`[BAILEYS] ❌ Error restoring from database:`, error);
+    loggers.database.error({
+      agentId: shortId(agentId),
+      error: error.message,
+      stack: error.stack
+    }, 'Error restoring from database');
+    
+    // Track error
+    errorTracker.trackError(error, {
+      agentId: shortId(agentId),
+      operation: 'restore_credentials'
+    });
+    
+    tracker.end({ agentId: shortId(agentId), success: false });
     return false;
   }
 }
@@ -1213,7 +2583,7 @@ async function ensureAgentIsolation(agentId) {
       }
       
       // Clear from memory but DON'T clear database credentials
-      activeSessions.delete(agentId);
+      await removeAgentFromActiveSessions(agentId);
       qrGenerationTracker.delete(agentId);
       
       console.log(`[BAILEYS] ✅ Socket cleaned up - credentials preserved`);
@@ -1450,6 +2820,85 @@ async function cleanupStaleQRState(agentId) {
 }
 
 async function initializeWhatsApp(agentId, userId = null) {
+  // Check if agent should be handled by this instance (before main try block)
+  if (instanceManager.isActive) {
+    try {
+      const assignedInstance = await instanceManager.getAgentInstance(agentId);
+      
+      if (assignedInstance && assignedInstance !== instanceManager.instanceId) {
+        // Check if the assigned instance is still alive
+        const activeInstances = await instanceManager.getActiveInstances();
+        const isAssignedInstanceAlive = activeInstances.some(inst => inst.instanceId === assignedInstance);
+        
+        if (isAssignedInstanceAlive) {
+          loggers.connection.info({
+            agentId: shortId(agentId),
+            assignedTo: assignedInstance,
+            thisInstance: instanceManager.instanceId
+          }, 'Agent assigned to different active instance, skipping');
+          return { 
+            success: false, 
+            reason: 'agent_assigned_to_different_instance',
+            assignedInstance 
+          };
+        } else {
+          // Assigned instance is dead, clear assignment and allow takeover
+          loggers.connection.warn({
+            agentId: shortId(agentId),
+            assignedTo: assignedInstance,
+            thisInstance: instanceManager.instanceId
+          }, 'Assigned instance is dead, taking over agent');
+          
+          // Clear the stale assignment
+          await instanceManager.unassignAgent(agentId);
+          
+          // Also clear from database if instance tracking exists
+          try {
+            const { error: dbError } = await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({ 
+                instance_id: null,
+                status: 'disconnected'
+              })
+              .eq('agent_id', agentId);
+              
+            if (dbError) {
+              loggers.connection.warn({ error: dbError.message }, 'Failed to clear stale instance assignment from database');
+            }
+          } catch (dbErr) {
+            loggers.connection.warn({ error: dbErr.message }, 'Error clearing stale instance assignment');
+          }
+        }
+      }
+      
+      // Check if this instance can accept more agents
+      if (!instanceManager.canAcceptMoreAgents()) {
+        loggers.connection.warn({
+          agentId: shortId(agentId),
+          currentAgents: instanceManager.assignedAgentCount,
+          maxAgents: 200
+        }, 'Instance at capacity');
+        
+        // Find and suggest least loaded instance
+        const leastLoaded = await instanceManager.getLeastLoadedInstance();
+        return {
+          success: false,
+          reason: 'instance_at_capacity',
+          suggestedInstance: leastLoaded.instanceId
+        };
+      }
+      
+      // Assign agent to this instance
+      await instanceManager.assignAgent(agentId);
+    } catch (error) {
+      loggers.connection.warn({ error: error.message }, 'Instance manager check failed, continuing anyway');
+    }
+  }
+  
+  loggers.connection.info({ agentId: shortId(agentId) }, 'Starting WhatsApp initialization');
+  
+  try {
+    
   console.log(`\n[BAILEYS] ==================== INITIALIZATION START ====================`);
   console.log(`[BAILEYS] Initializing WhatsApp for agent: ${agentId.substring(0, 40)}`);
   console.log(`[BAILEYS] Node: ${process.version}, Platform: ${process.platform}`);
@@ -1528,7 +2977,6 @@ async function initializeWhatsApp(agentId, userId = null) {
     };
   }
   
-  try {
     // CRITICAL FIX: Cleanup stale QR states before checking
     await cleanupStaleQRState(agentId);
     
@@ -1584,7 +3032,7 @@ async function initializeWhatsApp(agentId, userId = null) {
         existingSession.socket.ev.removeAllListeners();
         existingSession.socket.end();
       }
-      activeSessions.delete(agentId);
+      await removeAgentFromActiveSessions(agentId);
       qrGenerationTracker.delete(agentId);
     }
 
@@ -1604,7 +3052,7 @@ async function initializeWhatsApp(agentId, userId = null) {
       qrGenerationTracker.delete(agentId);
       // Clear any stale session
       if (currentState) {
-        activeSessions.delete(agentId);
+        await removeAgentFromActiveSessions(agentId);
       }
     }
     
@@ -1612,54 +3060,63 @@ async function initializeWhatsApp(agentId, userId = null) {
       console.warn(`[BAILEYS] ⚠️ Error checking database status:`, dbStatusError);
     }
     
-    // CRITICAL: If status is 'disconnected', force fresh start (delete local files, clear DB)
+    // FIX 5: Use smart status check before deleting credentials
+    // Only delete if it's an old disconnect, not a recent pairing
     if (dbSessionStatus && dbSessionStatus.status === 'disconnected') {
-      console.log(`[BAILEYS] ⚠️ Database status is 'disconnected' - forcing fresh start`);
-      console.log(`[BAILEYS] This indicates a manual disconnect - all credentials must be cleared`);
+      const shouldDelete = await shouldDeleteCredentials(agentId);
       
-      // Delete local auth directory completely (with error handling)
-      const authPath = path.join(__dirname, '../../auth_sessions', agentId);
-      if (fs.existsSync(authPath)) {
-        console.log(`[BAILEYS] 🗑️ Deleting local auth directory (disconnected session)...`);
-        try {
-          fs.rmSync(authPath, { recursive: true, force: true });
-          console.log(`[BAILEYS] ✅ Local credentials deleted successfully`);
-        } catch (deleteError) {
-          console.error(`[BAILEYS] ❌ Failed to delete local auth directory:`, deleteError.message);
-          console.error(`[BAILEYS] Error details:`, deleteError);
-          // Continue anyway - database cleanup is more important
-          // User may need to manually delete directory if permissions issue
-        }
-      } else {
-        console.log(`[BAILEYS] ℹ️ No local auth directory to delete`);
-      }
-      
-      // Clear database session data completely
-      try {
-        const { error: dbClearError } = await supabaseAdmin
-          .from('whatsapp_sessions')
-          .update({
-            session_data: null,
-            qr_code: null,
-            qr_generated_at: null,
-            is_active: false,
-            status: 'disconnected',
-            updated_at: new Date().toISOString()
-          })
-          .eq('agent_id', agentId);
+      if (shouldDelete) {
+        console.log(`[BAILEYS] ⚠️ Database status is 'disconnected' (old) - forcing fresh start`);
+        console.log(`[BAILEYS] This indicates a manual disconnect - all credentials must be cleared`);
         
-        if (dbClearError) {
-          console.error(`[BAILEYS] ❌ Failed to clear database session data:`, dbClearError);
-          throw new Error(`Database cleanup failed: ${dbClearError.message}`);
+        // Delete local auth directory completely (with error handling)
+        const authPath = path.join(__dirname, '../../auth_sessions', agentId);
+        if (fs.existsSync(authPath)) {
+          console.log(`[BAILEYS] 🗑️ Deleting local auth directory (disconnected session)...`);
+          try {
+            fs.rmSync(authPath, { recursive: true, force: true });
+            console.log(`[BAILEYS] ✅ Local credentials deleted successfully`);
+          } catch (deleteError) {
+            console.error(`[BAILEYS] ❌ Failed to delete local auth directory:`, deleteError.message);
+            console.error(`[BAILEYS] Error details:`, deleteError);
+            // Continue anyway - database cleanup is more important
+            // User may need to manually delete directory if permissions issue
+          }
+        } else {
+          console.log(`[BAILEYS] ℹ️ No local auth directory to delete`);
         }
-        console.log(`[BAILEYS] ✅ Database cleared successfully`);
-      } catch (dbError) {
-        console.error(`[BAILEYS] ❌ Database cleanup error:`, dbError);
-        // Don't throw - allow initialization to continue with fresh QR
+        
+        // Clear database session data completely
+        try {
+          const { error: dbClearError } = await supabaseAdmin
+            .from('whatsapp_sessions')
+            .update({
+              session_data: null,
+              qr_code: null,
+              qr_generated_at: null,
+              is_active: false,
+              status: 'disconnected',
+              updated_at: new Date().toISOString()
+            })
+            .eq('agent_id', agentId);
+          
+          if (dbClearError) {
+            console.error(`[BAILEYS] ❌ Failed to clear database session data:`, dbClearError);
+            throw new Error(`Database cleanup failed: ${dbClearError.message}`);
+          }
+          console.log(`[BAILEYS] ✅ Database cleared successfully`);
+        } catch (dbError) {
+          console.error(`[BAILEYS] ❌ Database cleanup error:`, dbError);
+          // Don't throw - allow initialization to continue with fresh QR
+        }
+        
+        console.log(`[BAILEYS] ✅ Fresh start complete - will generate fresh QR`);
+        // Continue to fresh QR generation below
+      } else {
+        console.log(`[BAILEYS] ℹ️ Status is 'disconnected' but recent - keeping credentials for reconnect`);
+        // Don't delete credentials - they were just saved after pairing
+        // Continue to try authenticated connection
       }
-      
-      console.log(`[BAILEYS] ✅ Fresh start complete - will generate fresh QR`);
-      // Continue to fresh QR generation below
     }
     
     // Mark session as initializing in database before proceeding
@@ -1718,25 +3175,61 @@ async function initializeWhatsApp(agentId, userId = null) {
       if (!fs.existsSync(credsFile)) {
         console.log(`[BAILEYS] 🆕 No credentials file found locally`);
       } else if (dbSessionStatus?.status === 'disconnected') {
-        console.log(`[BAILEYS] ⚠️ Local credentials exist but status is 'disconnected' - ignoring local file`);
+        // FIX 1: Check if this is a RECENT disconnect after pairing (error 515)
+        const recentDisconnect = dbSessionStatus.updated_at 
+          ? (Date.now() - new Date(dbSessionStatus.updated_at).getTime()) < 60000 // Within last 60 seconds
+          : false;
+        
+        if (recentDisconnect) {
+          console.log(`[BAILEYS] ✅ Recent disconnect after pairing - KEEPING credentials for reconnection`);
+          // Use credentials from file
+          try {
+            const credsContent = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
+            const isPaired = credsContent.me && credsContent.me.id;
+            if (isPaired) {
+              console.log(`[BAILEYS] ✅ Found paired credentials - will use them`);
+              useFileAuth = true;
+            }
+          } catch (error) {
+            console.log(`[BAILEYS] ⚠️ Error reading credentials:`, error.message);
+          }
+        } else {
+          console.log(`[BAILEYS] ⚠️ Local credentials exist but status is 'disconnected' (old) - ignoring local file`);
+        }
       }
       
-      // CRITICAL: Only try to restore from database if status is NOT 'disconnected' or 'conflict'
-      if (dbSessionStatus && 
-          dbSessionStatus.status !== 'disconnected' && 
-          dbSessionStatus.status !== 'conflict') {
-        // CRITICAL: Try to restore from Supabase before generating new QR
-        console.log(`[BAILEYS] 🔍 Checking Supabase for backed-up credentials...`);
-        const restored = await restoreCredsFromDatabase(agentId);
+      // FIX 1 & 4: Check database status for reconnecting after pairing or pairing complete
+      if (!useFileAuth && dbSessionStatus) {
+        const isReconnectingAfterPairing = dbSessionStatus.status === 'reconnecting_after_pairing';
+        const isPairingComplete = dbSessionStatus.status === 'pairing_complete';
+        const isRecentPairing = dbSessionStatus.last_paired_at && 
+          (Date.now() - new Date(dbSessionStatus.last_paired_at).getTime()) < 300000; // Within 5 minutes
         
-        if (restored) {
-          console.log(`[BAILEYS] ✅ Credentials restored from Supabase - will use them`);
-          useFileAuth = true;
+        if (isReconnectingAfterPairing || isPairingComplete || isRecentPairing) {
+          // This is a recent pairing - try to restore credentials
+          console.log(`[BAILEYS] 🔍 Recent pairing detected - checking Supabase for credentials...`);
+          const restored = await restoreCredsFromDatabase(agentId);
+          
+          if (restored) {
+            console.log(`[BAILEYS] ✅ Credentials restored from Supabase - will use them`);
+            useFileAuth = true;
+          } else {
+            console.log(`[BAILEYS] ⚠️ No credentials in database - will generate QR`);
+          }
+        } else if (dbSessionStatus.status !== 'disconnected' && dbSessionStatus.status !== 'conflict') {
+          // Normal status - try to restore from database
+          console.log(`[BAILEYS] 🔍 Checking Supabase for backed-up credentials...`);
+          const restored = await restoreCredsFromDatabase(agentId);
+          
+          if (restored) {
+            console.log(`[BAILEYS] ✅ Credentials restored from Supabase - will use them`);
+            useFileAuth = true;
+          } else {
+            console.log(`[BAILEYS] 🆕 No credentials in Supabase either - will generate QR`);
+          }
         } else {
-          console.log(`[BAILEYS] 🆕 No credentials in Supabase either - will generate QR`);
+          console.log(`[BAILEYS] ⚠️ Status is '${dbSessionStatus.status}' (old disconnect) - skipping database restore, will generate fresh QR`);
         }
-      } else {
-        console.log(`[BAILEYS] ⚠️ Status is '${dbSessionStatus?.status || 'unknown'}' - skipping database restore, will generate fresh QR`);
       }
     }
 
@@ -1767,15 +3260,28 @@ async function initializeWhatsApp(agentId, userId = null) {
       // Create COMPLETELY FRESH state for QR generation  
       console.log(`[BAILEYS] 🆕 Creating fresh auth state for QR generation...`);
       
-      // Delete entire auth directory if it exists to ensure completely fresh start
+      // FIX 5: Only delete if credentials are truly invalid (old disconnect)
+      const minutesSinceUpdate = dbSessionStatus?.updated_at 
+        ? (Date.now() - new Date(dbSessionStatus.updated_at).getTime()) / 60000
+        : 999;
+      
       if (fs.existsSync(authPath)) {
-        console.log(`[BAILEYS] 🗑️ Deleting entire auth directory for completely fresh start...`);
-        fs.rmSync(authPath, { recursive: true, force: true });
+        if (minutesSinceUpdate > 10) {
+          // Old credentials (>10 min), safe to delete
+          console.log(`[BAILEYS] 🗑️ Deleting OLD auth directory (>10 min since update: ${minutesSinceUpdate.toFixed(1)} min)`);
+          fs.rmSync(authPath, { recursive: true, force: true });
+        } else {
+          // Recent activity, keep credentials
+          console.log(`[BAILEYS] ✅ Recent credentials exist (<10 min: ${minutesSinceUpdate.toFixed(1)} min) - keeping for reconnection`);
+          // Don't delete - credentials might be valid
+        }
       }
       
-      // Create fresh directory
-      fs.mkdirSync(authPath, { recursive: true });
-      console.log(`[BAILEYS] 📁 Created fresh auth directory`);
+      // Create directory if it doesn't exist or was deleted
+      if (!fs.existsSync(authPath)) {
+        fs.mkdirSync(authPath, { recursive: true });
+        console.log(`[BAILEYS] 📁 Created fresh auth directory`);
+      }
       
       // Load completely fresh state (no existing files)
       const authState = await useMultiFileAuthState(authPath);
@@ -1840,34 +3346,75 @@ async function initializeWhatsApp(agentId, userId = null) {
           throw new Error(`Auth directory does not exist after creation attempt: ${authPath}`);
         }
         
-        // CRITICAL: Use atomic write pattern to prevent file corruption
+        // FIX 2: Windows-safe atomic write pattern to prevent file corruption and permission errors
         const credsPath = path.join(authPath, 'creds.json');
-        const tempPath = path.join(authPath, `creds.json.tmp.${Date.now()}`);
+        const credsData = JSON.stringify(currentCreds, null, 2);
         
+        // Windows-safe atomic write with fallback logic
         try {
-          // Step 1: Write to temporary file first
-          const credsData = JSON.stringify(currentCreds, null, 2);
-          fs.writeFileSync(tempPath, credsData, { encoding: 'utf-8', flag: 'w' });
+          // Try direct write first (works if file isn't locked)
+          fs.writeFileSync(credsPath, credsData, { encoding: 'utf-8', flag: 'w' });
+          console.log(`[BAILEYS] ✅ Credentials saved directly to ${credsPath}`);
+        } catch (directError) {
+          // Fallback: write to temp file then rename (atomic)
+          const tempPath = path.join(authPath, `creds.json.tmp.${Date.now()}`);
           
-          // Step 2: Verify temp file is readable and valid JSON
-          const verifyData = fs.readFileSync(tempPath, 'utf-8');
-          JSON.parse(verifyData); // Will throw if invalid JSON
-          
-          // Step 3: Atomic rename (replaces old file safely)
-          fs.renameSync(tempPath, credsPath);
-          
-          console.log(`[BAILEYS] ✅ Credentials saved atomically to ${credsPath}`);
-          
-        } catch (writeError) {
-          // Clean up temp file if it exists
-          if (fs.existsSync(tempPath)) {
+          try {
+            // Step 1: Write to temporary file first
+            fs.writeFileSync(tempPath, credsData, { encoding: 'utf-8', flag: 'w' });
+            
+            // Step 2: Verify temp file is readable and valid JSON
+            const verifyData = fs.readFileSync(tempPath, 'utf-8');
+            JSON.parse(verifyData); // Will throw if invalid JSON
+            
+            // Step 3: Delete original if exists (Windows-safe)
             try {
-              fs.unlinkSync(tempPath);
+              if (fs.existsSync(credsPath)) {
+                fs.unlinkSync(credsPath);
+              }
             } catch (unlinkError) {
-              // Ignore cleanup errors
+              // If unlink fails, continue anyway - rename might still work
+              console.log(`[BAILEYS] ⚠️ Could not delete old creds file: ${unlinkError.message}`);
+            }
+            
+            // Step 4: Atomic rename (replaces old file safely)
+            try {
+              fs.renameSync(tempPath, credsPath);
+              console.log(`[BAILEYS] ✅ Credentials saved atomically to ${credsPath}`);
+            } catch (renameError) {
+              // Last resort: just overwrite directly
+              console.log(`[BAILEYS] ⚠️ Atomic rename failed (${renameError.message}), using direct overwrite`);
+              fs.writeFileSync(credsPath, credsData, { encoding: 'utf-8', flag: 'w' });
+              
+              // Clean up temp file
+              try {
+                fs.unlinkSync(tempPath);
+              } catch (e) {
+                // Ignore cleanup errors
+              }
+            }
+            
+          } catch (atomicError) {
+            // Last resort: just overwrite
+            console.error(`[BAILEYS] ⚠️ Atomic save failed (${atomicError.message}), using direct overwrite`);
+            
+            try {
+              fs.writeFileSync(credsPath, credsData, { encoding: 'utf-8', flag: 'w' });
+              console.log(`[BAILEYS] ✅ Credentials saved via direct overwrite`);
+            } catch (overwriteError) {
+              console.error(`[BAILEYS] ❌ All save methods failed: ${overwriteError.message}`);
+              throw overwriteError;
+            }
+            
+            // Clean up temp file if it exists
+            if (fs.existsSync(tempPath)) {
+              try {
+                fs.unlinkSync(tempPath);
+              } catch (e) {
+                // Ignore cleanup errors
+              }
             }
           }
-          throw writeError;
         }
         
         // Also save keys using original function
@@ -1900,19 +3447,41 @@ async function initializeWhatsApp(agentId, userId = null) {
     const hasDeviceId = !!state.creds?.me?.id;
     const hasSignalKeys = !!(state.creds?.noiseKey && state.creds?.signedIdentityKey);
     const hasPairedDevice = hasDeviceId && hasSignalKeys;
-    const shouldGenerateQR = !hasPairedDevice;
+    
+    // FIX 4: Check database status for reconnecting after pairing
+    const { data: sessionStatus } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status, last_paired_at')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    const justPairedRecently = sessionStatus?.last_paired_at 
+      ? (Date.now() - new Date(sessionStatus.last_paired_at).getTime()) < 300000 // 5 minutes
+      : false;
+    
+    const isReconnectingAfterPairing = 
+      sessionStatus?.status === 'reconnecting_after_pairing' ||
+      sessionStatus?.status === 'pairing_complete';
+    
+    // FIX 4: Use credentials if we have device ID OR if we just paired recently
+    const willUseCredentials = (hasPairedDevice && hasSignalKeys && hasDeviceId) || 
+                              (isReconnectingAfterPairing && justPairedRecently && hasSignalKeys);
+    
+    const shouldGenerateQR = !willUseCredentials;
     
     console.log('[BAILEYS] 🔍 Connection Strategy:', {
       hasDeviceId,
       hasSignalKeys,
       hasPairedDevice,
-      willUseCredentials: hasPairedDevice,
+      isReconnectingAfterPairing,
+      justPairedRecently,
+      willUseCredentials,
       willGenerateQR: shouldGenerateQR,
       deviceId: hasDeviceId ? state.creds.me.id.split(':')[0] : null
     });
     
-    // If we have paired device, clear QR trackers - expect direct connection
-    if (hasPairedDevice) {
+    // If we have paired device or are reconnecting after pairing, clear QR trackers - expect direct connection
+    if (willUseCredentials) {
       console.log('[BAILEYS] ✅ Using existing credentials - expecting direct connection (no QR)');
       qrGenerationTracker.delete(agentId);
     }
@@ -2125,6 +3694,88 @@ async function initializeWhatsApp(agentId, userId = null) {
         await saveCreds();
         
         console.log(`[BAILEYS] ✅ Credentials saved successfully`);
+        
+        // FIX 2: Detect "Just Paired" State - Track when pairing completes
+        // Detect if this is a fresh pairing (me field just got populated)
+        const session = activeSessions.get(agentId);
+        const wasPairedBefore = session?.wasPaired || false;
+        const isJustPaired = currentCreds.me && currentCreds.me.id && !wasPairedBefore;
+        
+        if (isJustPaired) {
+          const phoneNumber = currentCreds.me.id?.split(':')[0] || null;
+          const deviceId = currentCreds.me.id;
+          
+          // Mark session as paired
+          if (session) {
+            session.wasPaired = true;
+            session.lastPairingTime = Date.now();
+          }
+          
+          console.log(`[BAILEYS] 🎉 PAIRING COMPLETED - Device ID: ${deviceId}`);
+          console.log(`[BAILEYS] ℹ️ Expect 515 disconnect + reconnect using these credentials`);
+          
+          try {
+            // Update database to indicate pairing just completed
+            await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                status: 'pairing_complete',
+                phone_number: phoneNumber,
+                last_paired_at: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+            
+            // Also update agents table if it exists
+            try {
+              await supabaseAdmin
+                .from('agents')
+                .update({
+                  status: 'pairing_complete',
+                  phone_number: phoneNumber,
+                  last_paired_at: new Date().toISOString()
+                })
+                .eq('id', agentId);
+            } catch (agentsError) {
+              // agents table might not exist or have different schema - ignore
+              console.log(`[BAILEYS] ℹ️ Could not update agents table:`, agentsError.message);
+            }
+            
+            loggers.connection.info({
+              agentId: shortId(agentId),
+              phone: phoneNumber,
+              deviceId: deviceId.split(':')[0]
+            }, 'Pairing completed - expecting 515 reconnect');
+            
+          } catch (statusError) {
+            console.error(`[BAILEYS] ❌ Failed to update pairing status:`, statusError.message);
+            // Don't throw - credentials are saved, status update is secondary
+          }
+        } else if (currentCreds.me && currentCreds.me.id && currentCreds.registered !== false) {
+          // Already paired - normal credential update
+          const phoneNumber = currentCreds.me.id?.split(':')[0] || null;
+          
+          try {
+            await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                status: 'connected',
+                phone_number: phoneNumber,
+                is_active: true,
+                last_connected: new Date().toISOString(),
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+            
+            loggers.connection.info({
+              agentId: shortId(agentId),
+              phone: phoneNumber
+            }, 'Status updated to connected');
+          } catch (statusError) {
+            console.error(`[BAILEYS] ❌ Failed to update status:`, statusError.message);
+          }
+        }
+        
         console.log(`[BAILEYS] 🔐 ============ CREDS.UPDATE COMPLETE ============\n`);
       } catch (error) {
         console.error(`[BAILEYS] ❌ CRITICAL ERROR saving credentials:`, error.message);
@@ -2154,7 +3805,10 @@ async function initializeWhatsApp(agentId, userId = null) {
       qrAttempts: 0,
       connectedAt: null,
       failureReason: null,
-      failureAt: null
+      failureAt: null,
+      // FIX 2: Track pairing state
+      wasPaired: false,
+      lastPairingTime: null
     };
     
     activeSessions.set(agentId, sessionData);
@@ -2203,6 +3857,9 @@ async function initializeWhatsApp(agentId, userId = null) {
     // REMOVED: Health check interval - causes false disconnects
     // Baileys handles keepalive internally, we don't need to monitor it
 
+    // FIX 1: Create connectionTracker for this connection attempt
+    const connectionTracker = new OperationTracker('connection_establish', loggers.connection, 30000);
+    
     // Connection updates
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr, isNewLogin } = update;
@@ -2223,10 +3880,35 @@ async function initializeWhatsApp(agentId, userId = null) {
           // Connection closed during pairing (not QR timeout)
           console.log(`[BAILEYS] ⚠️ Connection closed during pairing - network issue or server rejection`);
         }
+        
+        // Record connection failure metric (skip QR timeout 515)
+        if (statusCode && statusCode !== 515) {
+          const reason = errorMessage || `status_${statusCode}`;
+          const isRetryable = !RECONNECTION_CONFIG.nonRetryableCodes.includes(statusCode);
+          recordMetric(() => {
+            if (connectionMetrics?.failures) {
+              connectionMetrics.failures.labels(
+                shortId(agentId),
+                reason.substring(0, 50), // Limit reason length
+                isRetryable ? 'true' : 'false'
+              ).inc();
+            }
+          });
+          
+          // Track error if there's an error object
+          if (lastDisconnect?.error) {
+            errorTracker.trackError(lastDisconnect.error, {
+              agentId: shortId(agentId),
+              operation: 'connection_close',
+              statusCode: statusCode
+            });
+          }
+        }
       }
 
       // Handle QR code - ONLY process if we don't have valid paired credentials
       if (qr) {
+        const qrTracker = new OperationTracker('qr_generation', loggers.qr, 5000);
         const session = activeSessions.get(agentId);
         const qrAttempt = session ? session.qrAttempts + 1 : 1;
 
@@ -2247,11 +3929,18 @@ async function initializeWhatsApp(agentId, userId = null) {
           session.connectionState = 'qr_pending';
         }
         
-        // Log QR generation concisely
-        console.log(`[BAILEYS] 📱 QR Code #${qrAttempt} - scan within 60s`);
+        loggers.qr.info({ agentId: shortId(agentId) }, 'QR code generated');
+        
+        // Store QR in session
+        if (session) {
+          session.qrCode = qr;
+          session.qrGeneratedAt = Date.now();
+          session.qrAttempts = qrAttempt;
+        }
         
         qrGenerationTracker.set(agentId, Date.now());
         
+        // Update database with QR code
         try {
           await supabaseAdmin
             .from('whatsapp_sessions')
@@ -2265,14 +3954,20 @@ async function initializeWhatsApp(agentId, userId = null) {
             }, {
               onConflict: 'agent_id'
             });
-          
-          if (session) {
-            session.qrCode = qr;
-            session.qrGeneratedAt = Date.now();
-            session.qrAttempts = qrAttempt;
-          }
-          
+        } catch (error) {
+          console.error(`[BAILEYS] ❌ Error saving QR:`, error);
+        }
+        
+        // Cache QR code in Redis for cross-instance access
+        if (redisCache.isReady()) {
+          await redisCache.cacheQRCode(agentId, qr)
+            .catch(error => loggers.cache.warn({ error: error.message }, 'Failed to cache QR in Redis'));
+        }
+        
+        // Emit QR code event
           emitAgentEvent(agentId, 'qr', { qr, attempt: qrAttempt });
+          
+          qrTracker.end({ agentId: shortId(agentId) });
           
           // ━━━ SOCKET.IO EMISSION FOR REAL-TIME QR ━━━
           try {
@@ -2289,10 +3984,86 @@ async function initializeWhatsApp(agentId, userId = null) {
             }
           } catch (socketError) {
             // Socket.IO not critical - frontend can still poll
+        }
+        
+        // ============================================
+        // NEW: QR Code Expiration Logic
+        // ============================================
+        
+        // Clear any existing QR expiration timer
+        const existingQrTimer = QR_EXPIRATION_TIMERS.get(agentId);
+        if (existingQrTimer) {
+          clearTimeout(existingQrTimer);
+        }
+        
+        // Set 180-second expiration timer (3 minutes - WhatsApp QR typically valid for 2-3 min)
+        const qrTimerId = setTimeout(async () => {
+          try {
+            const currentSession = activeSessions.get(agentId);
+            
+            // Only clear if still not connected and QR hasn't changed
+            if (currentSession && !currentSession.isConnected && currentSession.qrCode === qr) {
+              loggers.qr.info({ agentId: shortId(agentId) }, 'QR code expired, clearing for regeneration');
+              
+              // Clear QR from session
+              currentSession.qrCode = null;
+              currentSession.qrGeneratedAt = null;
+              
+              // Clear QR from database
+              await supabaseAdmin
+                .from('whatsapp_sessions')
+                .update({ 
+                  qr_code: null,
+                  qr_generated_at: null,
+                  updated_at: new Date().toISOString()
+                })
+                .eq('agent_id', agentId);
+              
+              // Emit expiration event
+              emitAgentEvent(agentId, 'qr-expired', { agentId });
+              
+              loggers.qr.info({ agentId: shortId(agentId) }, 'QR cleared, new QR will be generated on next connection attempt');
           }
         } catch (error) {
-          console.error(`[BAILEYS] ❌ Error saving QR:`, error);
+            loggers.qr.error({
+              agentId: shortId(agentId),
+              error: error.message,
+              stack: error.stack
+            }, 'Error clearing expired QR');
+          } finally {
+            // Clean up timer reference
+            QR_EXPIRATION_TIMERS.delete(agentId);
+          }
+        }, 180000); // 180 seconds = 3 minutes (WhatsApp QR typically valid for 2-3 min)
+        
+        QR_EXPIRATION_TIMERS.set(agentId, qrTimerId);
+        
+        loggers.qr.debug({ agentId: shortId(agentId), expiresIn: 180 }, 'QR will expire in 180 seconds');
+        
+        // Enhanced QR logging
+        console.log(`[BAILEYS] ========== QR CODE DETAILS ==========`);
+        console.log(`[BAILEYS] Agent: ${agentId.substring(0, 8)}...`);
+        console.log(`[BAILEYS] QR Generated: ${new Date().toISOString()}`);
+        console.log(`[BAILEYS] QR Length: ${qr.length} characters`);
+        console.log(`[BAILEYS] Socket State: ${session?.socket?.ws?.readyState ?? 'unknown'}`);
+        console.log(`[BAILEYS] =====================================`);
+      }
+
+      // Enhanced logging for connection state changes
+      if (connection) {
+        console.log(`\n[BAILEYS] ========== CONNECTION STATE CHANGE ==========`);
+        console.log(`[BAILEYS] Agent: ${agentId.substring(0, 8)}...`);
+        console.log(`[BAILEYS] New State: ${connection}`);
+        console.log(`[BAILEYS] Timestamp: ${new Date().toISOString()}`);
+        
+        if (lastDisconnect) {
+          const statusCode = lastDisconnect?.error?.output?.statusCode;
+          const errorMsg = lastDisconnect?.error?.message || 'none';
+          console.log(`[BAILEYS] Status Code: ${statusCode || 'none'}`);
+          console.log(`[BAILEYS] Error: ${errorMsg}`);
         }
+        
+        console.log(`[BAILEYS] =======================================\n`);
       }
 
       // Connection connecting state
@@ -2302,6 +4073,7 @@ async function initializeWhatsApp(agentId, userId = null) {
 
       // Connection success
       if (connection === 'open') {
+        connectionTracker.end({ agentId: shortId(agentId), success: true });
         console.log(`\n[BAILEYS] ========== 🎉 CONNECTION SUCCESS 🎉 ==========`);
         
         qrGenerationTracker.delete(agentId);
@@ -2309,13 +4081,19 @@ async function initializeWhatsApp(agentId, userId = null) {
         
         // CRITICAL: Clear 401 failure timestamp on successful connection
         last401Failure.delete(agentId);
-        console.log(`[BAILEYS] ✅ 401 failure cooldown cleared - connection successful`);
+        loggers.connection.info({ agentId: shortId(agentId) }, '401 failure cooldown cleared - connection successful');
         
         const phoneNumber = sock.user?.id || 'Unknown';
         const cleanPhone = phoneNumber.split(':')[0].replace('@s.whatsapp.net', '');
         
-        console.log(`[BAILEYS] 📱 User:`, sock.user);
-        console.log(`[BAILEYS] 📞 Phone: ${cleanPhone}`);
+        loggers.connection.debug({
+          agentId: shortId(agentId),
+          userId: sock.user?.id
+        }, 'User connected');
+        loggers.connection.info({
+          agentId: shortId(agentId),
+          phone: cleanPhone
+        }, 'Phone number identified');
         
         try {
           // CRITICAL: Use upsert to ensure row exists, and set status field
@@ -2344,9 +4122,13 @@ async function initializeWhatsApp(agentId, userId = null) {
           if (updateError) {
             console.error(`[BAILEYS] ❌ DB update error:`, updateError);
           } else {
-            console.log(`[BAILEYS] ✅ Database updated with upsert`);
-            console.log(`[BAILEYS] ✅ status = 'connected', is_active = TRUE`);
-            console.log(`[BAILEYS] ✅ Phone: ${cleanPhone}`);
+            loggers.database.info({ agentId: shortId(agentId) }, 'Database updated with upsert');
+            loggers.connection.info({
+              agentId: shortId(agentId),
+              phone: cleanPhone,
+              status: 'connected',
+              isActive: true
+            }, 'Connection status updated');
           }
           
           const session = activeSessions.get(agentId);
@@ -2384,12 +4166,45 @@ async function initializeWhatsApp(agentId, userId = null) {
             console.error(`[BAILEYS] Socket.IO emit error:`, socketError.message);
           }
           
-          console.log(`[BAILEYS] 🎊 WhatsApp fully connected`);
-          console.log(`[BAILEYS] ========== CONNECTION COMPLETE ==========\n`);
+          loggers.connection.info({
+            agentId: shortId(agentId),
+            phone: cleanPhone
+          }, 'WhatsApp fully connected');
+          
+          // Warm cache with connection data
+          await sessionCache.setCachedUserId(agentId, userId || null)
+            .catch(error => loggers.cache.warn({ error: error.message }, 'Failed to cache user ID'));
+          
+          if (cleanPhone) {
+            await sessionCache.setCachedPhoneNumber(agentId, cleanPhone)
+              .catch(error => loggers.cache.warn({ error: error.message }, 'Failed to cache phone number'));
+          }
+          
+          await sessionCache.setCachedMetadata(agentId, {
+            connectedAt: Date.now(),
+            phoneNumber: cleanPhone,
+            status: 'connected'
+          }).catch(error => loggers.cache.warn({ error: error.message }, 'Failed to cache metadata'));
+          
+          loggers.connection.debug({ 
+            agentId: shortId(agentId),
+            cached: true
+          }, 'Session data cached on connection');
           
           // CRITICAL: Release initialization lock now that connection is established
           connectionLocks.delete(agentId);
-          console.log(`[BAILEYS] 🔓 Initialization lock released (connected)`);
+          loggers.connection.debug({ agentId: shortId(agentId) }, 'Initialization lock released');
+          
+          // ━━━ CLEAR RECONNECTION STATE ON SUCCESSFUL CONNECTION ━━━
+          clearReconnectionState(agentId);
+          
+          // ━━━ CLEAR QR EXPIRATION TIMER ON SUCCESSFUL CONNECTION ━━━
+          const qrTimerId = QR_EXPIRATION_TIMERS.get(agentId);
+          if (qrTimerId) {
+            clearTimeout(qrTimerId);
+            QR_EXPIRATION_TIMERS.delete(agentId);
+            loggers.qr.debug({ agentId: shortId(agentId) }, 'Cleared QR expiration timer - connection successful');
+          }
           
           // ━━━ CONTACT SYNCHRONIZATION ━━━
           // Sync WhatsApp contacts when connection is established
@@ -2436,35 +4251,59 @@ async function initializeWhatsApp(agentId, userId = null) {
 
       // Connection close
       if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const reason = lastDisconnect?.error?.message;
-        const payload = lastDisconnect?.error?.output?.payload;
-        const data = lastDisconnect?.error?.data;
-        const wsCloseEvent = sock?.ws && typeof sock.ws === 'object' && 'closeEvent' in sock.ws ? sock.ws.closeEvent : null;
+        const reason = lastDisconnect?.error?.output?.payload?.message || lastDisconnect?.error?.message || 'Unknown';
         const session = activeSessions.get(agentId);
 
+        console.log(`[BAILEYS] 🔌 Connection closed for ${agentId.substring(0, 8)}`);
+        console.log(`[BAILEYS] Status code: ${statusCode}, Reason: ${reason}`);
+        
+        // Update session state
         if (session) {
           session.isConnected = false;
-          session.connectionState = 'closed';
-          session.socketReadyState = session.socket?.ws?.readyState ?? null;
-        }
-
-        console.log(`\n[BAILEYS] ========== CONNECTION CLOSED ==========`);
-        console.log(`[BAILEYS] Code: ${statusCode}, Reason: ${reason}`);
-        if (payload) {
-          console.log(`[BAILEYS] Payload: ${JSON.stringify(payload)}`);
-        }
-        if (data) {
-          console.log(`[BAILEYS] Data: ${JSON.stringify(data)}`);
-        }
-        if (wsCloseEvent) {
-          console.log(`[BAILEYS] WS Close Event:`, wsCloseEvent);
-        }
-        if (session) {
-          session.connectionState = 'closed';
-          session.socketReadyState = session.socket?.ws?.readyState ?? null;
+          session.connectionState = 'close';
         }
         
+        // Clear health check interval
+        if (healthCheckIntervals.has(agentId)) {
+          clearInterval(healthCheckIntervals.get(agentId));
+          healthCheckIntervals.delete(agentId);
+        }
+        
+        // Update database status
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({ 
+            status: 'disconnected',
+            is_active: false,
+            disconnected_at: new Date().toISOString(),
+            last_error: `Connection closed: ${statusCode} - ${reason}`,
+            updated_at: new Date().toISOString()
+          })
+          .eq('agent_id', agentId);
+        
+        // ============================================
+        // NEW: Automatic Reconnection Logic
+        // ============================================
+        
+        // Determine if we should attempt reconnection
+        if (statusCode !== DisconnectReason.loggedOut && shouldReconnect) {
+          console.log(`[BAILEYS] 🔄 Triggering automatic reconnection for ${agentId.substring(0, 8)}`);
+          
+          // Trigger reconnection with exponential backoff
+          attemptReconnection(agentId, statusCode, reason);
+        } else {
+          console.log(`[BAILEYS] ⏹️  Not reconnecting agent ${agentId.substring(0, 8)} - logged out or permanent failure`);
+          
+          // Clear any pending reconnection attempts
+          clearReconnectionState(agentId);
+          
+          // Remove from active sessions
+          await removeAgentFromActiveSessions(agentId);
+        }
+        
+        // Emit disconnected event
         emitAgentEvent(agentId, 'disconnected', {
           reason,
           statusCode
@@ -2506,7 +4345,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           }
           
           // Clear from active sessions but don't delete from DB (let user retry)
-          activeSessions.delete(agentId);
+          await removeAgentFromActiveSessions(agentId);
           qrGenerationTracker.delete(agentId);
           connectionLocks.delete(agentId); // Release lock
           
@@ -2547,7 +4386,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           }
           
           // Remove from active sessions
-          activeSessions.delete(agentId);
+          await removeAgentFromActiveSessions(agentId);
           qrGenerationTracker.delete(agentId);
           connectionLocks.delete(agentId);
           
@@ -2604,16 +4443,70 @@ async function initializeWhatsApp(agentId, userId = null) {
           return;
         }
         
-        // Error 515 - Restart Required (EXPECTED after QR pairing!)
+        // FIX 4: Error 515 - Restart Required (EXPECTED after QR pairing!)
+        // FIX 3: Error 515 - Restart Required (EXPECTED after QR pairing!)
         if (statusCode === 515) {
           console.log(`[BAILEYS] 🔄 Error 515 - Restart required (EXPECTED after QR pairing)`);
           
+          // Check if pairing just happened (within last 2 minutes)
+          const session = activeSessions.get(agentId);
+          const lastPairingTime = session?.lastPairingTime;
+          const justPaired = lastPairingTime && (Date.now() - lastPairingTime) < 120000; // Within 2 minutes
+          
+          // Also check database for pairing status
+          const { data: agent } = await supabaseAdmin
+            .from('whatsapp_sessions')
+            .select('status, last_paired_at, updated_at')
+            .eq('agent_id', agentId)
+            .maybeSingle();
+          
+          const dbJustPaired = agent?.last_paired_at && 
+            (Date.now() - new Date(agent.last_paired_at).getTime()) < 120000; // Within 2 minutes
+          
+          const isPairingComplete = agent?.status === 'pairing_complete' || agent?.status === 'reconnecting_after_pairing';
+          
+          if (justPaired || dbJustPaired || isPairingComplete) {
+            console.log(`[BAILEYS] ✅ 515 after fresh pairing - KEEPING credentials for reconnection`);
+            console.log(`[BAILEYS] ℹ️ Will reconnect using saved credentials (no new QR)`);
+            
+            // Don't mark as disconnected! Keep status as 'reconnecting_after_pairing'
+            await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                status: 'reconnecting_after_pairing',
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+          } else {
+            // Normal 515 error, not after pairing
+            console.log(`[BAILEYS] ⚠️ 515 without recent pairing - marking disconnected`);
+            
+            const lastUpdate = agent?.updated_at ? new Date(agent.updated_at).getTime() : 0;
+            const minutesSinceUpdate = (Date.now() - lastUpdate) / 1000 / 60;
+            
+            if (minutesSinceUpdate > 5) {
+              // Old disconnect - update status
+              await supabaseAdmin
+                .from('whatsapp_sessions')
+                .update({
+                  status: 'disconnected',
+                  is_active: false,
+                  disconnected_at: new Date().toISOString()
+                })
+                .eq('agent_id', agentId);
+              console.log(`[BAILEYS] ℹ️ Updated status to disconnected (old disconnect)`);
+            } else {
+              console.log(`[BAILEYS] ℹ️ Recent disconnect, keeping status for reconnect`);
+            }
+          }
+          
           // Remove from memory to force clean restart
-          activeSessions.delete(agentId);
+          await removeAgentFromActiveSessions(agentId);
           qrGenerationTracker.delete(agentId);
           connectionLocks.delete(agentId); // Release lock before reconnect
           
           // Use smart reconnection (515 is expected, so start with attempt 1)
+          // Don't clear credentials - they were just saved after pairing
           const { handleSmartReconnection } = require('../utils/reconnectionManager');
           
           // Wait 3 seconds then reconnect (give WhatsApp time to register credentials)
@@ -2690,7 +4583,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           }
           
           // Remove from memory
-          activeSessions.delete(agentId);
+          await removeAgentFromActiveSessions(agentId);
           connectionLocks.delete(agentId);
           last401Failure.set(agentId, Date.now());
           
@@ -2787,7 +4680,7 @@ async function initializeWhatsApp(agentId, userId = null) {
 
           // Remove from active sessions IMMEDIATELY to stop health check
           // Health check checks if session exists, so deleting it stops the loop
-          activeSessions.delete(agentId);
+          await removeAgentFromActiveSessions(agentId);
           console.log(`[BAILEYS] ✅ Session removed from active sessions`);
 
           connectionLocks.delete(agentId);
@@ -2862,7 +4755,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           }
 
           // Remove from active sessions
-          activeSessions.delete(agentId);
+          await removeAgentFromActiveSessions(agentId);
           console.log(`[BAILEYS] ✅ Session removed from active sessions`);
 
           connectionLocks.delete(agentId);
@@ -2999,6 +4892,9 @@ async function initializeWhatsApp(agentId, userId = null) {
         return;
       }
 
+      // Messages will be queued individually via queueMessageForBatch()
+      // No need to collect in array - queue handles batching automatically
+
       const shouldProcessMessage = (message) => {
         const remoteJid = message?.key?.remoteJid || '';
 
@@ -3075,6 +4971,27 @@ async function initializeWhatsApp(agentId, userId = null) {
         const messageId = msg?.key?.id || 'unknown';
         const direction = fromMe ? '📤 Outgoing' : '📨 Incoming';
         const participant = fromMe ? 'to' : 'from';
+        
+        // Record message received metric
+        if (!fromMe) {
+          // Determine message type for metrics
+          let messageType = 'unknown';
+          if (msg.message?.conversation) messageType = 'text';
+          else if (msg.message?.imageMessage) messageType = 'image';
+          else if (msg.message?.videoMessage) messageType = 'video';
+          else if (msg.message?.audioMessage) messageType = 'audio';
+          else if (msg.message?.documentMessage) messageType = 'document';
+          else if (msg.message?.stickerMessage) messageType = 'sticker';
+          else if (msg.message?.locationMessage) messageType = 'location';
+          else if (msg.message?.contactMessage) messageType = 'contact';
+          else if (msg.message?.extendedTextMessage) messageType = 'text';
+          
+          recordMetric(() => {
+            if (messageMetrics?.received) {
+              messageMetrics.received.labels(shortId(agentId), messageType).inc();
+            }
+          });
+        }
 
         const participantJid =
           msg?.key?.participant ||
@@ -3296,9 +5213,23 @@ async function initializeWhatsApp(agentId, userId = null) {
         if (remoteJid.endsWith('@lid')) {
           // CRITICAL: Check cache FIRST (fastest method - populated by custom logger intercepting protocol)
           let senderPn = null;
-          if (lidToPhoneCache.has(remoteJid)) {
-            senderPn = lidToPhoneCache.get(remoteJid);
-            console.log(`[BAILEYS] ✅ Found sender_pn in cache for ${remoteJid}: ${senderPn}`);
+          const cached = lidToPhoneCache.get(remoteJid);
+          if (cached !== undefined) {
+            cacheStats.lidToPhone.hits++;
+            recordMetric(() => {
+              if (cacheMetrics?.hits) {
+                cacheMetrics.hits.labels('lidToPhone').inc();
+              }
+            });
+            senderPn = cached;
+            loggers.database.debug({ remoteJid }, 'Found sender_pn in cache');
+          } else {
+            cacheStats.lidToPhone.misses++;
+            recordMetric(() => {
+              if (cacheMetrics?.misses) {
+                cacheMetrics.misses.labels('lidToPhone').inc();
+              }
+            });
           }
           
           // Method 1: Check msg.key.attrs (if not in cache)
@@ -3402,10 +5333,17 @@ async function initializeWhatsApp(agentId, userId = null) {
             }
             
             // Method 4: Check cache (populated by logger interceptor)
-            if (!peerRecipientPn && lidToPhoneCache.has(remoteJid)) {
-              actualRecipientJid = lidToPhoneCache.get(remoteJid);
-              console.log(`[BAILEYS] ✅ Found peer_recipient_pn in cache for ${remoteJid}: ${actualRecipientJid}`);
-            } else if (peerRecipientPn) {
+            if (!peerRecipientPn) {
+              const cached = lidToPhoneCache.get(remoteJid);
+              if (cached !== undefined) {
+                cacheStats.lidToPhone.hits++;
+                actualRecipientJid = cached;
+                loggers.database.debug({ remoteJid }, 'Found peer_recipient_pn in cache');
+              } else {
+                cacheStats.lidToPhone.misses++;
+              }
+            }
+            if (peerRecipientPn) {
               // Convert peer_recipient_pn to proper JID format
               actualRecipientJid = peerRecipientPn.includes('@') ? peerRecipientPn : `${peerRecipientPn}@s.whatsapp.net`;
               // Cache it for future use
@@ -3797,34 +5735,8 @@ async function initializeWhatsApp(agentId, userId = null) {
           source: messageSource, // Set based on isDashboardMessage or isIncomingWhatsApp
         };
 
-        try {
-          const { error: insertError } = await supabaseAdmin.from('message_log').insert(dbPayload);
-          if (insertError) {
-            // Check if it's a duplicate key error (message_id already exists)
-            if (insertError.code === '23505' || insertError.message?.includes('duplicate key') || insertError.message?.includes('unique constraint')) {
-              console.log(`[BAILEYS][DB] ⚠️ Duplicate message detected (database constraint): ${messageId}, skipping`);
-            } else {
-            console.error('[BAILEYS][DB] ❌ Failed to insert chat message', {
-              messageId,
-              agentId,
-              insertError,
-            });
-            }
-          } else {
-            console.log(`[BAILEYS][DB] ✅ Message saved: ${messageId} (${messageType})`);
-          }
-        } catch (error) {
-          // Check if it's a duplicate key error
-          if (error.code === '23505' || error.message?.includes('duplicate key') || error.message?.includes('unique constraint')) {
-            console.log(`[BAILEYS][DB] ⚠️ Duplicate message detected (catch block): ${messageId}, skipping`);
-          } else {
-          console.error('[BAILEYS][DB] ❌ Unexpected error inserting chat message', {
-            messageId,
-            agentId,
-            error: error.message,
-          });
-          }
-        }
+        // Queue message for batch insertion
+        queueMessageForBatch(agentId, dbPayload);
 
         // Extract sender name from message (pushName, verifiedBisName, or notify)
         const senderName = msg.pushName || 
@@ -3841,15 +5753,21 @@ async function initializeWhatsApp(agentId, userId = null) {
           await new Promise(resolve => setTimeout(resolve, 50)); // 50ms delay
           
           // Check cache now (logger should have populated it by now)
-          if (lidToPhoneCache.has(remoteJid)) {
             const cachedSenderJid = lidToPhoneCache.get(remoteJid);
+          if (cachedSenderJid !== undefined) {
+            cacheStats.lidToPhone.hits++;
             const cachedPhoneNumber = sanitizeNumberFromJid(cachedSenderJid);
             if (cachedPhoneNumber) {
               webhookFromNumber = cachedPhoneNumber;
-              console.log(`[BAILEYS] ✅ Using cached sender_pn for webhook: ${remoteJid} -> ${webhookFromNumber}`);
             }
           } else {
-            console.log(`[BAILEYS] ⚠️ Cache not populated yet for ${remoteJid}, using fallback: ${webhookFromNumber}`);
+            cacheStats.lidToPhone.misses++;
+          }
+          
+          if (webhookFromNumber && cachedPhoneNumber) {
+            loggers.database.debug({ remoteJid, phone: webhookFromNumber }, 'Using cached sender_pn for webhook');
+          } else {
+            loggers.database.debug({ remoteJid }, 'Cache not populated yet, using fallback');
           }
         }
 
@@ -3951,6 +5869,9 @@ async function initializeWhatsApp(agentId, userId = null) {
         }
       }
 
+      // Messages are now queued for batch insertion via queueMessageForBatch()
+      // They will be flushed automatically when batch size (100) is reached or timeout (1s) occurs
+
       console.log(`[BAILEYS] ========== END MESSAGES ==========`); 
     });
 
@@ -3970,9 +5891,11 @@ async function initializeWhatsApp(agentId, userId = null) {
   } catch (error) {
     console.error(`[BAILEYS] ❌ Error initializing:`, error);
     
-    // Release lock on error
-    connectionLocks.delete(agentId);
-    console.log(`[BAILEYS] 🔓 Initialization lock released (error)`);
+    // Track error
+    errorTracker.trackError(error, {
+      agentId: shortId(agentId),
+      operation: 'connection_init'
+    });
     
     return {
       success: false,
@@ -3980,10 +5903,18 @@ async function initializeWhatsApp(agentId, userId = null) {
       status: 'error',
       isActive: false
     };
+  } finally {
+    // FIX 2: Always release lock in finally block to prevent race conditions
+    // This ensures the lock is released even if an error occurs or function returns early
+    if (connectionLocks.has(agentId)) {
+      connectionLocks.delete(agentId);
+      console.log(`[BAILEYS] 🔓 Initialization lock released (finally)`);
+    }
   }
 }
 
 async function safeInitializeWhatsApp(agentId, userId = null) {
+  const connectionTracker = new OperationTracker('connection_establish', loggers.connection, 30000);
   const now = Date.now();
 
   // Check if initialization is already in progress (with stale lock detection)
@@ -4097,8 +6028,226 @@ async function safeInitializeWhatsApp(agentId, userId = null) {
   // Note: Lock is now managed inside initializeWhatsApp to prevent race conditions
   lastConnectionAttempt.set(agentId, now);
 
-  // Call initializeWhatsApp directly - it handles its own locking
-    return await initializeWhatsApp(agentId, userId);
+  // Record connection attempt metric
+  recordMetric(() => {
+    if (connectionMetrics?.total) {
+      connectionMetrics.total.labels(shortId(agentId), userId || 'unknown', 'attempt').inc();
+    }
+  });
+
+  // Track connection duration
+  const connectionTimer = connectionMetrics?.duration 
+    ? connectionMetrics.duration.startTimer({ agent_id: shortId(agentId) })
+    : null;
+
+  try {
+    // Call initializeWhatsApp directly - it handles its own locking
+    const result = await initializeWhatsApp(agentId, userId);
+    
+    // Record success
+    if (result.success) {
+      recordMetric(() => {
+        if (connectionMetrics?.total) {
+          connectionMetrics.total.labels(shortId(agentId), userId || 'unknown', 'success').inc();
+        }
+      });
+    } else {
+      recordMetric(() => {
+        if (connectionMetrics?.total) {
+          connectionMetrics.total.labels(shortId(agentId), userId || 'unknown', 'failure').inc();
+        }
+      });
+    }
+    
+    // Stop timer
+    if (connectionTimer) {
+      connectionTimer();
+    }
+    
+    return result;
+  } catch (error) {
+    connectionTracker.end({ agentId: shortId(agentId), success: false, error: error.message });
+    
+    // Track error
+    errorTracker.trackError(error, {
+      agentId: shortId(agentId),
+      userId,
+      operation: 'connection_init'
+    });
+    
+    // Record failure
+    recordMetric(() => {
+      if (connectionMetrics?.total) {
+        connectionMetrics.total.labels(shortId(agentId), userId || 'unknown', 'error').inc();
+      }
+    });
+    
+    // Stop timer
+    if (connectionTimer) {
+      connectionTimer();
+    }
+    
+    throw error;
+  }
+}
+
+/**
+ * Clear all reconnection state for an agent
+ * @param {string} agentId - Agent UUID
+ */
+function clearReconnectionState(agentId) {
+  // Clear attempt counters
+  RECONNECTION_ATTEMPTS.delete(agentId);
+  RECONNECTION_DELAYS.delete(agentId);
+  
+  // Clear and cancel any pending timers
+  const timerId = RECONNECTION_TIMERS.get(agentId);
+  if (timerId) {
+    clearTimeout(timerId);
+    RECONNECTION_TIMERS.delete(agentId);
+  }
+  
+  const qrTimerId = QR_EXPIRATION_TIMERS.get(agentId);
+  if (qrTimerId) {
+    clearTimeout(qrTimerId);
+    QR_EXPIRATION_TIMERS.delete(agentId);
+  }
+  
+  loggers.reconnect.debug({ agentId: shortId(agentId) }, 'Cleared reconnection state');
+}
+
+/**
+ * Attempt automatic reconnection with exponential backoff
+ * @param {string} agentId - Agent UUID
+ * @param {number} statusCode - WhatsApp disconnect status code
+ * @param {string} reason - Disconnect reason
+ */
+async function attemptReconnection(agentId, statusCode, reason) {
+  try {
+    // Skip reconnection for non-retryable errors
+    if (RECONNECTION_CONFIG.nonRetryableCodes.includes(statusCode)) {
+      loggers.reconnect.info({
+        agentId: shortId(agentId),
+        statusCode,
+        reason
+      }, 'Skipping non-retryable error');
+      
+      await supabaseAdmin
+        .from('whatsapp_sessions')
+        .update({ 
+          status: 'error', 
+          last_error: `Non-retryable error: ${statusCode} - ${reason}`,
+          updated_at: new Date().toISOString()
+        })
+        .eq('agent_id', agentId);
+      
+      clearReconnectionState(agentId);
+      return;
+    }
+
+    // Get current attempt count
+    const attempts = RECONNECTION_ATTEMPTS.get(agentId) || 0;
+    
+    // Check if max attempts reached
+    if (attempts >= RECONNECTION_CONFIG.maxAttempts) {
+      loggers.reconnect.error({
+        agentId: shortId(agentId),
+        maxAttempts: RECONNECTION_CONFIG.maxAttempts,
+        attempts
+      }, 'Max reconnection attempts reached');
+      
+      await supabaseAdmin
+        .from('whatsapp_sessions')
+        .update({ 
+          status: 'error', 
+          last_error: `Max reconnection attempts exceeded (${RECONNECTION_CONFIG.maxAttempts})`,
+          updated_at: new Date().toISOString()
+        })
+        .eq('agent_id', agentId);
+      
+      clearReconnectionState(agentId);
+      return;
+    }
+
+    // Calculate delay with exponential backoff + jitter
+    const exponentialDelay = Math.min(
+      RECONNECTION_CONFIG.baseDelay * Math.pow(2, attempts),
+      RECONNECTION_CONFIG.maxDelay
+    );
+    const jitter = Math.random() * 1000; // 0-1000ms random jitter
+    const finalDelay = exponentialDelay + jitter;
+    
+    // Update attempt count and delay
+    RECONNECTION_ATTEMPTS.set(agentId, attempts + 1);
+    RECONNECTION_DELAYS.set(agentId, finalDelay);
+
+    loggers.reconnect.info({
+      agentId: shortId(agentId),
+      attempt: attempts + 1,
+      maxAttempts: RECONNECTION_CONFIG.maxAttempts,
+      delayMs: Math.round(finalDelay)
+    }, 'Scheduling reconnection');
+
+    // Clear any existing timer
+    const existingTimer = RECONNECTION_TIMERS.get(agentId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    // Schedule reconnection
+    const timerId = setTimeout(async () => {
+      try {
+        // Check if already reconnected
+        const session = activeSessions.get(agentId);
+        if (session && session.isConnected) {
+          loggers.reconnect.info({ agentId: shortId(agentId) }, 'Already reconnected, skipping');
+          clearReconnectionState(agentId);
+          return;
+        }
+
+        loggers.reconnect.info({ agentId: shortId(agentId) }, 'Attempting reconnection');
+        
+        // Get user_id for this agent
+        const { data: sessionData } = await supabaseAdmin
+          .from('whatsapp_sessions')
+          .select('user_id')
+          .eq('agent_id', agentId)
+          .single();
+
+        if (!sessionData) {
+          loggers.reconnect.error({ agentId: shortId(agentId) }, 'No session data found');
+          clearReconnectionState(agentId);
+          return;
+        }
+
+        // Attempt to reconnect
+        await safeInitializeWhatsApp(agentId, sessionData.user_id);
+        
+        // Success - reset counters
+        clearReconnectionState(agentId);
+        loggers.reconnect.info({ agentId: shortId(agentId) }, 'Reconnection successful');
+        
+      } catch (error) {
+        loggers.reconnect.error({
+          agentId: shortId(agentId),
+          error: error.message,
+          stack: error.stack
+        }, 'Reconnection failed');
+        
+        // Will retry automatically via exponential backoff
+        // unless max attempts reached
+      }
+    }, finalDelay);
+    
+    RECONNECTION_TIMERS.set(agentId, timerId);
+    
+  } catch (error) {
+    loggers.reconnect.error({
+      agentId: shortId(agentId),
+      error: error.message,
+      stack: error.stack
+    }, 'Error in attemptReconnection');
+  }
 }
 
 // Disconnect
@@ -4165,6 +6314,10 @@ async function disconnectWhatsApp(agentId) {
           clearInterval(session.backupInterval);
           session.backupInterval = null;
         }
+        
+        // Clear reconnection state on manual disconnect
+        clearReconnectionState(agentId);
+        
         cleanupSteps.intervalsCleared = true;
         console.log(`[BAILEYS] ✅ All intervals cleared`);
       } catch (intervalError) {
@@ -4228,7 +6381,7 @@ async function disconnectWhatsApp(agentId) {
     // STEP 5: Clear from memory
     console.log(`[BAILEYS] 🧠 Step 5: Clearing from memory...`);
     try {
-      activeSessions.delete(agentId);
+      await removeAgentFromActiveSessions(agentId);
       qrGenerationTracker.delete(agentId);
       connectionLocks.delete(agentId);
       lastConnectionAttempt.delete(agentId);
@@ -4675,14 +6828,30 @@ async function isNumberOnWhatsApp(agentId, phoneNumber, useCache = true) {
   
   // Check cache first
   const cacheKey = `${agentId}:${phoneNumber}`;
-  if (useCache && validationCache.has(cacheKey)) {
+  if (useCache) {
     const cached = validationCache.get(cacheKey);
-    if (Date.now() < cached.expiresAt) {
-      console.log(`${logPrefix} Using cached result for ${phoneNumber.substring(0, 8)}...`);
+    if (cached !== undefined) {
+      cacheStats.validation.hits++;
+      recordMetric(() => {
+        if (cacheMetrics?.hits) {
+          cacheMetrics.hits.labels('validation').inc();
+        }
+      });
+      // LRU handles TTL automatically, but we check expiresAt for legacy compatibility
+      if (cached.expiresAt && Date.now() < cached.expiresAt) {
+        loggers.database.debug({ agentId: shortId(agentId), phone: phoneNumber.substring(0, 8) }, 'Validation cache hit');
       return cached.result;
     }
     // Cache expired, remove it
     validationCache.delete(cacheKey);
+    } else {
+      cacheStats.validation.misses++;
+      recordMetric(() => {
+        if (cacheMetrics?.misses) {
+          cacheMetrics.misses.labels('validation').inc();
+        }
+      });
+    }
   }
   
   // Format phone number as JID
@@ -4709,13 +6878,13 @@ async function isNumberOnWhatsApp(agentId, phoneNumber, useCache = true) {
       jid: result && result.length > 0 ? result[0].jid : jid
     };
     
-    // Cache result (24 hours)
+    // Cache result (LRU handles TTL automatically, but we keep expiresAt for legacy compatibility)
     if (useCache) {
       validationCache.set(cacheKey, {
         result: validationResult,
         expiresAt: Date.now() + VALIDATION_CACHE_TTL
       });
-      console.log(`${logPrefix} Cached validation result for ${phoneNumber.substring(0, 8)}...`);
+      loggers.database.debug({ agentId: shortId(agentId), phone: phoneNumber.substring(0, 8) }, 'Validation result cached');
     }
     
     return validationResult;
@@ -4953,122 +7122,63 @@ async function updateIntegrationEndpoints(agentId, endpoints) {
 // Initialize existing sessions on startup (optional - for session recovery)
 // Initialize existing WhatsApp sessions on server startup
 // This function is called when the backend starts to restore active connections
+/**
+ * Initialize existing sessions in batches
+ * Phase 3C.2 optimization with pagination
+ */
 async function initializeExistingSessions() {
   try {
-    console.log('\n[BAILEYS] ========== STARTUP: CHECKING FOR EXISTING SESSIONS ==========');
-    console.log('[BAILEYS] 🔍 Querying database for active WhatsApp sessions...');
+    loggers.connection.info('Initializing existing sessions');
     
-    // CRITICAL: Don't auto-reconnect sessions with conflict status (401 errors)
-    // These require manual user intervention
-    // ALSO: Include sessions with credentials (session_data not null) even if is_active is false
-    // This handles cases where server restarted during reconnection
-    const { data: activeSessionsData, error } = await supabaseAdmin
+    // Get total count first (uses idx_whatsapp_sessions_status_active_heartbeat)
+    const { count, error: countError } = await supabaseAdmin
       .from('whatsapp_sessions')
-      .select('agent_id, phone_number, status, session_data')
-      .or('is_active.eq.true,session_data.not.is.null') // Active OR has credentials
-      .not('status', 'in', '("conflict","disconnected")') // Exclude conflict and manually disconnected
-      .limit(20); // Support up to 20 concurrent connections
+      .select('*', { count: 'exact', head: true })
+      .in('status', ['connected', 'qr_pending', 'connecting'])
+      .eq('is_active', true);
     
-    if (error) {
-      console.error('[BAILEYS] ❌ Error fetching active sessions:', error);
+    if (countError) {
+      loggers.connection.error({ error: countError.message }, 'Failed to count sessions');
       return;
     }
     
-    if (!activeSessionsData || activeSessionsData.length === 0) {
-      console.log('[BAILEYS] ℹ️  No existing active sessions found in database');
-      console.log('[BAILEYS] 📝 Connection persistence: When users connect, sessions will persist across server restarts');
-      console.log('[BAILEYS] ========== STARTUP CHECK COMPLETE ==========\n');
-      return;
+    loggers.connection.info({ totalSessions: count }, 'Total active sessions found');
+    
+    // Process in batches for large deployments
+    const BATCH_SIZE = 100;
+    const batches = Math.ceil((count || 0) / BATCH_SIZE);
+    
+    if (batches > 1) {
+      loggers.connection.info({ batches, batchSize: BATCH_SIZE }, 'Processing in batches');
     }
     
-    // Check for conflict sessions that won't be auto-reconnected
-    const { data: conflictSessions } = await supabaseAdmin
-      .from('whatsapp_sessions')
-      .select('agent_id, status')
-      .eq('is_active', true)
-      .eq('status', 'conflict')
-      .limit(20);
-    
-    if (conflictSessions && conflictSessions.length > 0) {
-      console.log(`[BAILEYS] ⚠️  Found ${conflictSessions.length} session(s) with conflict status (will NOT auto-reconnect):`);
-      conflictSessions.forEach((session, index) => {
-        console.log(`[BAILEYS]    ${index + 1}. Agent: ${session.agent_id.substring(0, 20)}... Status: ${session.status}`);
-      });
-      console.log(`[BAILEYS] ℹ️  These sessions require manual reconnection due to 401 errors (device removed/conflict)`);
-    }
-    
-    if (activeSessionsData.length === 0) {
-      console.log(`[BAILEYS] ℹ️  No active sessions to auto-reconnect (conflict sessions excluded)`);
-      console.log('[BAILEYS] 📝 Connection persistence: When users connect, sessions will persist across server restarts');
-      console.log('[BAILEYS] ========== STARTUP CHECK COMPLETE ==========\n');
-      return;
-    }
-    
-    // Filter to only sessions with credentials for actual reconnection
-    const sessionsWithCreds = activeSessionsData.filter(s => s.session_data?.creds);
-    const sessionsWithoutCreds = activeSessionsData.filter(s => !s.session_data?.creds);
-    
-    console.log(`[BAILEYS] ✅ Found ${activeSessionsData.length} session(s) to check:`);
-    console.log(`[BAILEYS]    - With credentials (will reconnect): ${sessionsWithCreds.length}`);
-    console.log(`[BAILEYS]    - Without credentials (need QR scan): ${sessionsWithoutCreds.length}`);
-    
-    sessionsWithCreds.forEach((session, index) => {
-      console.log(`[BAILEYS]    ${index + 1}. Agent: ${session.agent_id.substring(0, 20)}... Phone: ${session.phone_number || 'Unknown'} [HAS CREDS]`);
-    });
-    
-    // Use sessions with credentials for reconnection
-    const sessionsToReconnect = sessionsWithCreds;
-    
-    if (sessionsToReconnect.length === 0) {
-      console.log(`[BAILEYS] ℹ️  No sessions with valid credentials to auto-reconnect`);
-      console.log('[BAILEYS] 📝 Users will need to scan QR code to connect their agents');
-      console.log('[BAILEYS] ========== STARTUP CHECK COMPLETE ==========\n');
-      return;
-    }
-    
-    console.log(`\n[BAILEYS] 🔄 AUTO-RECONNECTING ${sessionsToReconnect.length} session(s) with credentials...`);
-    console.log('[BAILEYS] This ensures WhatsApp connections persist across server restarts.');
-    console.log('[BAILEYS] ⚠️  Note: Sessions with conflict/disconnected status are excluded.\n');
-    
-    // Auto-reconnect each session with credentials
-    let successCount = 0;
-    let failCount = 0;
-    
-    for (const sessionData of sessionsToReconnect) {
-      try {
-        console.log(`[BAILEYS] 🔄 Restoring session for agent: ${sessionData.agent_id.substring(0, 20)}...`);
-        
-        // Call initializeWhatsApp to restore the connection
-        // This will load saved credentials and reconnect automatically
-        const result = await initializeWhatsApp(sessionData.agent_id, null);
-        
-        if (result.success) {
-          successCount++;
-          console.log(`[BAILEYS] ✅ Session restored successfully for ${sessionData.agent_id.substring(0, 20)}...`);
-        } else {
-          failCount++;
-          console.log(`[BAILEYS] ⚠️  Session restoration failed for ${sessionData.agent_id.substring(0, 20)}...: ${result.error}`);
-        }
-        
-        // Small delay between reconnections to avoid overwhelming the system
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-      } catch (error) {
-        failCount++;
-        console.error(`[BAILEYS] ❌ Error restoring session for ${sessionData.agent_id.substring(0, 20)}...:`, error.message);
+    for (let i = 0; i < batches; i++) {
+      const offset = i * BATCH_SIZE;
+      
+      loggers.connection.info({
+        batch: i + 1,
+        totalBatches: batches,
+        offset
+      }, 'Processing batch');
+      
+      // Reconnect batch
+      const stats = await reconnectAllAgents();
+      
+      if (stats.total === 0) {
+        loggers.connection.info('No more agents to reconnect');
+        break;
+      }
+      
+      // Delay between batches to prevent overload
+      if (i < batches - 1) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
     }
     
-    console.log(`\n[BAILEYS] ========== AUTO-RECONNECT SUMMARY ==========`);
-    console.log(`[BAILEYS] ✅ Successfully restored: ${successCount} session(s)`);
-    console.log(`[BAILEYS] ❌ Failed to restore: ${failCount} session(s)`);
-    console.log(`[BAILEYS] 📱 WhatsApp connections ${successCount > 0 ? 'ACTIVE and ready to receive messages' : 'will reconnect when accessed'}`);
-    console.log(`[BAILEYS] ========== STARTUP COMPLETE ==========\n`);
+    loggers.connection.info('Existing sessions initialized');
     
   } catch (error) {
-    console.error('[BAILEYS] ❌ Critical error in initializeExistingSessions:', error.message);
-    console.log('[BAILEYS] ⚠️  Server will continue, but WhatsApp sessions may need manual reconnection');
-    // Don't crash the server
+    loggers.connection.error({ error: error.message }, 'Failed to initialize existing sessions');
   }
 }
 
@@ -5076,59 +7186,959 @@ async function initializeExistingSessions() {
  * Reconnect all agents that were active before server restart
  * Called on server startup to restore connections
  */
+/**
+ * Reconnect all active agents in parallel
+ * Uses p-limit for concurrency control
+ */
+/**
+ * Reconnect all active agents in parallel with optimized query
+ * Phase 3C.2 optimization
+ */
 async function reconnectAllAgents() {
+  const startTime = Date.now();
+  
   try {
-    console.log('[RECONNECT-ALL] 🔍 Finding agents to reconnect...');
+    loggers.reconnect.info('Starting parallel agent reconnection');
     
-    // Get all agents that were connected or active
+    // Optimized query: uses idx_whatsapp_sessions_status_active_heartbeat
+    // Select only required fields to reduce data transfer
     const { data: sessions, error } = await supabaseAdmin
       .from('whatsapp_sessions')
-      .select('agent_id, user_id, status, phone_number')
+      .select('agent_id, user_id, phone_number, status')
       .in('status', ['connected', 'qr_pending', 'connecting'])
-      .eq('is_active', true);
+      .eq('is_active', true)
+      .order('last_heartbeat', { ascending: false })
+      .limit(1000); // Safety limit for large deployments
     
     if (error) {
-      console.error('[RECONNECT-ALL] ❌ Error fetching sessions:', error);
-      return;
+      loggers.reconnect.error({ error: error.message }, 'Failed to fetch sessions');
+      throw error;
     }
     
     if (!sessions || sessions.length === 0) {
-      console.log('[RECONNECT-ALL] ℹ️  No agents to reconnect');
-      return;
+      loggers.reconnect.info('No agents to reconnect');
+      return { success: 0, failed: 0, total: 0 };
     }
     
-    console.log(`[RECONNECT-ALL] 📱 Found ${sessions.length} agent(s) to reconnect`);
+    loggers.reconnect.info({ count: sessions.length }, 'Found agents to reconnect');
     
-    // Reconnect each agent
-    for (const session of sessions) {
-      try {
-        console.log(`[RECONNECT-ALL] 🔌 Reconnecting agent: ${session.agent_id}`);
-        
-        // Small delay between reconnections to avoid overwhelming the server
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        // Initialize the connection (will use existing credentials)
+    // Process in parallel with concurrency limit
+    const limit = pLimit(CONCURRENCY_CONFIG.maxConcurrent);
+    const connectionDelay = CONCURRENCY_CONFIG.connectionDelay;
+    
+    let successCount = 0;
+    let failureCount = 0;
+    const failedAgents = [];
+    
+    const results = await Promise.allSettled(
+      sessions.map((session, index) =>
+        limit(async () => {
+          // Stagger connection starts to prevent thundering herd
+          if (index > 0 && connectionDelay > 0) {
+            await new Promise(resolve => setTimeout(resolve, connectionDelay));
+          }
+          
+          loggers.reconnect.info({
+            agentId: shortId(session.agent_id),
+            progress: `${index + 1}/${sessions.length}`
+          }, 'Starting reconnection');
+          
+          try {
+            const connStart = Date.now();
         await initializeWhatsApp(session.agent_id, session.user_id);
-        
-        console.log(`[RECONNECT-ALL] ✅ Agent ${session.agent_id} reconnected`);
+            const connTime = Date.now() - connStart;
+            
+            loggers.reconnect.info({
+              agentId: shortId(session.agent_id),
+              connectionTime: connTime
+            }, 'Reconnection successful');
+            
+            return { success: true, agentId: session.agent_id, time: connTime };
+            
       } catch (error) {
-        console.error(`[RECONNECT-ALL] ❌ Failed to reconnect ${session.agent_id}:`, error.message);
+            loggers.reconnect.error({
+              agentId: shortId(session.agent_id),
+              error: error.message
+            }, 'Reconnection failed');
         
-        // Update status to error
-        await supabaseAdmin
+            // Update database with error (don't await to prevent blocking)
+            supabaseAdmin
           .from('whatsapp_sessions')
           .update({
             status: 'error',
             last_error: error.message,
-            is_active: false
-          })
-          .eq('agent_id', session.agent_id);
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', session.agent_id)
+              .then(() => {})
+              .catch(err => loggers.database.error({ error: err.message }, 'Failed to update error status'));
+            
+            return { success: false, agentId: session.agent_id, error: error.message };
+          }
+        })
+      )
+    );
+
+    // Calculate statistics
+    const totalDuration = Date.now() - startTime;
+    const connectionTimes = [];
+    
+    results.forEach(result => {
+      if (result.status === 'fulfilled') {
+        if (result.value.success) {
+          successCount++;
+          if (result.value.time) {
+            connectionTimes.push(result.value.time);
+          }
+        } else {
+          failureCount++;
+          failedAgents.push({
+            agentId: shortId(result.value.agentId),
+            error: result.value.error
+          });
+        }
+      } else {
+        failureCount++;
+      }
+    });
+    
+    const avgConnectionTime = connectionTimes.length > 0
+      ? Math.round(connectionTimes.reduce((a, b) => a + b, 0) / connectionTimes.length)
+      : 0;
+    
+    const throughput = sessions.length / (totalDuration / 1000);
+    const successRate = (successCount / sessions.length * 100).toFixed(1);
+    
+    // Log summary
+    loggers.reconnect.info({
+      successful: successCount,
+      failed: failureCount,
+      total: sessions.length,
+      successRate: `${successRate}%`,
+      duration: `${(totalDuration / 1000).toFixed(2)}s`,
+      throughput: `${throughput.toFixed(2)} agents/s`,
+      avgConnectionTime: `${avgConnectionTime}ms`
+    }, 'Reconnection summary');
+    
+    if (failedAgents.length > 0 && failedAgents.length <= 10) {
+      loggers.reconnect.warn({ failedAgents }, 'Failed agents');
+    } else if (failedAgents.length > 10) {
+      loggers.reconnect.warn({
+        failedCount: failedAgents.length,
+        sample: failedAgents.slice(0, 5)
+      }, 'Many agents failed (showing first 5)');
+    }
+    
+    return {
+      success: successCount,
+      failed: failureCount,
+      total: sessions.length,
+      duration: totalDuration,
+      throughput,
+      avgConnectionTime
+    };
+        
+      } catch (error) {
+    loggers.reconnect.error({
+      error: error.message,
+      stack: error.stack
+    }, 'Fatal error in reconnectAllAgents');
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Clear all caches
+ * Useful for testing or manual cleanup
+ */
+function clearAllCaches() {
+  const before = {
+    validation: validationCache.size,
+    lidToPhone: lidToPhoneCache.size,
+    session: SESSION_CACHE.size
+  };
+  
+  validationCache.clear();
+  lidToPhoneCache.clear();
+  SESSION_CACHE.clear();
+  
+  // Reset statistics
+  cacheStats.validation = { hits: 0, misses: 0, evictions: 0 };
+  cacheStats.lidToPhone = { hits: 0, misses: 0, evictions: 0 };
+  cacheStats.session = { hits: 0, misses: 0, evictions: 0 };
+  
+  logger.info({ clearedEntries: before }, 'All caches cleared');
+}
+
+/**
+ * Periodic cache maintenance
+ * Runs every 5 minutes to:
+ * - Log cache statistics
+ * - Clear stale entries
+ * - Monitor cache health
+ * Phase 3C.3
+ */
+function startCacheMaintenance() {
+  setInterval(() => {
+    try {
+      // Calculate hit rates
+      const validationHitRate = cacheStats.validation.hits + cacheStats.validation.misses > 0
+        ? (cacheStats.validation.hits / (cacheStats.validation.hits + cacheStats.validation.misses) * 100).toFixed(2)
+        : 0;
+      
+      const lidHitRate = cacheStats.lidToPhone.hits + cacheStats.lidToPhone.misses > 0
+        ? (cacheStats.lidToPhone.hits / (cacheStats.lidToPhone.hits + cacheStats.lidToPhone.misses) * 100).toFixed(2)
+        : 0;
+      
+      const sessionHitRate = cacheStats.session.hits + cacheStats.session.misses > 0
+        ? (cacheStats.session.hits / (cacheStats.session.hits + cacheStats.session.misses) * 100).toFixed(2)
+        : 0;
+      
+      // Update cache size metrics
+      recordMetric(() => {
+        if (cacheMetrics?.size) {
+          cacheMetrics.size.labels('validation').set(validationCache.size);
+          cacheMetrics.size.labels('lidToPhone').set(lidToPhoneCache.size);
+          cacheMetrics.size.labels('session').set(SESSION_CACHE.size);
+        }
+      });
+      
+      // Log cache statistics
+      loggers.perf.info({
+        validation: {
+          size: validationCache.size,
+          max: CACHE_CONFIG.validation.max,
+          hits: cacheStats.validation.hits,
+          misses: cacheStats.validation.misses,
+          evictions: cacheStats.validation.evictions,
+          hitRate: `${validationHitRate}%`,
+          utilization: `${(validationCache.size / CACHE_CONFIG.validation.max * 100).toFixed(1)}%`
+        },
+        lidToPhone: {
+          size: lidToPhoneCache.size,
+          max: CACHE_CONFIG.lidToPhone.max,
+          hits: cacheStats.lidToPhone.hits,
+          misses: cacheStats.lidToPhone.misses,
+          evictions: cacheStats.lidToPhone.evictions,
+          hitRate: `${lidHitRate}%`,
+          utilization: `${(lidToPhoneCache.size / CACHE_CONFIG.lidToPhone.max * 100).toFixed(1)}%`
+        },
+        session: {
+          size: SESSION_CACHE.size,
+          max: CACHE_CONFIG.session.max,
+          hits: cacheStats.session.hits,
+          misses: cacheStats.session.misses,
+          evictions: cacheStats.session.evictions,
+          hitRate: `${sessionHitRate}%`,
+          utilization: `${(SESSION_CACHE.size / CACHE_CONFIG.session.max * 100).toFixed(1)}%`
+        }
+      }, 'Cache statistics');
+      
+      // Warn if cache hit rate is low
+      if (parseFloat(validationHitRate) < 50 && cacheStats.validation.hits > 100) {
+        loggers.perf.warn({ hitRate: validationHitRate }, 'Low validation cache hit rate');
+      }
+      
+      if (parseFloat(sessionHitRate) < 60 && cacheStats.session.hits > 100) {
+        loggers.perf.warn({ hitRate: sessionHitRate }, 'Low session cache hit rate');
+      }
+    
+  } catch (error) {
+      loggers.perf.error({ error: error.message }, 'Cache maintenance error');
+    }
+  }, 5 * 60 * 1000); // Every 5 minutes
+  
+  loggers.perf.info('Cache maintenance started (5 minute intervals)');
+}
+
+/**
+ * Monitor event listener counts
+ * Runs every 5 minutes
+ * Phase 3C.3
+ */
+function startListenerMonitoring() {
+  setInterval(() => {
+    try {
+      const stats = getEventListenerStats();
+      
+      loggers.perf.info({
+        totalAgents: stats.totalAgents,
+        totalListeners: stats.totalListeners,
+        averagePerAgent: stats.averagePerAgent
+      }, 'Event listener statistics');
+      
+      // Warn if listener count is high
+      if (stats.totalListeners > 500) {
+        loggers.perf.warn({
+          totalListeners: stats.totalListeners,
+          threshold: 500
+        }, 'High event listener count detected');
+      }
+      
+      // Warn if any agent has excessive listeners
+      for (const [agentId, count] of Object.entries(stats.agentBreakdown)) {
+        if (count > 20) {
+          loggers.perf.warn({
+            agentId,
+            listenerCount: count,
+            threshold: 20
+          }, 'Agent has excessive event listeners');
+        }
+      }
+      
+    } catch (error) {
+      loggers.perf.error({ error: error.message }, 'Listener monitoring error');
+    }
+  }, 5 * 60 * 1000); // Every 5 minutes
+  
+  loggers.perf.info('Event listener monitoring started (5 minute intervals)');
+}
+
+/**
+ * Monitor message batch queues
+ * Runs every 30 seconds
+ * Phase 3C.4
+ */
+function startMessageBatchMonitoring() {
+  setInterval(() => {
+    try {
+      const totalPending = Array.from(messageBatchQueue.values())
+        .reduce((sum, queue) => sum + queue.length, 0);
+      
+      if (totalPending > 0) {
+        const agentsWithPending = messageBatchQueue.size;
+        const maxQueueSize = Math.max(
+          ...Array.from(messageBatchQueue.values()).map(q => q.length),
+          0
+        );
+        
+        loggers.messages.info({
+          totalPending,
+          agentsWithPending,
+          maxQueueSize
+        }, 'Message batch queue status');
+        
+        // Warn if queue is growing too large
+        if (maxQueueSize > MESSAGE_BATCH_SIZE * 2) {
+          loggers.messages.warn({
+            maxQueueSize,
+            threshold: MESSAGE_BATCH_SIZE * 2
+          }, 'Large message queue detected - may indicate slow database');
+        }
+      }
+      
+    } catch (error) {
+      loggers.messages.error({
+        error: error.message
+      }, 'Message batch monitoring error');
+    }
+  }, 30000); // Every 30 seconds
+  
+  loggers.messages.info({
+    batchSize: MESSAGE_BATCH_SIZE,
+    timeout: MESSAGE_BATCH_TIMEOUT
+  }, 'Message batch monitoring started (30 second intervals)');
+}
+
+/**
+ * Warm up session cache on startup
+ * Loads recently active sessions into memory
+ */
+async function warmSessionCache() {
+  try {
+    logger.info({}, 'Warming session cache...');
+    
+    const { data: sessions, error } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('agent_id, session_data')
+      .eq('is_active', true)
+      .not('session_data', 'is', null)
+      .order('last_connected', { ascending: false })
+      .limit(CACHE_CONFIG.session.max);
+    
+    if (error) {
+      loggers.database.error({ error: error.message }, 'Failed to fetch sessions for cache warming');
+      return;
+    }
+    
+    if (sessions && sessions.length > 0) {
+      let warmed = 0;
+      sessions.forEach(session => {
+        if (session.session_data?.creds) {
+          try {
+            const creds = session.session_data.encrypted
+              ? decryptCredentials(session.session_data.creds)
+              : session.session_data.creds;
+            
+            SESSION_CACHE.set(session.agent_id, creds);
+            warmed++;
+          } catch (error) {
+            loggers.security.error({
+              agentId: shortId(session.agent_id),
+              error: error.message
+            }, 'Failed to decrypt credentials during cache warming');
+          }
+        }
+      });
+      
+      logger.info({ warmed, total: sessions.length }, 'Session cache warmed');
+    } else {
+      logger.info({}, 'No active sessions to warm cache');
+    }
+  } catch (error) {
+    logger.error({ error: error.message, stack: error.stack }, 'Failed to warm session cache');
+  }
+}
+
+// ============================================
+// ORPHANED AGENT MONITORING
+// ============================================
+
+/**
+ * Periodically check for and recover orphaned agents
+ */
+function startOrphanedAgentMonitor() {
+  // Check every 2 minutes
+  setInterval(async () => {
+    try {
+      if (!instanceManager.isActive) {
+        return; // Skip if instance manager not active
+      }
+      
+      const orphanedAgents = await instanceManager.detectOrphanedAgents(supabaseAdmin);
+      
+      if (orphanedAgents.length > 0) {
+        logger.info({ 
+          count: orphanedAgents.length 
+        }, 'Recovering orphaned agents');
+        
+        // Reconnect orphaned agents if this instance has capacity
+        for (const agentId of orphanedAgents) {
+          if (instanceManager.canAcceptMoreAgents()) {
+            try {
+              // Get user_id for agent
+              const { data } = await supabaseAdmin
+                .from('whatsapp_sessions')
+                .select('user_id')
+                .eq('agent_id', agentId)
+                .single();
+              
+              if (data) {
+                logger.info({ agentId: shortId(agentId) }, 'Recovering orphaned agent');
+                await safeInitializeWhatsApp(agentId, data.user_id);
+              }
+      } catch (error) {
+              logger.error({ 
+                error: error.message, 
+                agentId: shortId(agentId) 
+              }, 'Failed to recover orphaned agent');
+            }
+          } else {
+            logger.warn('Instance at capacity, cannot recover more orphaned agents');
+            break;
+          }
+        }
+      }
+    } catch (error) {
+      logger.error({ error: error.message }, 'Error in orphaned agent monitor');
+    }
+  }, 2 * 60 * 1000); // Every 2 minutes
+  
+  logger.info('Orphaned agent monitor started');
+}
+
+// ============================================
+// SERVICE INITIALIZATION
+// ============================================
+
+/**
+ * Initialize all services
+ */
+// ============================================
+// PERFORMANCE REPORTING HELPERS
+// Added: 2025-01-16 - Performance Reporting
+// ============================================
+
+// Helper functions for performance data collection
+function getAverageConnectionTime() {
+  // Get average from Prometheus histogram if available
+  // Note: This is a simplified calculation - in production, you'd query the histogram
+  // For now, return 0 as placeholder - actual implementation would query metricsRegistry
+  if (connectionMetrics?.duration) {
+    // In a real implementation, you'd query the histogram buckets
+    // For now, we'll track this separately or use OperationTracker data
+    return 0; // Placeholder
+  }
+  return 0;
+}
+
+function getAverageMessageProcessingTime() {
+  // Get average from Prometheus histogram if available
+  if (messageMetrics?.processingDuration) {
+    // In a real implementation, you'd query the histogram buckets
+    return 0; // Placeholder
+  }
+  return 0;
+}
+
+function calculateCacheHitRate() {
+  const total = cacheStats.session.hits + cacheStats.session.misses +
+                cacheStats.validation.hits + cacheStats.validation.misses +
+                cacheStats.lidToPhone.hits + cacheStats.lidToPhone.misses;
+  const hits = cacheStats.session.hits + cacheStats.validation.hits + cacheStats.lidToPhone.hits;
+  return total > 0 ? (hits / total) * 100 : 0;
+}
+
+function getRecentErrorCount() {
+  // Get error count from Prometheus counter if available
+  // Note: This would require querying the metricsRegistry
+  // For now, return 0 as placeholder
+  if (errorMetrics?.total) {
+    // In a real implementation, you'd query the counter value
+    return 0; // Placeholder
+  }
+  return 0;
+}
+
+/**
+ * Start performance snapshot collection and reporting
+ */
+function startPerformanceReporting() {
+  // Take performance snapshots every 5 minutes
+  setInterval(() => {
+    const snapshot = {
+      connectionTime: getAverageConnectionTime(),
+      messageProcessingTime: getAverageMessageProcessingTime(),
+      cacheHitRate: calculateCacheHitRate(),
+      errorCount: getRecentErrorCount(),
+      activeConnections: activeSessions.size,
+      timestamp: Date.now()
+    };
+    
+    performanceReporter.recordSnapshot(snapshot);
+  }, 300000); // 5 minutes
+
+  // Schedule daily report at midnight
+  const scheduleDaily = () => {
+    const now = new Date();
+    const night = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0);
+    const msToMidnight = night.getTime() - now.getTime();
+    
+    setTimeout(() => {
+      performanceReporter.generateDailyReport();
+      setInterval(() => {
+        performanceReporter.generateDailyReport();
+      }, 24 * 60 * 60 * 1000); // Every 24 hours
+    }, msToMidnight);
+  };
+
+  scheduleDaily();
+  loggers.perf.info('Daily performance reporting scheduled');
+
+  // Schedule weekly report every Sunday at midnight
+  const scheduleWeekly = () => {
+    const now = new Date();
+    const nextSunday = new Date(now);
+    nextSunday.setDate(now.getDate() + (7 - now.getDay()));
+    nextSunday.setHours(0, 0, 0, 0);
+    const msToSunday = nextSunday.getTime() - now.getTime();
+    
+    setTimeout(() => {
+      performanceReporter.generateWeeklyReport();
+      setInterval(() => {
+        performanceReporter.generateWeeklyReport();
+      }, 7 * 24 * 60 * 60 * 1000); // Every 7 days
+    }, msToSunday);
+  };
+
+  scheduleWeekly();
+  loggers.perf.info('Weekly performance reporting scheduled');
+}
+
+async function initializeServices() {
+  try {
+    logger.info('Initializing services...');
+    
+    // Initialize Prometheus metrics
+    if (METRICS_CONFIG.enabled) {
+      try {
+        if (metricsRegistry) {
+          loggers.perf.info({
+            enabled: METRICS_CONFIG.enabled,
+            prefix: METRICS_CONFIG.prefix,
+            instance: INSTANCE_HOSTNAME,
+            collectInterval: METRICS_CONFIG.collectInterval
+          }, 'Prometheus metrics initialized');
+        } else {
+          loggers.perf.warn('Prometheus metrics disabled or initialization failed');
+        }
+      } catch (error) {
+        loggers.perf.warn({ error: error.message }, 'Prometheus metrics initialization error');
+      }
+    } else {
+      loggers.perf.warn('Prometheus metrics disabled via PROMETHEUS_METRICS_ENABLED=false');
+    }
+    
+    // Initialize Redis
+    try {
+      await redisCache.initialize();
+      logger.info('✅ Redis initialized');
+    } catch (error) {
+      logger.warn({ error: error.message }, '⚠️  Redis initialization failed - continuing without distributed cache');
+      // Continue without Redis - will fall back to LRU
+    }
+    
+    // Initialize instance manager
+    try {
+      await instanceManager.initialize();
+      logger.info('✅ Instance manager initialized');
+      
+      // Log instance info
+      const stats = instanceManager.getStats();
+      logger.info({
+        instanceId: stats.instanceId,
+        hostname: stats.hostname,
+        maxAgents: stats.maxAgents
+      }, 'Instance registered');
+      
+      // Start cache maintenance
+      startCacheMaintenance();
+      
+  } catch (error) {
+      logger.warn({ error: error.message }, '⚠️  Instance manager initialization failed - running in single-instance mode');
+    }
+    
+    // Start event listener monitoring (runs regardless of instance manager status)
+    startListenerMonitoring();
+    
+    // Start message batch monitoring
+    startMessageBatchMonitoring();
+    
+    // Warm caches
+    await warmSessionCache();
+    
+    // Initialize existing sessions
+    await initializeExistingSessions();
+    
+    // Start orphaned agent monitoring
+    startOrphanedAgentMonitor();
+    
+    // Initialize performance reporter
+    try {
+      await performanceReporter.initialize();
+      loggers.perf.info('Performance reporter initialized');
+    } catch (error) {
+      loggers.perf.warn({ error: error.message }, 'Performance reporter initialization failed');
+    }
+    
+    // Start performance snapshot collection and reporting
+    startPerformanceReporting();
+    
+    // Start error pattern cleanup
+    errorTracker.startPatternCleanup();
+    loggers.perf.info('Error pattern cleanup started');
+    
+    // Start alerting service monitoring
+    alertingService.startMonitoring(module.exports, 60000);
+    loggers.perf.info('Alerting service started');
+    
+    // Configure alert event listener for external integrations
+    alertingService.on('alert', (alert) => {
+      // Log alert for external notification systems
+      loggers.perf.info({ alert }, 'Alert triggered - ready for external notification');
+      
+      // TODO: Add external integrations here (Slack, email, etc.)
+      // Example:
+      // if (alert.severity === 'critical') {
+      //   sendSlackAlert(alert);
+      //   sendEmailAlert(alert);
+      // }
+    });
+    
+    logger.info('✅ All services initialized');
+    
+  } catch (error) {
+    logger.error({ error: error.message }, '❌ Service initialization failed');
+    throw error;
+  }
+}
+
+// ============================================
+// GRACEFUL SHUTDOWN
+// ============================================
+
+/**
+ * Graceful shutdown handler
+ */
+async function gracefulShutdown(signal) {
+  logger.info({ signal }, 'Received shutdown signal');
+  
+  try {
+    // Stop accepting new connections
+    logger.info('Stopping new connections...');
+    
+    // Close all active sessions
+    logger.info({ count: activeSessions.size }, 'Closing active sessions...');
+    for (const [agentId, session] of activeSessions.entries()) {
+      try {
+        if (session.socket) {
+          await session.socket.logout();
+        }
+      } catch (error) {
+        loggers.connection.warn({ agentId: shortId(agentId) }, 'Error during session logout');
       }
     }
     
-    console.log('[RECONNECT-ALL] ✅ Reconnection process complete');
+    // Clean up all event listeners
+    loggers.connection.info('Cleaning up event listeners');
+    const listenerStats = getEventListenerStats();
+    loggers.connection.info({ 
+      totalListeners: listenerStats.totalListeners 
+    }, 'Removing all event listeners');
+    
+    for (const agentId of agentListeners.keys()) {
+      removeTrackedListeners(agentId);
+    }
+    
+    // Shutdown Redis
+    await redisCache.shutdown();
+    
+    // Shutdown instance manager
+    if (instanceManager.isActive) {
+      await instanceManager.shutdown();
+    }
+    
+    logger.info('✅ Graceful shutdown complete');
+    process.exit(0);
+    
   } catch (error) {
-    console.error('[RECONNECT-ALL] ❌ Error in reconnectAllAgents:', error);
+    logger.error({ error: error.message }, 'Error during shutdown');
+    process.exit(1);
+  }
+}
+
+// ============================================
+// INSTANCE HEALTH ENDPOINT
+// ============================================
+
+/**
+ * Get instance health status
+ * Used by load balancers and monitoring
+ */
+async function getInstanceHealth() {
+  // Get stats if instance manager is active, otherwise use fallback values
+  const stats = instanceManager.isActive ? instanceManager.getStats() : null;
+  const memory = process.memoryUsage();
+  
+  // Update active connections gauge
+  recordMetric(() => {
+    if (connectionMetrics?.active) {
+      connectionMetrics.active.set(activeSessions.size);
+    }
+  });
+  
+  // Get cache statistics
+  let cacheStats = null;
+  try {
+    cacheStats = await getCacheStats();
+  } catch (error) {
+    logger.warn({ error: error.message }, 'Failed to get cache stats');
+  }
+  
+  // Calculate active agents - use multiple sources and take the maximum
+  // 1. Instance manager assigned agents (if instance manager is active)
+  // 2. Active sessions in memory (actual connected sockets - only count isConnected=true)
+  // 3. Database connected sessions (source of truth)
+  let activeAgentsFromInstance = stats ? stats.assignedAgents : 0;
+  
+  // Count only truly connected sessions in memory (where isConnected === true)
+  let activeAgentsFromMemory = 0;
+  for (const [agentId, session] of activeSessions.entries()) {
+    if (session && session.isConnected === true) {
+      activeAgentsFromMemory++;
+    }
+  }
+  
+  let activeAgentsFromDatabase = 0;
+  
+  // Always check database for connected sessions (source of truth)
+  // Use actual data fetch instead of count query for more reliability
+  try {
+    // Fetch actual sessions and count manually - more reliable than count query
+    const { data: sessionsData, error: dbError } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('agent_id, status, is_active, last_heartbeat')
+      .eq('is_active', true);
+    
+    if (dbError) {
+      console.error('[HEALTH] ❌ Database query error:', dbError);
+      logger.warn({ error: dbError.message }, 'Failed to get active agents from database');
+      activeAgentsFromDatabase = 0;
+    } else if (sessionsData && Array.isArray(sessionsData)) {
+      // Count sessions with status = 'connected' (case-insensitive check)
+      const connectedSessions = sessionsData.filter(s => {
+        const status = s.status?.toLowerCase() || '';
+        const isActive = s.is_active === true || s.is_active === 'true' || s.is_active === 1;
+        return isActive && (status === 'connected' || status === 'pairing_complete' || status === 'reconnecting_after_pairing');
+      });
+      
+      activeAgentsFromDatabase = connectedSessions.length;
+      
+      // Debug logging
+      if (activeAgentsFromDatabase > 0) {
+        console.log(`[HEALTH] ✅ Found ${activeAgentsFromDatabase} active connected session(s) in database`);
+        console.log('[HEALTH] Connected sessions:', connectedSessions.map(s => ({
+          agent_id: s.agent_id?.substring(0, 8) + '...',
+          status: s.status,
+          is_active: s.is_active,
+          last_heartbeat: s.last_heartbeat
+        })));
+        logger.debug({ 
+          count: activeAgentsFromDatabase, 
+          source: 'database',
+          sessions: connectedSessions.length
+        }, 'Found active connected sessions in database');
+      } else if (sessionsData.length > 0) {
+        // Log all sessions if none are connected (for debugging)
+        console.log('[HEALTH] ℹ️ Found sessions but none are connected:', sessionsData.map(s => ({
+          agent_id: s.agent_id?.substring(0, 8) + '...',
+          status: s.status,
+          is_active: s.is_active
+        })));
+      }
+    } else {
+      console.log('[HEALTH] ⚠️ Database query returned no data');
+      activeAgentsFromDatabase = 0;
+    }
+  } catch (error) {
+    console.error('[HEALTH] ❌ Exception getting active agents:', error);
+    logger.warn({ error: error.message, stack: error.stack }, 'Exception getting active agents from database');
+    activeAgentsFromDatabase = 0;
+  }
+  
+  // Use the maximum of all three sources to get the most accurate count
+  // This ensures we show connected agents even if tracking is slightly out of sync
+  const activeAgentsCount = Math.max(
+    activeAgentsFromInstance,
+    activeAgentsFromMemory,
+    activeAgentsFromDatabase
+  );
+  
+  // Always log the counts for debugging (not just on discrepancy)
+  logger.debug({
+    instanceManager: activeAgentsFromInstance,
+    activeSessions: activeAgentsFromMemory,
+    database: activeAgentsFromDatabase,
+    final: activeAgentsCount,
+    activeSessionsSize: activeSessions.size
+  }, 'Active agent count calculation');
+  
+  // Log warning if there's a significant discrepancy
+  if (activeAgentsFromDatabase > 0 && activeAgentsCount === 0) {
+    logger.warn({
+      instanceManager: activeAgentsFromInstance,
+      activeSessions: activeAgentsFromMemory,
+      database: activeAgentsFromDatabase,
+      final: activeAgentsCount
+    }, '⚠️ Database shows connected sessions but count is 0 - check Math.max logic');
+  }
+  
+  return {
+    status: instanceManager.isActive && stats ? 'healthy' : 'healthy', // Always healthy if process is running
+    instance: stats ? {
+      id: stats.instanceId,
+      hostname: stats.hostname,
+      uptime: stats.uptime,
+      pid: stats.pid
+    } : {
+      id: process.env.INSTANCE_ID || `${require('os').hostname()}-${process.pid}`,
+      hostname: require('os').hostname(),
+      uptime: process.uptime(),
+      pid: process.pid
+    },
+    agents: {
+      assigned: activeAgentsCount,
+      max: stats ? stats.maxAgents : 200, // Default max if no stats
+      utilization: stats ? stats.utilization : `${((activeAgentsCount / 200) * 100).toFixed(1)}%`
+    },
+    // Add activeAgents for backward compatibility with frontend
+    activeAgents: activeAgentsCount,
+    resources: {
+      memory: {
+        rss: Math.round(memory.rss / 1024 / 1024) + 'MB',
+        heapUsed: Math.round(memory.heapUsed / 1024 / 1024) + 'MB',
+        heapTotal: Math.round(memory.heapTotal / 1024 / 1024) + 'MB'
+      },
+      cpu: process.cpuUsage()
+    },
+    redis: {
+      connected: redisCache.isReady()
+    },
+    cache: cacheStats,
+    eventListeners: getEventListenerStats(),
+    messageQueue: {
+      agentsWithPending: messageBatchQueue.size,
+      totalPending: Array.from(messageBatchQueue.values())
+        .reduce((sum, queue) => sum + queue.length, 0),
+      pendingByAgent: Object.fromEntries(
+        Array.from(messageBatchQueue.entries())
+          .filter(([_, queue]) => queue.length > 0)
+          .map(([agentId, queue]) => [shortId(agentId), queue.length])
+      )
+    },
+    localCaches: {
+      validation: {
+        size: validationCache.size,
+        max: CACHE_CONFIG.validation.max,
+        utilization: `${(validationCache.size / CACHE_CONFIG.validation.max * 100).toFixed(1)}%`
+      },
+      lidToPhone: {
+        size: lidToPhoneCache.size,
+        max: CACHE_CONFIG.lidToPhone.max,
+        utilization: `${(lidToPhoneCache.size / CACHE_CONFIG.lidToPhone.max * 100).toFixed(1)}%`
+      },
+      session: {
+        size: SESSION_CACHE.size,
+        max: CACHE_CONFIG.session.max,
+        utilization: `${(SESSION_CACHE.size / CACHE_CONFIG.session.max * 100).toFixed(1)}%`
+      }
+    },
+    errorStats: {
+      last1Hour: errorTracker.getErrorStats(3600000),
+      last5Minutes: errorTracker.getErrorStats(300000),
+      currentRate: `${errorTracker.getErrorRate(300000)}/min`
+    },
+    alertStats: alertingService.getAlertStats(3600000),
+    timestamp: new Date().toISOString()
+  };
+}
+
+// Register shutdown handlers
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Call on module load
+initializeServices().catch(error => {
+  logger.fatal({ error: error.message }, 'Failed to initialize services');
+  process.exit(1);
+});
+
+/**
+ * Get cache statistics
+ * @returns {Promise<Object|null>} Cache statistics or null
+ */
+async function getCacheStats() {
+  try {
+    const stats = await sessionCache.getSessionStats();
+    const memory = await sessionCache.getMemoryUsage();
+    
+    return {
+      ...stats,
+      memory,
+    };
+  } catch (error) {
+    logger.error({ error: error.message }, 'Error getting cache stats');
+    return null;
   }
 }
 
@@ -5154,5 +8164,27 @@ module.exports = {
   cleanupMonitoring,
   startAllMonitoring,
   connectionMonitors,
-  healthCheckIntervals
+  healthCheckIntervals,
+  clearAllCaches,
+  warmSessionCache,
+  getInstanceHealth,
+  getCacheStats,
+  getUserIdByAgentId,
+  batchUpdateSessionStatus,
+  // Prometheus metrics registry (for /metrics endpoint)
+  metricsRegistry,
+  // Prometheus custom metrics (for advanced monitoring)
+  connectionMetrics,
+  messageMetrics,
+  cacheMetrics,
+  databaseMetrics,
+  errorMetrics,
+  // Performance tracking
+  OperationTracker,
+  // Performance reporting
+  performanceReporter,
+  // Error tracking
+  errorTracker,
+  // Alerting
+  alertingService
 };

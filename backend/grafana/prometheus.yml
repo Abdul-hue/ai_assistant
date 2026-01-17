@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'pa-agent-monitor'
+
+scrape_configs:
+  - job_name: 'pa-agent'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets:
+          - 'localhost:3001'
+          - 'localhost:3002'
+          - 'localhost:3003'
+        labels:
+          env: 'production'
+          service: 'pa-agent'
+    metrics_path: '/api/metrics'
+    scheme: 'http'
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

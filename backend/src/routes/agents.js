@@ -938,6 +938,30 @@ router.post('/:agentId/init-whatsapp', authMiddleware, validateUUID('agentId'), 
         });
       }
 
+      // Handle agent assigned to different instance
+      if (result.reason === 'agent_assigned_to_different_instance') {
+        return res.status(409).json({
+          success: false,
+          status: 'instance_conflict',
+          error: 'Agent is assigned to a different server instance',
+          message: 'This agent is currently managed by another server instance. Please try again in a moment or contact support if the issue persists.',
+          reason: result.reason,
+          assignedInstance: result.assignedInstance
+        });
+      }
+
+      // Handle instance at capacity
+      if (result.reason === 'instance_at_capacity') {
+        return res.status(503).json({
+          success: false,
+          status: 'service_unavailable',
+          error: 'Server instance is at capacity',
+          message: 'The server instance is currently at maximum capacity. Please try again in a moment.',
+          reason: result.reason,
+          suggestedInstance: result.suggestedInstance
+        });
+      }
+
       res.status(500).json({
         success: false,
         error: result.error || 'Failed to initialize WhatsApp',

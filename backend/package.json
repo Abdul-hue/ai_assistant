@@ -12,7 +12,10 @@
     "lint": "eslint src/ app.js",
     "lint:fix": "eslint src/ app.js --fix",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "test:whatsapp": "node tests/whatsapp-connection.test.js"
+    "test:whatsapp": "node tests/whatsapp-connection.test.js",
+    "test:metrics": "node scripts/test-metrics.js",
+    "test:performance": "node scripts/test-performance-reporting.js",
+    "kill-server": "powershell -ExecutionPolicy Bypass -File scripts/kill-server.ps1"
   },
   "engines": {
     "node": "18.19.1"
@@ -33,16 +36,20 @@
     "express-rate-limit": "^8.1.0",
     "googleapis": "^166.0.0",
     "imap-simple": "^5.1.0",
+    "ioredis": "^5.3.2",
     "jsonwebtoken": "^9.0.0",
+    "lru-cache": "^7.18.3",
     "mailparser": "^3.9.0",
     "mammoth": "^1.6.0",
     "multer": "^1.4.5-lts.1",
     "node-cron": "^4.2.1",
     "nodemailer": "^7.0.11",
+    "p-limit": "^3.1.0",
     "pdf-parse": "^1.1.1",
     "pg": "^8.16.3",
     "pino": "^8.21.0",
     "pino-pretty": "^10.2.0",
+    "prom-client": "^15.1.3",
     "proper-lockfile": "^4.1.2",
     "qrcode": "^1.5.4",
     "qrcode-terminal": "^0.12.0",

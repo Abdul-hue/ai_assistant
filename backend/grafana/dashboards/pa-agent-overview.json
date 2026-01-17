@@ -1,0 +1,342 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "pa-agent-overview",
+    "title": "PA Agent - System Overview",
+    "tags": ["pa-agent", "whatsapp", "monitoring"],
+    "timezone": "browser",
+    "schemaVersion": 38,
+    "version": 1,
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+        "type": "stat",
+        "title": "Active Connections",
+        "targets": [
+          {
+            "expr": "pa_agent_connections_active{instance=~\"$instance\"}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "thresholds" },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": null, "color": "green" },
+                { "value": 50, "color": "yellow" },
+                { "value": 100, "color": "red" }
+              ]
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+        "type": "stat",
+        "title": "Message Rate (5m)",
+        "targets": [
+          {
+            "expr": "sum(rate(pa_agent_messages_received_total{instance=~\"$instance\"}[5m]))",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "thresholds" },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": null, "color": "blue" }
+              ]
+            },
+            "unit": "msg/sec"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+        "type": "stat",
+        "title": "Error Rate (5m)",
+        "targets": [
+          {
+            "expr": "sum(rate(pa_agent_errors_total{instance=~\"$instance\"}[5m]))",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "thresholds" },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": null, "color": "green" },
+                { "value": 1, "color": "yellow" },
+                { "value": 10, "color": "red" }
+              ]
+            },
+            "unit": "ops/sec"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+        "type": "stat",
+        "title": "Cache Hit Rate",
+        "targets": [
+          {
+            "expr": "sum(rate(pa_agent_cache_hits_total{instance=~\"$instance\"}[5m])) / (sum(rate(pa_agent_cache_hits_total{instance=~\"$instance\"}[5m])) + sum(rate(pa_agent_cache_misses_total{instance=~\"$instance\"}[5m]))) * 100",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "thresholds" },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                { "value": null, "color": "red" },
+                { "value": 50, "color": "yellow" },
+                { "value": 80, "color": "green" }
+              ]
+            },
+            "unit": "percent",
+            "min": 0,
+            "max": 100
+          }
+        }
+      },
+      {
+        "id": 5,
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+        "type": "timeseries",
+        "title": "Connection Rate",
+        "targets": [
+          {
+            "expr": "rate(pa_agent_connections_total{instance=~\"$instance\", result=\"success\"}[5m])",
+            "legendFormat": "{{instance}} - Success",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(pa_agent_connections_total{instance=~\"$instance\", result=\"failure\"}[5m])",
+            "legendFormat": "{{instance}} - Failure",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "unit": "ops/sec"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+        "type": "timeseries",
+        "title": "Connection Duration (P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(pa_agent_connection_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
+            "legendFormat": "{{instance}} - P95",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "unit": "s"
+          }
+        }
+      },
+      {
+        "id": 7,
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+        "type": "timeseries",
+        "title": "Message Throughput",
+        "targets": [
+          {
+            "expr": "rate(pa_agent_messages_received_total{instance=~\"$instance\"}[5m])",
+            "legendFormat": "{{instance}} - Received",
+            "refId": "A"
+          },
+          {
+            "expr": "rate(pa_agent_messages_sent_total{instance=~\"$instance\"}[5m])",
+            "legendFormat": "{{instance}} - Sent",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "unit": "msg/sec"
+          }
+        }
+      },
+      {
+        "id": 8,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+        "type": "timeseries",
+        "title": "Message Processing Time (P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(pa_agent_message_processing_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
+            "legendFormat": "{{instance}} - P95",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "unit": "s"
+          }
+        }
+      },
+      {
+        "id": 9,
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+        "type": "timeseries",
+        "title": "Cache Hit Rate by Type",
+        "targets": [
+          {
+            "expr": "sum(rate(pa_agent_cache_hits_total{instance=~\"$instance\", cache_type=\"session\"}[5m])) / (sum(rate(pa_agent_cache_hits_total{instance=~\"$instance\", cache_type=\"session\"}[5m])) + sum(rate(pa_agent_cache_misses_total{instance=~\"$instance\", cache_type=\"session\"}[5m]))) * 100",
+            "legendFormat": "Session Cache",
+            "refId": "A"
+          },
+          {
+            "expr": "sum(rate(pa_agent_cache_hits_total{instance=~\"$instance\", cache_type=\"validation\"}[5m])) / (sum(rate(pa_agent_cache_hits_total{instance=~\"$instance\", cache_type=\"validation\"}[5m])) + sum(rate(pa_agent_cache_misses_total{instance=~\"$instance\", cache_type=\"validation\"}[5m]))) * 100",
+            "legendFormat": "Validation Cache",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "unit": "percent",
+            "min": 0,
+            "max": 100
+          }
+        }
+      },
+      {
+        "id": 10,
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+        "type": "timeseries",
+        "title": "Cache Size",
+        "targets": [
+          {
+            "expr": "pa_agent_cache_size{instance=~\"$instance\"}",
+            "legendFormat": "{{cache_type}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 11,
+        "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+        "type": "timeseries",
+        "title": "Memory Usage",
+        "targets": [
+          {
+            "expr": "pa_agent_process_resident_memory_bytes{instance=~\"$instance\"} / 1024 / 1024",
+            "legendFormat": "{{instance}} - RSS",
+            "refId": "A"
+          },
+          {
+            "expr": "pa_agent_nodejs_heap_bytes_total{instance=~\"$instance\"} / 1024 / 1024",
+            "legendFormat": "{{instance}} - Heap Total",
+            "refId": "B"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "unit": "MB"
+          }
+        }
+      },
+      {
+        "id": 12,
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+        "type": "timeseries",
+        "title": "Error Rate by Category",
+        "targets": [
+          {
+            "expr": "sum(rate(pa_agent_errors_total{instance=~\"$instance\"}[5m])) by (category)",
+            "legendFormat": "{{category}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "unit": "ops/sec"
+          }
+        }
+      },
+      {
+        "id": 13,
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+        "type": "timeseries",
+        "title": "Database Query Duration (P95)",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(pa_agent_db_query_duration_seconds_bucket{instance=~\"$instance\"}[5m]))",
+            "legendFormat": "{{operation}} - {{table}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": { "mode": "palette-classic" },
+            "unit": "s"
+          }
+        }
+      }
+    ],
+    "time": {
+      "from": "now-1h",
+      "to": "now"
+    },
+    "timepicker": {
+      "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h"],
+      "time_options": ["5m", "15m", "1h", "6h", "12h", "24h", "7d", "30d"]
+    },
+    "templating": {
+      "list": [
+        {
+          "name": "instance",
+          "type": "query",
+          "datasource": "${DS_PROMETHEUS}",
+          "query": "label_values(pa_agent_connections_active, instance)",
+          "refresh": 1,
+          "includeAll": true,
+          "multi": true
+        }
+      ]
+    },
+    "annotations": {
+      "list": [
+        {
+          "name": "Deployments",
+          "datasource": "${DS_PROMETHEUS}",
+          "enable": true,
+          "iconColor": "rgba(0, 211, 255, 1)"
+        }
+      ]
+    }
+  }
+}

@@ -1,484 +1,482 @@
-# Phase 1 Testing Guide - WhatsApp Credential Persistence Fixes
+# Phase 1 Testing Guide - Connection Stability & Security
 
-## Pre-Deployment Checklist
+**Date:** 2025-01-15  
+**Phase:** Phase 1 - Critical Fixes  
+**Status:** Ready for Testing
 
-### 1. Database Migration (REQUIRED)
+---
+
+## 🎯 Overview
+
+This guide covers testing for Phase 1 optimizations:
+1. **Automatic Reconnection** with exponential backoff
+2. **QR Code Expiration** and regeneration
+3. **Credential Encryption** in database
+
+---
+
+## 📋 Prerequisites
+
+### 1. Environment Setup
+
+Ensure these environment variables are set in `.env`:
+
 ```bash
-# Run migration on your database
-psql -U your_user -d your_database -f backend/migrations/011_add_disconnected_at.sql
+# Required
+SUPABASE_URL=your_supabase_url
+SUPABASE_SERVICE_KEY=your_service_key
+CREDENTIALS_ENCRYPTION_KEY=your_64_hex_character_key
 
-# OR via Supabase Dashboard:
-# 1. Go to SQL Editor
-# 2. Copy contents of backend/migrations/011_add_disconnected_at.sql
-# 3. Execute the SQL
+# Optional (with defaults)
+RECONNECTION_MAX_ATTEMPTS=10
+RECONNECTION_BASE_DELAY_MS=2000
 ```
 
-**Verify migration:**
-```sql
-SELECT column_name, data_type 
-FROM information_schema.columns 
-WHERE table_name = 'whatsapp_sessions' 
-AND column_name = 'disconnected_at';
--- Should return: disconnected_at | timestamp without time zone
+### 2. Generate Encryption Key
+
+If you don't have `CREDENTIALS_ENCRYPTION_KEY`, generate one:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ```
 
-### 2. Backup Current State
-```bash
-# Backup database (recommended)
-pg_dump -U your_user your_database > backup_before_phase1_$(date +%Y%m%d_%H%M%S).sql
+Copy the 64-character hex string to your `.env` file.
 
-# Backup code
-git tag backup-before-phase1-$(date +%Y%m%d)
+---
+
+## 🧪 Automated Testing
+
+### Run Test Script
+
+```bash
+cd backend
+node scripts/test-phase1.js
 ```
 
-### 3. Code Deployment
-```bash
-# Pull latest changes
-git pull origin main
+### Expected Output
 
-# Verify changes are present
-grep -n "disconnected_at" backend/src/services/baileysService.js
-grep -n "validateCredentialFreshness" backend/src/services/baileysService.js
+```
+🧪 ============================================
+🧪 PHASE 1 TESTING - Connection Stability
+🧪 ============================================
 
-# Restart PM2 (if using PM2)
-pm2 restart all
-# OR
-pm2 restart your-app-name
+📋 Test 1: Encryption Configuration
+─────────────────────────────────────
+✅ Encryption key configured
+   Key length: 64 characters
+   Key preview: a1b2c3d4...
 
-# OR restart Node.js service
-systemctl restart your-service-name
+📋 Test 2: Database Encryption Status
+─────────────────────────────────────
+✅ Found 3 session(s) with credentials
+   Encrypted: 2
+   Unencrypted: 1 (legacy data)
+
+📋 Test 3: Reconnection Configuration
+─────────────────────────────────────
+✅ Max attempts: 10
+✅ Base delay: 2000ms
+✅ Max delay: 60000ms
+✅ Exponential backoff: 2s → 4s → 8s → 16s → 32s → 60s (max)
+
+📋 Test 4: Service Module Loading
+─────────────────────────────────────
+✅ baileysService.js loaded successfully
+✅ Encryption key validation passed
+
+📋 Test 5: Environment Configuration
+─────────────────────────────────────
+✅ SUPABASE_URL: Set
+✅ SUPABASE_SERVICE_KEY: Set
+✅ CREDENTIALS_ENCRYPTION_KEY: Set
+
+📊 ============================================
+📊 TEST SUMMARY
+📊 ============================================
+
+🎉 All Phase 1 tests passed!
 ```
 
 ---
 
-## Testing Checklist
+## 🔍 Manual Testing Checklist
 
-### Test 1: Clean Disconnect → Immediate Reconnect ✅
-
-**Objective:** Verify manual disconnect completely removes credentials and allows immediate reconnection.
+### Test 1: QR Code Generation & Expiration
 
 **Steps:**
-1. [ ] **Connect an agent** (if not already connected)
-   - Navigate to agent dashboard
-   - Click "Connect WhatsApp"
-   - Scan QR code
-   - Wait for connection confirmation
+1. ✅ Start backend server
+2. ✅ Navigate to agent creation/WhatsApp connection page
+3. ✅ Click "Connect WhatsApp" or similar button
+4. ✅ Verify QR code appears in UI
+5. ✅ **Wait 60 seconds without scanning**
+6. ✅ Verify QR code expires and clears from database
+7. ✅ Click "Connect" again - verify new QR code generates
 
-2. [ ] **Disconnect the agent**
-   - Click "Disconnect WhatsApp" button
-   - **Monitor logs** for cleanup steps:
-     ```
-     [BAILEYS] ==================== DISCONNECT START ====================
-     [BAILEYS] 🔐 Step 1: Attempting explicit logout...
-     [BAILEYS] ✅ Logout successful - device unregistered from WhatsApp servers
-     [BAILEYS] 🛑 Step 2: Stopping health check and heartbeat intervals...
-     [BAILEYS] ✅ Intervals cleared
-     [BAILEYS] 🔌 Step 3: Closing socket and removing event listeners...
-     [BAILEYS] ✅ Socket closed
-     [BAILEYS] 🗄️ Step 4: Clearing instance tracking in database...
-     [BAILEYS] ✅ Instance tracking cleared
-     [BAILEYS] 🧠 Step 5: Clearing from memory...
-     [BAILEYS] ✅ Memory cleared
-     [BAILEYS] 🗑️ Step 6: Deleting local auth directory...
-     [BAILEYS] ✅ Local credentials deleted
-     [BAILEYS] 🗄️ Step 7: Clearing database session data...
-     [BAILEYS] ✅ Database cleared
-     [BAILEYS] ✅ Step 8: Verifying cleanup...
-     [BAILEYS] ✅ All critical cleanup steps succeeded
-     [BAILEYS] ==================== DISCONNECT COMPLETE ====================
-     ```
+**Expected Behavior:**
+- QR code generated within 2-3 seconds
+- QR code expires after 60 seconds if not scanned
+- New QR code generates on next connection attempt
+- Logs show: `[QR] ⏰ QR code expired` and `[QR] ✅ QR cleared`
 
-3. [ ] **Verify local files deleted**
-   ```bash
-   # Check if auth directory exists (should NOT exist)
-   ls -la /root/pagent/backend/auth_sessions/{agentId}/
-   # Expected: No such file or directory
-   
-   # OR check all agent directories
-   ls -la /root/pagent/backend/auth_sessions/
-   # Should not contain the disconnected agent's directory
-   ```
+**Logs to Monitor:**
+```
+[BAILEYS] 📱 QR code generated for agent abc12345...
+[QR] ⏱️  QR will expire in 60 seconds for agent abc12345...
+[QR] ⏰ QR code expired for agent abc12345, clearing for regeneration
+[QR] ✅ QR cleared for agent abc12345, new QR will be generated on next connection attempt
+```
 
-4. [ ] **Verify database state**
+---
+
+### Test 2: Connection & Credential Encryption
+
+**Steps:**
+1. ✅ Generate QR code
+2. ✅ Scan QR code with WhatsApp mobile app
+3. ✅ Wait for connection to establish
+4. ✅ Verify connection success in UI
+5. ✅ Check database: `whatsapp_sessions` table
+6. ✅ Verify `session_data.encrypted = true`
+7. ✅ Verify `session_data.creds` contains encrypted data structure
+
+**Expected Behavior:**
+- Connection establishes within 5-10 seconds after QR scan
+- Credentials are encrypted before saving to database
+- Logs show: `[SECURITY] 🔐 Credentials encrypted and saved`
+- Database contains encrypted credentials with `encrypted: true` flag
+
+**Database Query:**
    ```sql
    SELECT 
      agent_id,
-     status,
-     is_active,
-     session_data,
-     disconnected_at,
+  session_data->>'encrypted' as is_encrypted,
+  session_data->'creds'->>'encrypted' as has_encrypted_creds,
      updated_at
    FROM whatsapp_sessions
-   WHERE agent_id = 'your-agent-id';
-   
-   -- Expected results:
-   -- status: 'disconnected'
-   -- is_active: false
-   -- session_data: NULL (not {} or empty string)
-   -- disconnected_at: timestamp (NOT NULL)
-   -- updated_at: recent timestamp
-   ```
-
-5. [ ] **Reconnect immediately** (no waiting)
-   - Click "Connect WhatsApp" immediately after disconnect
-   - **Expected:** Fresh QR code should generate within 5-10 seconds
-   - **No cooldown message** should appear
-   - **No Bad MAC errors** in logs
-   - **No 401 errors** in logs
-
-6. [ ] **Verify reconnection logs**
-   ```
-   [BAILEYS] ==================== INITIALIZATION START ====================
-   [BAILEYS] 🔍 Checking database status FIRST (before local files)...
-   [BAILEYS] ⚠️ Database status is 'disconnected' - forcing fresh start
-   [BAILEYS] 🗑️ Deleting local auth directory (disconnected session)...
-   [BAILEYS] ✅ Local credentials deleted
-   [BAILEYS] ✅ Database cleared - will generate fresh QR
-   [BAILEYS] 🆕 Creating fresh auth state for QR generation...
-   [BAILEYS] 🎯 QR CODE RECEIVED!
-   ```
-
-**Success Criteria:**
-- ✅ All 8 cleanup steps succeed
-- ✅ Local files deleted
-- ✅ Database `session_data` is NULL
-- ✅ `status` = 'disconnected'
-- ✅ `disconnected_at` is set
-- ✅ Fresh QR generates immediately (no cooldown)
-- ✅ No Bad MAC or 401 errors
-
----
-
-### Test 2: Verify Logout Attempt ✅
-
-**Objective:** Verify explicit logout from WhatsApp servers is attempted.
-
-**Steps:**
-1. [ ] **Monitor logs during disconnect**
-   - Look for one of these messages:
-     - `[BAILEYS] ✅ Logout successful - device unregistered from WhatsApp servers`
-     - `[BAILEYS] ℹ️ Logout skipped: Socket not connected or logout not available`
-     - `[BAILEYS] ⚠️ Logout failed (non-critical): [error message]`
-
-2. [ ] **Verify logout doesn't block cleanup**
-   - Even if logout fails, cleanup should continue
-   - All other steps should complete successfully
-
-**Success Criteria:**
-- ✅ Logout attempt is logged
-- ✅ Cleanup continues even if logout fails
-- ✅ No critical errors from logout attempt
-
----
-
-### Test 3: Database Resilience (Retry Logic) ✅
-
-**Objective:** Verify retry logic handles transient database failures.
-
-**Steps:**
-1. [ ] **Simulate slow database** (optional - for testing)
-   ```sql
-   -- Add artificial delay (PostgreSQL)
-   -- This is just for testing - remove after
-   ```
-
-2. [ ] **Disconnect agent**
-   - Monitor logs for retry attempts:
-     ```
-     [BAILEYS] ⚠️ Database clear failed (attempt 1/3), retrying...
-     [BAILEYS] ⚠️ Database clear failed (attempt 2/3), retrying...
-     [BAILEYS] ✅ Database cleared (attempt 3)
-     ```
-
-3. [ ] **Verify exponential backoff**
-   - Retries should have increasing delays (500ms, 1000ms, 1500ms)
-   - Check timestamps in logs
-
-**Success Criteria:**
-- ✅ Retry logic activates on failure
-- ✅ Up to 3 attempts are made
-- ✅ Exponential backoff is used
-- ✅ Cleanup eventually succeeds
-
----
-
-### Test 4: Credential Freshness Validation ✅
-
-**Objective:** Verify stale credentials are rejected after disconnect.
-
-**Steps:**
-1. [ ] **Disconnect agent** (from Test 1)
-
-2. [ ] **Manually create stale credentials** (simulate old state)
-   ```bash
-   # Create auth directory with old credentials
-   mkdir -p /root/pagent/backend/auth_sessions/{agentId}
-   echo '{"me":{"id":"old-device-id"},"registered":false}' > /root/pagent/backend/auth_sessions/{agentId}/creds.json
-   ```
-
-3. [ ] **Attempt reconnection**
-   - Monitor logs for validation:
-     ```
-     [BAILEYS] 🔍 Validating credential freshness...
-     [BAILEYS] ❌ Credentials rejected: Session status is 'disconnected' (manual disconnect)
-     [BAILEYS] Will generate fresh QR instead
-     ```
-
-4. [ ] **Verify fresh QR is generated**
-   - Stale credentials should be ignored
-   - Fresh QR should appear
-
-**Success Criteria:**
-- ✅ Stale credentials are detected
-- ✅ Credentials are rejected with clear reason
-- ✅ Fresh QR is generated despite stale credentials
-
----
-
-### Test 5: Multiple Disconnect/Reconnect Cycles ✅
-
-**Objective:** Verify system handles multiple disconnect/reconnect cycles correctly.
-
-**Steps:**
-1. [ ] **Cycle 1:** Disconnect → Reconnect → Verify
-2. [ ] **Cycle 2:** Disconnect → Reconnect → Verify
-3. [ ] **Cycle 3:** Disconnect → Reconnect → Verify
-
-**Success Criteria:**
-- ✅ Each cycle completes successfully
-- ✅ No credential persistence between cycles
-- ✅ Fresh QR generated each time
-- ✅ No errors accumulate
-
----
-
-## Monitoring During Testing
-
-### Key Success Indicators ✅
-
-Look for these log messages:
-
-1. **Disconnect Success:**
-   ```
-   [BAILEYS] ✅ All critical cleanup steps succeeded
-   [BAILEYS] ==================== DISCONNECT COMPLETE ====================
-   ```
-
-2. **Reconnection Success:**
-   ```
-   [BAILEYS] ✅ Credentials validated: Fresh and valid
-   [BAILEYS] 🎯 QR CODE RECEIVED!
-   ```
-
-3. **Fresh Start:**
-   ```
-   [BAILEYS] ⚠️ Database status is 'disconnected' - forcing fresh start
-   [BAILEYS] 🆕 Creating fresh auth state for QR generation...
-   ```
-
-### Error Patterns to Watch For ⚠️
-
-**If you see these, Phase 1 may not be working:**
-
-1. **Bad MAC Errors:**
-   ```
-   [BAILEYS] ❌ Bad MAC Error detected - Session corruption detected
-   ```
-   - **Action:** Check if credentials were properly cleared
-
-2. **401 Errors on Reconnect:**
-   ```
-   [BAILEYS] ❌ 401 - Clearing session due to conflict or device removal
-   ```
-   - **Action:** Verify logout was attempted and succeeded
-
-3. **Stale Credentials Used:**
-   ```
-   [BAILEYS] ✅ Found valid credentials with paired device - loading...
-   ```
-   - **After disconnect:** This should NOT appear immediately after disconnect
-   - **Action:** Verify database status check is running first
-
-4. **Cooldown After Disconnect:**
-   ```
-   [BAILEYS] 🚫 401 error occurred recently... Auto-retry blocked
-   ```
-   - **After manual disconnect:** This should NOT appear
-   - **Action:** Verify `last401Failure` is cleared on disconnect
-
----
-
-## Database Verification Queries
-
-### Check Disconnect State
-```sql
-SELECT 
-  agent_id,
-  status,
-  is_active,
-  CASE 
-    WHEN session_data IS NULL THEN 'NULL ✅'
-    WHEN session_data::text = '{}' THEN 'Empty Object ❌'
-    WHEN session_data::text = '""' THEN 'Empty String ❌'
-    ELSE 'Has Data ❌'
-  END as session_data_status,
-  disconnected_at,
-  updated_at,
-  phone_number
-FROM whatsapp_sessions
-WHERE agent_id = 'your-agent-id';
+WHERE session_data IS NOT NULL
+ORDER BY updated_at DESC
+LIMIT 5;
 ```
 
-### Check All Disconnected Sessions
-```sql
-SELECT 
-  agent_id,
-  status,
-  disconnected_at,
-  updated_at,
-  CASE 
-    WHEN disconnected_at IS NOT NULL THEN 'Manual Disconnect ✅'
-    WHEN status = 'disconnected' AND disconnected_at IS NULL THEN 'Error Disconnect ⚠️'
-    ELSE 'Unknown'
-  END as disconnect_type
-FROM whatsapp_sessions
-WHERE status = 'disconnected'
-ORDER BY updated_at DESC;
-```
+**Expected Result:**
+- `is_encrypted` = `"true"`
+- `has_encrypted_creds` = encrypted hex string (not plain JSON)
 
-### Verify No Stale Credentials
-```sql
--- Should return 0 rows if cleanup worked
-SELECT 
-  agent_id,
-  status,
-  session_data
-FROM whatsapp_sessions
-WHERE status = 'disconnected'
-AND session_data IS NOT NULL;
+**Logs to Monitor:**
+```
+[BAILEYS] 🎉 CONNECTION SUCCESS 🎉
+[SECURITY] 🔐 Credentials encrypted and saved for agent abc12345
+[BAILEYS] ✅ Credentials synced to database successfully
 ```
 
 ---
 
-## Troubleshooting
+### Test 3: Automatic Reconnection
 
-### Issue: Local Files Not Deleted
+**Steps:**
+1. ✅ Connect agent successfully
+2. ✅ Verify connection is active (send a test message)
+3. ✅ **Disable network connection** (unplug ethernet or disable WiFi)
+4. ✅ Wait 10-15 seconds
+5. ✅ **Re-enable network connection**
+6. ✅ Monitor logs for reconnection attempts
+7. ✅ Verify connection re-establishes automatically
 
-**Symptoms:**
-- Auth directory still exists after disconnect
-- Logs show: `[BAILEYS] ❌ Failed to delete local auth directory`
+**Expected Behavior:**
+- Connection drops when network is disabled
+- Automatic reconnection triggers after disconnect
+- Exponential backoff: 2s → 4s → 8s → 16s → 32s → 60s
+- Connection re-establishes within 1-2 minutes
+- No manual intervention required
 
-**Solutions:**
-1. Check file permissions:
-   ```bash
-   ls -la /root/pagent/backend/auth_sessions/
-   chmod -R 755 /root/pagent/backend/auth_sessions/
-   ```
+**Logs to Monitor:**
+```
+[BAILEYS] 🔌 Connection closed for abc12345
+[BAILEYS] Status code: 428, Reason: Connection Lost
+[RECONNECT] 🔄 Agent abc12345 - scheduling attempt 1/10 in 2s
+[RECONNECT] 🔌 Agent abc12345 - attempting reconnection...
+[RECONNECT] ✅ Agent abc12345 - reconnection successful!
+[BAILEYS] 🎉 CONNECTION SUCCESS 🎉
+```
 
-2. Manually delete:
-   ```bash
-   rm -rf /root/pagent/backend/auth_sessions/{agentId}
-   ```
-
-3. Check disk space:
-   ```bash
-   df -h
-   ```
-
-### Issue: Database Update Fails
-
-**Symptoms:**
-- Logs show: `[BAILEYS] ❌ Failed to clear database after 3 attempts`
-
-**Solutions:**
-1. Check database connection:
-   ```sql
-   SELECT NOW();
-   ```
-
-2. Check for locks:
-   ```sql
-   SELECT * FROM pg_locks WHERE relation = 'whatsapp_sessions'::regclass;
-   ```
-
-3. Manually update:
-   ```sql
-   UPDATE whatsapp_sessions
-   SET 
-     session_data = NULL,
-     status = 'disconnected',
-     disconnected_at = NOW(),
-     is_active = false
-   WHERE agent_id = 'your-agent-id';
-   ```
-
-### Issue: Cooldown Still Applies After Disconnect
-
-**Symptoms:**
-- Reconnect shows: `Please wait X minute(s) before retrying`
-
-**Solutions:**
-1. Check `last401Failure` is cleared:
-   - Look for: `[BAILEYS] ✅ 401 failure cooldown cleared (manual disconnect)`
-
-2. Verify database status:
-   ```sql
-   SELECT status FROM whatsapp_sessions WHERE agent_id = 'your-agent-id';
-   -- Should be 'disconnected', not 'conflict'
-   ```
-
-3. Check logs for cooldown bypass logic
+**Reconnection Timeline:**
+- **Attempt 1:** 2 seconds (base delay)
+- **Attempt 2:** 4 seconds (2^1 * base)
+- **Attempt 3:** 8 seconds (2^2 * base)
+- **Attempt 4:** 16 seconds (2^3 * base)
+- **Attempt 5:** 32 seconds (2^4 * base)
+- **Attempt 6+:** 60 seconds (max delay)
 
 ---
 
-## Rollback Plan
+### Test 4: Credential Decryption on Restore
 
-If Phase 1 causes issues, follow these steps:
+**Steps:**
+1. ✅ Ensure agent has encrypted credentials in database
+2. ✅ Restart backend server
+3. ✅ Verify agent reconnects automatically on startup
+4. ✅ Check logs for decryption messages
+5. ✅ Verify connection succeeds
 
-### Quick Rollback (Code Only)
+**Expected Behavior:**
+- Server starts without errors
+- Credentials are decrypted when restoring from database
+- Connection re-establishes using decrypted credentials
+- Logs show: `[SECURITY] 🔓 Credentials decrypted`
+
+**Logs to Monitor:**
+```
+[BAILEYS] 🔄 Attempting to restore credentials from database...
+[SECURITY] 🔓 Credentials decrypted for agent abc12345
+[BAILEYS] ✅ Credentials restored from database
+[BAILEYS] 🎉 CONNECTION SUCCESS 🎉
+```
+
+---
+
+### Test 5: Non-Retryable Errors
+
+**Steps:**
+1. ✅ Connect agent
+2. ✅ Manually logout from WhatsApp mobile app
+3. ✅ Verify connection closes
+4. ✅ Verify **NO** automatic reconnection attempts
+5. ✅ Verify status set to 'error' in database
+
+**Expected Behavior:**
+- Connection closes with status code 401 (logged out)
+- No reconnection attempts (non-retryable error)
+- Database status: `error`
+- User must reconnect manually
+
+**Logs to Monitor:**
+```
+[BAILEYS] 🔌 Connection closed for abc12345
+[BAILEYS] Status code: 401, Reason: Logged Out
+[RECONNECT] ⏭️  Agent abc12345 - skipping non-retryable error 401
+```
+
+---
+
+### Test 6: Memory Leak Check
+
+**Steps:**
+1. ✅ Start backend server
+2. ✅ Connect 5-10 agents
+3. ✅ Let run for 1 hour
+4. ✅ Monitor memory usage
+5. ✅ Check for interval leaks
+6. ✅ Verify no memory growth
+
+**Expected Behavior:**
+- Memory usage stable (no continuous growth)
+- No orphaned intervals
+- No memory leaks in reconnection timers
+- All cleanup functions working
+
+**Monitoring Commands:**
 ```bash
-# Revert to previous commit
-git revert HEAD
-# OR
-git reset --hard backup-before-phase1-YYYYMMDD
+# Check memory usage
+node -e "console.log(process.memoryUsage())"
 
-# Restart service
-pm2 restart all
+# Monitor over time (every 5 minutes)
+watch -n 300 "node -e 'console.log(process.memoryUsage())'"
 ```
 
-### Full Rollback (Code + Database)
-```bash
-# 1. Revert code (above)
+**Success Criteria:**
+- Memory usage stays within 200-500 MB per agent
+- No memory growth > 10% over 1 hour
+- No "MaxListenersExceededWarning" in logs
 
-# 2. Remove column (if needed)
-psql -U your_user -d your_database -c "
-ALTER TABLE whatsapp_sessions DROP COLUMN IF EXISTS disconnected_at;
-"
+---
 
-# 3. Restore database backup (if needed)
-psql -U your_user -d your_database < backup_before_phase1_YYYYMMDD_HHMMSS.sql
+## 🐛 Troubleshooting
+
+### Issue: Encryption Key Not Set
+
+**Error:**
+```
+❌ CREDENTIALS_ENCRYPTION_KEY not set in environment!
+```
+
+**Solution:**
+1. Generate key: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+2. Add to `.env`: `CREDENTIALS_ENCRYPTION_KEY=<generated-key>`
+3. Restart server
+
+---
+
+### Issue: Reconnection Not Working
+
+**Symptoms:**
+- Connection drops but no reconnection attempts
+- Logs show: `⏭️ skipping reconnection`
+
+**Check:**
+1. Verify status code is not in `nonRetryableCodes` (440, 401, 403, 428)
+2. Check database status is not 'disconnected' (user-initiated)
+3. Verify `attemptReconnection()` is being called
+
+**Debug:**
+```javascript
+// Add to connection.close handler
+console.log('Reconnection check:', {
+  statusCode,
+  isNonRetryable: RECONNECTION_CONFIG.nonRetryableCodes.includes(statusCode),
+  shouldReconnect
+});
 ```
 
 ---
 
-## Success Metrics
+### Issue: Credentials Not Encrypting
 
-After completing all tests, you should see:
+**Symptoms:**
+- Database shows `encrypted: false` or missing
+- No `[SECURITY] 🔐` logs
 
-- ✅ **100% disconnect cleanup success rate**
-- ✅ **0 Bad MAC errors** on reconnection
-- ✅ **0 401 conflicts** after manual disconnect
-- ✅ **0 cooldown delays** after manual disconnect
-- ✅ **Fresh QR generation** within 5-10 seconds
+**Check:**
+1. Verify `encryptCredentials()` is called in `syncCredsToDatabase`
+2. Check encryption key is valid (64 hex characters)
+3. Verify no errors in encryption function
+
+**Debug:**
+```javascript
+// Add to syncCredsToDatabase
+try {
+  const encryptedCreds = encryptCredentials(credsData);
+  console.log('Encryption result:', {
+    hasEncrypted: !!encryptedCreds.encrypted,
+    hasIV: !!encryptedCreds.iv,
+    hasAuthTag: !!encryptedCreds.authTag
+  });
+} catch (error) {
+  console.error('Encryption error:', error);
+}
+```
 
 ---
 
-## Next Steps
+### Issue: QR Code Not Expiring
 
-Once Phase 1 testing is successful:
+**Symptoms:**
+- QR code remains in database after 60 seconds
+- No expiration logs
 
-1. ✅ Document any issues found
-2. ✅ Proceed to Phase 2 (Cooldown Bypass)
-3. ✅ Monitor production for 24-48 hours
-4. ✅ Collect metrics on disconnect/reconnect success rates
+**Check:**
+1. Verify `QR_EXPIRATION_TIMERS` Map is working
+2. Check timer is set: `QR_EXPIRATION_TIMERS.set(agentId, qrTimerId)`
+3. Verify timer callback executes
 
+**Debug:**
+```javascript
+// Add to QR handler
+console.log('QR timer set:', {
+  agentId: agentId.substring(0, 8),
+  timerId: qrTimerId,
+  expiresIn: '60s'
+});
+```
+
+---
+
+## 📊 Success Criteria
+
+### ✅ All Tests Pass
+
+- [x] Automated test script passes
+- [x] QR code expires after 60 seconds
+- [x] Credentials encrypted in database
+- [x] Automatic reconnection works
+- [x] No memory leaks after 1 hour
+- [x] No errors in logs
+
+### ✅ Performance Metrics
+
+- **Connection Time:** < 5 seconds
+- **Reconnection Time:** < 2 minutes (with exponential backoff)
+- **Memory per Agent:** < 100 MB
+- **QR Expiration:** Exactly 60 seconds
+
+### ✅ Security Metrics
+
+- **Encryption:** 100% of new credentials encrypted
+- **Key Validation:** Key validated on startup
+- **Decryption:** Successful for all encrypted credentials
+
+---
+
+## 📝 Test Report Template
+
+After completing tests, fill out:
+
+```markdown
+## Phase 1 Test Report
+
+**Date:** YYYY-MM-DD
+**Tester:** [Your Name]
+**Environment:** [Development/Staging/Production]
+
+### Test Results
+
+| Test | Status | Notes |
+|------|--------|-------|
+| QR Expiration | ✅/❌ | |
+| Credential Encryption | ✅/❌ | |
+| Automatic Reconnection | ✅/❌ | |
+| Memory Leak Check | ✅/❌ | |
+
+### Issues Found
+
+1. [Issue description]
+   - **Severity:** High/Medium/Low
+   - **Status:** Fixed/Pending
+
+### Performance Metrics
+
+- Average connection time: ___ seconds
+- Average reconnection time: ___ seconds
+- Memory usage: ___ MB per agent
+
+### Recommendations
+
+[Any recommendations for improvements]
+```
+
+---
+
+## 🚀 Next Steps After Testing
+
+1. **If All Tests Pass:**
+   - Deploy to staging environment
+   - Run extended tests (24 hours)
+   - Monitor production metrics
+
+2. **If Tests Fail:**
+   - Review error logs
+   - Check troubleshooting section
+   - Fix issues and re-test
+
+3. **Documentation:**
+   - Update deployment guide
+   - Document encryption key management
+   - Create runbook for operations team
+
+---
+
+## 📞 Support
+
+If you encounter issues during testing:
+
+1. Check logs: `backend/logs/` or console output
+2. Review this guide's troubleshooting section
+3. Check GitHub issues for known problems
+4. Contact development team with:
+   - Test case that failed
+   - Error logs
+   - Environment details
+
+---
+
+**Last Updated:** 2025-01-15  
+**Version:** 1.0.0

@@ -873,8 +873,8 @@ const UnifiedEmailInbox = () => {
                   {accountInfo.email.charAt(0).toUpperCase()}
                 </div>
                 <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate flex-1">
-                  {accountInfo.email}
-                </p>
+                {accountInfo.email}
+              </p>
               </div>
             </div>
           )}
@@ -974,33 +974,33 @@ const UnifiedEmailInbox = () => {
               )}
             </div>
             <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                size="icon"
+            <Button
+              variant="outline"
+              size="icon"
                 className="h-10 w-10 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-110"
-                onClick={() => {
-                  setLastRefresh(new Date());
-                  loadImapEmails();
-                }}
-                disabled={loading}
-                title="Refresh emails (auto-refreshes every 15 minutes)"
-              >
+              onClick={() => {
+                setLastRefresh(new Date());
+                loadImapEmails();
+              }}
+              disabled={loading}
+              title="Refresh emails (auto-refreshes every 15 minutes)"
+            >
                 <RefreshCw className={`h-5 w-5 ${loading ? "animate-spin" : ""}`} />
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
                 className="h-10 px-4 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-105 font-medium"
-                onClick={() => {
-                  console.log('🔄 Manual sync from IMAP triggered');
-                  triggerInitialSync();
-                }}
-                disabled={loading}
-                title="Sync emails from IMAP server"
-              >
-                <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
-                Sync from IMAP
-              </Button>
+              onClick={() => {
+                console.log('🔄 Manual sync from IMAP triggered');
+                triggerInitialSync();
+              }}
+              disabled={loading}
+              title="Sync emails from IMAP server"
+            >
+              <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
+              Sync from IMAP
+            </Button>
             </div>
           </div>
 
@@ -1092,26 +1092,26 @@ const UnifiedEmailInbox = () => {
                         }`}>
                           {(email.from || email.fromEmail || "U").charAt(0).toUpperCase()}
                         </div>
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2 mb-1">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1">
                             <p className={`font-semibold truncate ${
                               !email.isRead ? 'text-gray-900 dark:text-gray-100 text-lg' : 'text-gray-700 dark:text-gray-300'
                             }`}>
-                              {email.from || email.fromEmail || "Unknown"}
-                            </p>
-                            {!email.isRead && (
+                          {email.from || email.fromEmail || "Unknown"}
+                        </p>
+                        {!email.isRead && (
                               <div className="h-2 w-2 rounded-full bg-blue-500 animate-pulse flex-shrink-0"></div>
-                            )}
-                          </div>
+                        )}
+                      </div>
                           <p className={`text-base font-medium truncate mb-2 ${
                             !email.isRead ? 'text-gray-900 dark:text-gray-100' : 'text-gray-600 dark:text-gray-400'
                           }`}>
-                            {email.subject || "(No subject)"}
-                          </p>
-                          <p className="text-sm text-muted-foreground line-clamp-2">
+                        {email.subject || "(No subject)"}
+                      </p>
+                      <p className="text-sm text-muted-foreground line-clamp-2">
                             {email.body?.substring(0, 120) || ""}
-                          </p>
-                        </div>
+                      </p>
+                    </div>
                       </div>
                     </div>
                     <div className="flex flex-col items-end gap-2 flex-shrink-0">
@@ -1173,20 +1173,20 @@ const UnifiedEmailInbox = () => {
               </div>
             </DialogHeader>
             <div className="space-y-6 pt-4">
-              <div className="space-y-4">
+            <div className="space-y-4">
                 <div className="flex items-start justify-between gap-4">
                   <div className="flex-1 space-y-3">
                     <div className="flex items-center gap-3">
                       <div className="h-12 w-12 rounded-full bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-white font-bold text-lg shadow-lg">
                         {(selectedEmail.from || selectedEmail.fromEmail || "U").charAt(0).toUpperCase()}
                       </div>
-                      <div>
+                  <div>
                         <p className="font-semibold text-lg text-gray-900 dark:text-gray-100">
                           {selectedEmail.from || selectedEmail.fromEmail}
-                        </p>
-                        <p className="text-sm text-muted-foreground">
-                          {formatEmailDate(selectedEmail.date)}
-                        </p>
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                      {formatEmailDate(selectedEmail.date)}
+                    </p>
                       </div>
                     </div>
                     <div className="pl-[60px] space-y-1">
@@ -1227,15 +1227,15 @@ const UnifiedEmailInbox = () => {
               <div className="border-t border-gray-200 dark:border-gray-700 pt-6">
                 {selectedEmail.bodyHtml ? (
                   <div className="bg-gray-950 dark:bg-gray-950 rounded-lg p-6 -mx-6">
-                    <div
-                      dangerouslySetInnerHTML={{ __html: selectedEmail.bodyHtml }}
+                  <div
+                    dangerouslySetInnerHTML={{ __html: selectedEmail.bodyHtml }}
                       className="email-content prose prose-sm dark:prose-invert max-w-none"
                       style={{
                         color: '#e5e7eb !important',
                         fontSize: '15px',
                         lineHeight: '1.6'
                       }}
-                    />
+                  />
                   </div>
                 ) : (
                   <div className="whitespace-pre-wrap text-gray-200 dark:text-gray-200 text-base leading-relaxed font-sans bg-gray-950 dark:bg-gray-950 rounded-lg p-6 -mx-6">

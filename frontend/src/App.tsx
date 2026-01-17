@@ -24,6 +24,7 @@ const AgentChat = lazy(() => import("./pages/AgentChat"));
 const CreateAgent = lazy(() => import("./pages/CreateAgent"));
 const Calendar = lazy(() => import("./pages/Calendar"));
 const ProfileSettings = lazy(() => import("./pages/ProfileSettings"));
+const MonitoringDashboard = lazy(() => import("./pages/MonitoringDashboard"));
 
 // Email Integration - IMAP/SMTP - lazy loaded
 const EmailAccountIntegration = lazy(() => import("./pages/EmailAccountIntegration"));
@@ -74,6 +75,7 @@ const App = () => {
                     <Route path="/create-agent" element={<CreateAgent />} />
                     <Route path="/calendar" element={<Calendar />} />
                     <Route path="/profile" element={<ProfileSettings />} />
+                    <Route path="/monitoring" element={<MonitoringDashboard />} />
                     
                     {/* Email Account Integration - IMAP/SMTP - lazy loaded */}
                     <Route path="/email-integration" element={<EmailAccountIntegration />} />

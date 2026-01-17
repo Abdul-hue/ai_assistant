@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PA Agent - Real-Time Monitoring</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 20px;
+    }
+    
+    .header {
+      text-align: center;
+      margin-bottom: 30px;
+      padding-bottom: 20px;
+      border-bottom: 2px solid #1e293b;
+    }
+    
+    .header h1 {
+      font-size: 32px;
+      margin-bottom: 10px;
+      color: #60a5fa;
+    }
+    
+    .status-indicator {
+      display: inline-block;
+      padding: 5px 15px;
+      border-radius: 20px;
+      font-size: 14px;
+      font-weight: 600;
+      margin-right: 10px;
+    }
+    
+    .status-healthy {
+      background: #10b981;
+      color: #fff;
+    }
+    
+    .status-warning {
+      background: #f59e0b;
+      color: #fff;
+    }
+    
+    .status-error {
+      background: #ef4444;
+      color: #fff;
+    }
+    
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+    
+    .card {
+      background: #1e293b;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+    }
+    
+    .card-header {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 15px;
+      color: #94a3b8;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    
+    .card-value {
+      font-size: 36px;
+      font-weight: 700;
+      color: #60a5fa;
+      margin-bottom: 5px;
+    }
+    
+    .card-label {
+      font-size: 14px;
+      color: #64748b;
+    }
+    
+    .chart-container {
+      grid-column: 1 / -1;
+      height: 300px;
+    }
+    
+    .alert-list {
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    
+    .alert-item {
+      background: #334155;
+      padding: 12px;
+      border-radius: 8px;
+      margin-bottom: 10px;
+      border-left: 4px solid;
+    }
+    
+    .alert-critical {
+      border-left-color: #ef4444;
+    }
+    
+    .alert-warning {
+      border-left-color: #f59e0b;
+    }
+    
+    .alert-item-header {
+      font-weight: 600;
+      margin-bottom: 5px;
+    }
+    
+    .alert-item-time {
+      font-size: 12px;
+      color: #64748b;
+    }
+    
+    .refresh-indicator {
+      font-size: 12px;
+      color: #64748b;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>🚀 PA Agent - Real-Time Monitoring</h1>
+    <div id="status">
+      <span class="status-indicator status-healthy">● System Healthy</span>
+      <span class="refresh-indicator" id="lastUpdate">Last update: --</span>
+    </div>
+  </div>
+
+  <!-- Stat Cards -->
+  <div class="grid">
+    <div class="card">
+      <div class="card-header">Active Connections</div>
+      <div class="card-value" id="activeConnections">--</div>
+      <div class="card-label">Currently connected agents</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Messages/min</div>
+      <div class="card-value" id="messageRate">--</div>
+      <div class="card-label">Message throughput</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Cache Hit Rate</div>
+      <div class="card-value" id="cacheHitRate">--</div>
+      <div class="card-label">Cache effectiveness</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Memory Usage</div>
+      <div class="card-value" id="memoryUsage">--</div>
+      <div class="card-label">Heap memory used</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Error Rate</div>
+      <div class="card-value" id="errorRate">--</div>
+      <div class="card-label">Errors per minute</div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Active Alerts</div>
+      <div class="card-value" id="activeAlertCount">0</div>
+      <div class="card-label">Current system alerts</div>
+    </div>
+  </div>
+
+  <!-- Charts -->
+  <div class="grid">
+    <div class="card chart-container">
+      <div class="card-header">Connection Trend (Last Hour)</div>
+      <canvas id="connectionChart"></canvas>
+    </div>
+
+    <div class="card chart-container">
+      <div class="card-header">Message Throughput (Last Hour)</div>
+      <canvas id="messageChart"></canvas>
+    </div>
+  </div>
+
+  <!-- Alerts -->
+  <div class="grid">
+    <div class="card">
+      <div class="card-header">
+        Active Alerts
+        <span class="refresh-indicator" id="alertCount">0 alerts</span>
+      </div>
+      <div class="alert-list" id="alertList">
+        <p style="color: #64748b; text-align: center; padding: 20px;">No active alerts</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Recent Errors</div>
+      <div class="alert-list" id="errorList">
+        <p style="color: #64748b; text-align: center; padding: 20px;">No recent errors</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Configuration
+    const API_BASE = window.location.origin;
+    const REFRESH_INTERVAL = 5000; // 5 seconds
+    const HISTORY_LENGTH = 60; // 60 data points (5 minutes at 5-second intervals)
+
+    // Data storage
+    const historyData = {
+      timestamps: [],
+      connections: [],
+      messages: []
+    };
+
+    // Initialize charts
+    const connectionChart = new Chart(document.getElementById('connectionChart'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'Active Connections',
+          data: [],
+          borderColor: '#60a5fa',
+          backgroundColor: 'rgba(96, 165, 250, 0.1)',
+          tension: 0.4,
+          fill: true
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            grid: { color: '#334155' },
+            ticks: { color: '#94a3b8' }
+          },
+          x: {
+            grid: { color: '#334155' },
+            ticks: { color: '#94a3b8', maxTicksLimit: 10 }
+          }
+        }
+      }
+    });
+
+    const messageChart = new Chart(document.getElementById('messageChart'), {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [{
+          label: 'Messages/min',
+          data: [],
+          borderColor: '#10b981',
+          backgroundColor: 'rgba(16, 185, 129, 0.1)',
+          tension: 0.4,
+          fill: true
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            grid: { color: '#334155' },
+            ticks: { color: '#94a3b8' }
+          },
+          x: {
+            grid: { color: '#334155' },
+            ticks: { color: '#94a3b8', maxTicksLimit: 10 }
+          }
+        }
+      }
+    });
+
+    // Update dashboard
+    async function updateDashboard() {
+      try {
+        const response = await fetch(`${API_BASE}/api/health/detailed`);
+        const data = await response.json();
+
+        // Update stat cards
+        const activeAgents = data.agents?.assigned || data.activeAgents || 0;
+        document.getElementById('activeConnections').textContent = activeAgents;
+        
+        document.getElementById('cacheHitRate').textContent = 
+          data.localCaches ? calculateOverallHitRate(data.localCaches) : '--';
+        
+        const memoryMB = data.resources?.memory?.heapUsed || 
+          (data.system?.memory?.heapUsed ? parseFloat(data.system.memory.heapUsed) : null);
+        document.getElementById('memoryUsage').textContent = 
+          memoryMB ? formatMemory(memoryMB) : '--';
+
+        // Calculate derived metrics
+        if (data.errorStats) {
+          const errorRate = parseFloat(data.errorStats.currentRate) || 0;
+          document.getElementById('errorRate').textContent = errorRate.toFixed(1);
+        }
+
+        // Update alert count
+        const alertCount = data.alertStats?.active || 0;
+        document.getElementById('activeAlertCount').textContent = alertCount;
+
+        // Calculate message rate from message queue or use placeholder
+        const messageQueue = data.messageQueue?.totalPending || 0;
+        const messageRate = messageQueue > 0 ? Math.floor(messageQueue / 60) : 0;
+        document.getElementById('messageRate').textContent = messageRate;
+
+        // Update history
+        const timestamp = new Date().toLocaleTimeString();
+        historyData.timestamps.push(timestamp);
+        historyData.connections.push(activeAgents);
+        historyData.messages.push(messageRate);
+
+        // Keep only last N points
+        if (historyData.timestamps.length > HISTORY_LENGTH) {
+          historyData.timestamps.shift();
+          historyData.connections.shift();
+          historyData.messages.shift();
+        }
+
+        // Update charts
+        connectionChart.data.labels = historyData.timestamps;
+        connectionChart.data.datasets[0].data = historyData.connections;
+        connectionChart.update('none');
+
+        messageChart.data.labels = historyData.timestamps;
+        messageChart.data.datasets[0].data = historyData.messages;
+        messageChart.update('none');
+
+        // Update alerts
+        if (data.alertStats) {
+          updateAlerts(data.alertStats);
+        }
+
+        // Update errors
+        if (data.errorStats) {
+          updateErrors(data.errorStats);
+        }
+
+        // Update status
+        updateSystemStatus(data);
+
+        // Update last update time
+        document.getElementById('lastUpdate').textContent = 
+          `Last update: ${new Date().toLocaleTimeString()}`;
+
+      } catch (error) {
+        console.error('Failed to update dashboard:', error);
+        const statusEl = document.getElementById('status');
+        statusEl.innerHTML = 
+          '<span class="status-indicator status-error">● Connection Error</span>' +
+          '<span class="refresh-indicator">Last update: --</span>';
+      }
+    }
+
+    function calculateOverallHitRate(caches) {
+      // Try to calculate from cache stats if available
+      // Otherwise use utilization as proxy
+      let totalSize = 0;
+      let totalMax = 0;
+
+      Object.values(caches).forEach(cache => {
+        if (cache.size !== undefined && cache.max !== undefined) {
+          totalSize += cache.size;
+          totalMax += cache.max;
+        }
+      });
+
+      // This is utilization, not actual hit rate
+      // For real hit rate, we'd need cacheStats from the API
+      return totalMax > 0 
+        ? `${((totalSize / totalMax) * 100).toFixed(1)}%`
+        : '--';
+    }
+
+    function formatMemory(memoryStr) {
+      // Handle both "123MB" format and number
+      if (typeof memoryStr === 'string') {
+        return memoryStr;
+      }
+      const mb = memoryStr / (1024 * 1024);
+      return `${mb.toFixed(1)}MB`;
+    }
+
+    function updateAlerts(alertStats) {
+      const alertList = document.getElementById('alertList');
+      const alertCount = document.getElementById('alertCount');
+
+      if (!alertStats.activeAlerts || alertStats.activeAlerts.length === 0) {
+        alertList.innerHTML = 
+          '<p style="color: #64748b; text-align: center; padding: 20px;">No active alerts</p>';
+        alertCount.textContent = '0 alerts';
+        return;
+      }
+
+      alertCount.textContent = `${alertStats.activeAlerts.length} alert(s)`;
+      alertList.innerHTML = alertStats.activeAlerts.map(alert => `
+        <div class="alert-item alert-${alert.severity}">
+          <div class="alert-item-header">${alert.type}</div>
+          <div>${alert.message}</div>
+          <div class="alert-item-time">${alert.lastTriggered} (Count: ${alert.count})</div>
+        </div>
+      `).join('');
+    }
+
+    function updateErrors(errorStats) {
+      const errorList = document.getElementById('errorList');
+
+      if (!errorStats.last5Minutes || errorStats.last5Minutes.total === 0) {
+        errorList.innerHTML = 
+          '<p style="color: #64748b; text-align: center; padding: 20px;">No recent errors</p>';
+        return;
+      }
+
+      const errors = errorStats.last5Minutes.topPatterns || [];
+      if (errors.length === 0) {
+        errorList.innerHTML = 
+          '<p style="color: #64748b; text-align: center; padding: 20px;">No recent errors</p>';
+        return;
+      }
+
+      errorList.innerHTML = errors.slice(0, 5).map(error => `
+        <div class="alert-item">
+          <div class="alert-item-header">${error.category || 'unknown'}: ${error.severity || 'low'}</div>
+          <div style="font-size: 14px;">${error.message || 'No message'}</div>
+          <div class="alert-item-time">Count: ${error.count || 0} | Last seen: ${error.lastSeen ? new Date(error.lastSeen).toLocaleTimeString() : 'N/A'}</div>
+        </div>
+      `).join('');
+    }
+
+    function updateSystemStatus(data) {
+      const statusEl = document.getElementById('status');
+      let statusClass = 'status-healthy';
+      let statusText = 'System Healthy';
+
+      // Check for critical conditions
+      if (data.alertStats && data.alertStats.active > 0) {
+        const hasCritical = data.alertStats.activeAlerts?.some(a => a.severity === 'critical');
+        if (hasCritical) {
+          statusClass = 'status-error';
+          statusText = 'Critical Alerts';
+        } else {
+          statusClass = 'status-warning';
+          statusText = 'Warnings Active';
+        }
+      }
+
+      statusEl.innerHTML = `
+        <span class="status-indicator ${statusClass}">● ${statusText}</span>
+        <span class="refresh-indicator" id="lastUpdate">Last update: ${new Date().toLocaleTimeString()}</span>
+      `;
+    }
+
+    // Start auto-refresh
+    updateDashboard();
+    setInterval(updateDashboard, REFRESH_INTERVAL);
+  </script>
+</body>
+</html>

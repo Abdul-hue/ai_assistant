@@ -83,7 +83,7 @@ const Dashboard = () => {
   // Modal state
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
-  
+
   // Search state
   const [searchTerm, setSearchTerm] = useState('');
   const debouncedSearchTerm = useDebounce(searchTerm, 300);
@@ -138,25 +138,25 @@ const Dashboard = () => {
   // Memoize header content
   const headerContent = useMemo(() => (
     <div className="flex items-center justify-between gap-4 w-full">
-      <div>
+                <div>
         <h1 className="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">
-          Welcome back{user?.name ? `, ${user.name.split(' ')[0]}` : ''}! 👋
-        </h1>
+                    Welcome back{user?.name ? `, ${user.name.split(' ')[0]}` : ''}! 👋
+                  </h1>
         <p className="text-gray-600 dark:text-gray-400 text-xs sm:text-sm mt-1 hidden sm:block">
-          Manage your AI agents and monitor conversations
-        </p>
-      </div>
-      <Button 
+                    Manage your AI agents and monitor conversations
+                  </p>
+              </div>
+              <Button 
         onClick={handleCreateAgent}
-        className="bg-gradient-primary shadow-glow hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105 text-sm sm:text-base"
-        size="sm"
+                className="bg-gradient-primary shadow-glow hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105 text-sm sm:text-base"
+                size="sm"
         aria-label={ariaLabels.actions.create('agent')}
-      >
+              >
         <Plus className="mr-1 sm:mr-2 h-4 w-4" aria-hidden="true" />
-        <span className="hidden sm:inline">Create Agent</span>
-        <span className="sm:hidden">Create</span>
-      </Button>
-    </div>
+                <span className="hidden sm:inline">Create Agent</span>
+                <span className="sm:hidden">Create</span>
+              </Button>
+            </div>
   ), [user, handleCreateAgent]);
 
   return (
@@ -414,7 +414,7 @@ const Dashboard = () => {
               ))}
             </div>
           )}
-        </div>
+      </div>
 
       <AlertDialog 
         open={!!agentToDelete} 

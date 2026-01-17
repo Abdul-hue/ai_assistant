@@ -1,4 +1,62 @@
 require('dotenv').config();
+
+// ============================================================================
+// PORT AVAILABILITY CHECK - MUST RUN BEFORE ANY SERVICE INITIALIZATION
+// ============================================================================
+// Check port availability BEFORE loading any services that might auto-initialize
+// This prevents unnecessary service initialization when port is already in use
+
+const { execSync } = require('child_process');
+const PORT = process.env.PORT || 3001;
+
+function checkPortAvailable(port) {
+  try {
+    // Windows: Use PowerShell
+    if (process.platform === 'win32') {
+      const result = execSync(
+        `powershell -Command "Get-NetTCPConnection -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object -First 1"`,
+        { encoding: 'utf8', stdio: 'pipe' }
+      );
+      
+      if (result.trim()) {
+        return false; // Port is in use
+      }
+    } else {
+      // Linux/Mac: Use lsof or netstat
+      try {
+        execSync(`lsof -i:${port}`, { stdio: 'pipe' });
+        return false; // Port is in use
+      } catch (e) {
+        // lsof throws error if port is free
+        return true;
+      }
+    }
+    return true; // Port is available
+  } catch (error) {
+    // If command fails, assume port is available (error handler will catch it)
+    return true;
+  }
+}
+
+// Check port before loading anything
+if (!checkPortAvailable(PORT)) {
+  console.log('\n' + '='.repeat(60));
+  console.log(`❌ Port ${PORT} is already in use!`);
+  console.log('='.repeat(60));
+  console.log('   Another server instance is already running.\n');
+  console.log('   To fix this:');
+  console.log('   1. Kill the existing process: npm run kill-server');
+  console.log('   2. Or find and kill manually:');
+  console.log(`      Get-NetTCPConnection -LocalPort ${PORT} | Select-Object OwningProcess`);
+  console.log('      Stop-Process -Id <PID> -Force\n');
+  console.log('   Then try starting again: npm start\n');
+  process.exit(1); // Exit BEFORE any service initialization
+}
+
+// ============================================================================
+// NOW it's safe to require modules and initialize services
+// ============================================================================
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -8,7 +66,6 @@ const cookieParser = require('cookie-parser');
 
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT || 3001;
 
 // Initialize Socket.IO with improved configuration
 const io = new Server(server, {
@@ -49,6 +106,9 @@ const imapSmtpRoutes = require('./src/routes/imapSmtp');
 const folderManagementRoutes = require('./src/routes/folderManagement');
 const fetchNewMailRoutes = require('./src/routes/fetchNewMail');
 const { fetchNewUnreadEmailsForAllAccounts } = require('./src/routes/fetchNewMail');
+const healthRoutes = require('./src/routes/health');
+const metricsRoutes = require('./src/routes/metrics');
+const { performanceTrackingMiddleware, startResourceMonitoring } = require('./src/middleware/performanceTracking');
 
 // ============================================================================
 // ENVIRONMENT VALIDATION
@@ -250,6 +310,11 @@ app.use(cookieParser());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// Performance tracking middleware (after body parsers, before routes)
+// Get logger reference from baileysService
+const { loggers } = require('./src/services/baileysService');
+app.use(performanceTrackingMiddleware(loggers?.perf || console));
+
 // Serve static files from public directory (frontend build)
 // This allows the backend to serve the React frontend
 const path = require('path');
@@ -288,24 +353,12 @@ app.get('/', (req, res) => {
   }
 });
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  const healthCheck = {
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    environment: process.env.NODE_ENV || 'development',
-    cors: 'enabled',
-    allowedOrigins: allowedOrigins.length,
-    env: {
-      databaseUrl: process.env.DATABASE_URL ? 'configured' : 'missing',
-      supabaseUrl: process.env.SUPABASE_URL ? 'configured' : 'missing',
-      supabaseServiceKey: process.env.SUPABASE_SERVICE_ROLE_KEY ? 'configured' : 'missing',
-    }
-  };
+// Health check routes (comprehensive health endpoints for load balancers)
+// Note: Basic /api/health is now handled by healthRoutes
+app.use('/api', healthRoutes);
 
-  res.json(healthCheck);
-});
+// Prometheus metrics routes
+app.use('/api/metrics', metricsRoutes);
 
 // CORS test endpoint
 app.get('/api/cors-test', (req, res) => {
@@ -686,6 +739,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // Initialize existing WhatsApp sessions on startup
+// Port check at the top of the file ensures this only runs if port is available
 const { initializeExistingSessions } = require('./src/services/baileysService');
 
 // Socket.IO authentication middleware
@@ -1186,6 +1240,28 @@ io.on('connection', (socket) => {
   });
 });
 
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    // Clear any buffered output and show clear error message
+    console.error('\n' + '='.repeat(60));
+    console.error(`❌ Port ${PORT} is already in use!`);
+    console.error('='.repeat(60));
+    console.error('   Another server instance is already running.');
+    console.error('\n   To fix this:');
+    console.error('   1. Kill the existing process: npm run kill-server');
+    console.error('   2. Or find and kill manually:');
+    console.error(`      Get-NetTCPConnection -LocalPort ${PORT} | Select-Object OwningProcess`);
+    console.error(`      Stop-Process -Id <PID> -Force`);
+    console.error('\n   Then try starting again: npm start\n');
+    // Exit immediately - any initialization logs above are from baileysService auto-init
+    // They're harmless since we're exiting anyway
+    process.exit(1);
+  } else {
+    console.error('\n❌ Server failed to start:', error.message);
+    process.exit(1);
+  }
+});
+
 server.listen(PORT, '0.0.0.0', async () => {
   console.log('\n' + '='.repeat(60));
   console.log('🚀 Backend Server Started Successfully');
@@ -1197,6 +1273,9 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log(`🔑 Supabase Service Key: ${process.env.SUPABASE_SERVICE_ROLE_KEY ? 'Configured' : 'Not configured'}`);
   console.log(`📱 WhatsApp (Baileys): ✅ Enabled`);
   console.log('='.repeat(60) + '\n');
+
+  // Start resource monitoring (every 30 seconds)
+  startResourceMonitoring(loggers?.perf || console, 30000);
 
   // Initialize existing WhatsApp sessions (non-blocking)
   setTimeout(async () => {
