@@ -35,10 +35,10 @@ async function monitorConnections() {
       
       // Case 1: Session in DB but not in memory
       if (!memorySession) {
-        // ⚠️ CRITICAL: Check status FIRST - don't retry FATAL errors (conflict/disconnected)
-        if (status === 'conflict' || status === 'disconnected') {
+        // ⚠️ CRITICAL: Check status FIRST - don't retry FATAL errors (conflict/logged_out/disconnected)
+        if (status === 'conflict' || status === 'logged_out' || status === 'disconnected') {
           console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - status is '${status}' (FATAL error - requires manual reconnection)`);
-          console.log(`[CONNECTION-MONITOR] ℹ️  Status 'conflict' = 401/404/440 error, 'disconnected' = manual disconnect`);
+          console.log(`[CONNECTION-MONITOR] ℹ️  Status 'conflict' = 404/440 error, 'logged_out' = 401 error, 'disconnected' = manual disconnect`);
           continue;
         }
         
@@ -69,7 +69,7 @@ async function monitorConnections() {
       // Case 2: Session in memory but not connected
       if (!memorySession.isConnected) {
         // ⚠️ CRITICAL: Check status FIRST - don't retry FATAL errors
-        if (status === 'conflict' || status === 'disconnected') {
+        if (status === 'conflict' || status === 'logged_out' || status === 'disconnected') {
           console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - status is '${status}' (FATAL error - requires manual reconnection)`);
           continue;
         }
@@ -111,7 +111,7 @@ async function monitorConnections() {
         
         if (minutesSinceHeartbeat > 5) {
           // ⚠️ CRITICAL: Check status FIRST - don't retry FATAL errors
-          if (status === 'conflict' || status === 'disconnected') {
+          if (status === 'conflict' || status === 'logged_out' || status === 'disconnected') {
             console.log(`[CONNECTION-MONITOR] ⏭️  Skipping ${agent_id.substring(0, 8)}... - stale heartbeat but status is '${status}' (FATAL error)`);
             continue;
           }

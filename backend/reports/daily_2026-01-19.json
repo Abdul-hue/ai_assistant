@@ -1,0 +1,47 @@
+{
+  "type": "daily",
+  "generatedAt": "2026-01-19T19:00:00.031Z",
+  "period": {
+    "start": "2026-01-18T19:00:00.031Z",
+    "end": "2026-01-19T19:00:00.031Z"
+  },
+  "snapshots": 13,
+  "summary": {
+    "connectionTime": {
+      "min": 0,
+      "max": 0,
+      "avg": 0,
+      "median": 0,
+      "p95": 0
+    },
+    "messageProcessingTime": {
+      "min": 0,
+      "max": 0,
+      "avg": 0,
+      "median": 0,
+      "p95": 0
+    },
+    "cacheHitRate": {
+      "min": 0,
+      "max": 0,
+      "avg": 0,
+      "median": 0,
+      "p95": 0
+    },
+    "errorCount": {
+      "min": 0,
+      "max": 0,
+      "avg": 0,
+      "median": 0,
+      "p95": 0
+    },
+    "activeConnections": {
+      "min": 0,
+      "max": 0,
+      "avg": 0,
+      "median": 0,
+      "p95": 0
+    }
+  },
+  "degradation": {}
+}

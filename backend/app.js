@@ -1,4 +1,67 @@
 require('dotenv').config();
+<<<<<<< Updated upstream
+=======
+
+// ============================================================================
+// PORT AVAILABILITY CHECK - MUST RUN BEFORE ANY SERVICE INITIALIZATION
+// ============================================================================
+// Check port availability BEFORE loading any services that might auto-initialize
+// This prevents unnecessary service initialization when port is already in use
+
+const { execSync } = require('child_process');
+const PORT = process.env.PORT || 3001;
+
+function checkPortAvailable(port) {
+  try {
+    // Windows: Use PowerShell
+    if (process.platform === 'win32') {
+      // Check for connections and filter out PID 0 (system process)
+      const result = execSync(
+        `powershell -Command "$conns = Get-NetTCPConnection -LocalPort ${port} -ErrorAction SilentlyContinue; if ($conns) { $validPids = $conns | Select-Object -ExpandProperty OwningProcess -Unique | Where-Object { $_ -ne 0 -and $_ -gt 0 }; if ($validPids) { Write-Output 'IN_USE' } else { Write-Output 'FREE' } } else { Write-Output 'FREE' }"`,
+        { encoding: 'utf8', stdio: 'pipe' }
+      );
+      
+      if (result.trim() === 'IN_USE') {
+        return false; // Port is in use by a valid process
+      }
+      // If result is 'FREE' or empty, port is available (PID 0 doesn't count)
+      return true;
+    } else {
+      // Linux/Mac: Use lsof or netstat
+      try {
+        execSync(`lsof -i:${port}`, { stdio: 'pipe' });
+        return false; // Port is in use
+      } catch (e) {
+        // lsof throws error if port is free
+        return true;
+      }
+    }
+  } catch (error) {
+    // If command fails, assume port is available (error handler will catch it)
+    return true;
+  }
+}
+
+// Check port before loading anything
+if (!checkPortAvailable(PORT)) {
+  console.log('\n' + '='.repeat(60));
+  console.log(`❌ Port ${PORT} is already in use!`);
+  console.log('='.repeat(60));
+  console.log('   Another server instance is already running.\n');
+  console.log('   To fix this:');
+  console.log('   1. Kill the existing process: npm run kill-server');
+  console.log('   2. Or find and kill manually:');
+  console.log(`      Get-NetTCPConnection -LocalPort ${PORT} | Select-Object OwningProcess`);
+  console.log('      Stop-Process -Id <PID> -Force\n');
+  console.log('   Then try starting again: npm start\n');
+  process.exit(1); // Exit BEFORE any service initialization
+}
+
+// ============================================================================
+// NOW it's safe to require modules and initialize services
+// ============================================================================
+
+>>>>>>> Stashed changes
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -42,6 +105,8 @@ const processAgentFileRoute = require('./src/routes/processAgentFile');
 const agentDocumentsRoute = require('./src/routes/agentDocuments');
 const agentFileRoutes = require('./src/routes/agentFileRoutes');
 const contactsRoutes = require('./src/routes/contacts');
+const groupsRoutes = require('./src/routes/groups');
+const whatsappDataFetcherRoutes = require('./src/routes/whatsappDataFetcher');
 const profileRoutes = require('./src/routes/profile');
 const dashboardRoutes = require('./src/routes/dashboard');
 const messagesRoutes = require('./src/routes/messages');
@@ -49,6 +114,13 @@ const imapSmtpRoutes = require('./src/routes/imapSmtp');
 const folderManagementRoutes = require('./src/routes/folderManagement');
 const fetchNewMailRoutes = require('./src/routes/fetchNewMail');
 const { fetchNewUnreadEmailsForAllAccounts } = require('./src/routes/fetchNewMail');
+<<<<<<< Updated upstream
+=======
+const healthRoutes = require('./src/routes/health');
+const metricsRoutes = require('./src/routes/metrics');
+const mediaWebhookRoutes = require('./src/routes/mediaWebhook');
+const { performanceTrackingMiddleware, startResourceMonitoring } = require('./src/middleware/performanceTracking');
+>>>>>>> Stashed changes
 
 // ============================================================================
 // ENVIRONMENT VALIDATION
@@ -177,7 +249,7 @@ const corsOptions = {
     return callback(new Error('Not allowed by CORS'), false);
   },
   credentials: true, // ✅ CRITICAL: Required for HttpOnly cookies
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Idempotency-Key'], // ✅ Allow idempotency header
   exposedHeaders: ['Content-Length', 'X-Request-Id', 'Set-Cookie'], // ✅ Allow Set-Cookie header
   maxAge: 86400, // 24 hours
@@ -430,6 +502,10 @@ app.use('/api/agents', agentFileRoutes); // File routes must come before general
 app.use('/api/agents', messagesRoutes); // Messages/chat routes
 app.use('/api/agents', agentRoutes);
 app.use('/api/agents', contactsRoutes);
+// Groups routes - must be before catch-all
+app.use('/api/groups', groupsRoutes);
+app.use('/api/whatsapp-data', whatsappDataFetcherRoutes);
+app.use('/api/whatsapp', whatsappRoutes);
 app.use('/api/profile', profileRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/process-agent-file', processAgentFileRoute);
@@ -443,6 +519,9 @@ app.use('/api/webhooks/send-message', webhookSendMessageRoute);
 
 // Webhook for N8N to send emails (public endpoint)
 app.use('/api/webhooks/send-email', webhookSendEmailRoute);
+
+// Media processing webhook (for WhatsApp media files)
+app.use('/', mediaWebhookRoutes);
 
 // Document extraction endpoint (used by frontend after file upload)
 app.use('/extract-pdf', extractPdfRoute);

@@ -7,6 +7,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { PageLoadingSpinner } from "@/components/loading/PageLoadingSpinner";
 import { AuthProvider } from "./context/AuthContext";
+import { ThemeProvider } from "./context/ThemeContext";
 import { CommandPalette } from "@/components/CommandPalette";
 
 // Public pages - eager loaded (small, frequently used)
@@ -47,10 +48,11 @@ const App = () => {
   return (
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>
-        <TooltipProvider>
-          <Toaster />
-          <Sonner richColors />
-          <AuthProvider>
+        <ThemeProvider>
+          <TooltipProvider>
+            <Toaster />
+            <Sonner richColors />
+            <AuthProvider>
             <BrowserRouter
               future={{
                 v7_startTransition: true,
@@ -90,6 +92,7 @@ const App = () => {
             </BrowserRouter>
           </AuthProvider>
         </TooltipProvider>
+        </ThemeProvider>
       </QueryClientProvider>
     </ErrorBoundary>
   );

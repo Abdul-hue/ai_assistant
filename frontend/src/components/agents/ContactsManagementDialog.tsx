@@ -12,6 +12,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import ContactsTable from './ContactsTable';
 import ContactUploadDialog from './ContactUploadDialog';
+import GroupsTable from './GroupsTable';
 import { useContactCount } from '@/hooks/useContacts';
 
 interface ContactsManagementDialogProps {
@@ -49,9 +50,10 @@ export const ContactsManagementDialog = ({
         </DialogHeader>
 
         <Tabs defaultValue="view" className="w-full">
-          <TabsList className="grid w-full grid-cols-2">
-            <TabsTrigger value="view">View contacts</TabsTrigger>
-            <TabsTrigger value="upload">Upload new</TabsTrigger>
+          <TabsList className="grid w-full grid-cols-3">
+            <TabsTrigger value="view">View Contacts</TabsTrigger>
+            <TabsTrigger value="upload">Upload Contacts</TabsTrigger>
+            <TabsTrigger value="groups">View Groups</TabsTrigger>
           </TabsList>
 
           <TabsContent value="view" className="mt-6">
@@ -72,6 +74,10 @@ export const ContactsManagementDialog = ({
                 </Button>
               }
             />
+          </TabsContent>
+
+          <TabsContent value="groups" className="mt-6">
+            <GroupsTable agentId={agentId} />
           </TabsContent>
         </Tabs>
       </DialogContent>

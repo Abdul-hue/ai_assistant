@@ -1,14 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
   <defs>
-    <linearGradient id="blueGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:#3B82F6"/>
-      <stop offset="100%" style="stop-color:#6366F1"/>
+    <linearGradient id="tealGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4A9B8E"/>
+      <stop offset="100%" style="stop-color:#2D7A6E"/>
     </linearGradient>
   </defs>
   
   <!-- Chat bubble shape - optimized for small sizes -->
   <path d="M16 4C9.373 4 4 9.373 4 16c0 2.209.75 4.25 2 6L4 28l6-2c1.6 1.2 3.55 1.9 5.6 1.9C23.627 28 29 22.627 29 16S22.627 4 16 4z" 
-        fill="url(#blueGrad)"/>
+        fill="url(#tealGrad)"/>
   
   <!-- AI indicator: simple dot with lines (circuit/AI symbol) -->
   <g fill="white" opacity="0.95">
@@ -22,4 +22,3 @@
   <rect x="9" y="19" width="10" height="2" rx="1" fill="white" opacity="0.9"/>
   <rect x="9" y="22.5" width="7" height="2" rx="1" fill="white" opacity="0.9"/>
 </svg>
-

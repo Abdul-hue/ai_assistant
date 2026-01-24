@@ -37,34 +37,39 @@ const Index = () => {
   ];
 
   return (
-    <div className="min-h-screen bg-black relative overflow-hidden">
-      {/* Animated Background Pattern */}
+    <div className="min-h-screen bg-background dark:bg-background relative overflow-hidden">
+      {/* Animated Background Pattern - Theme-aware accents */}
       <div className="fixed inset-0 z-0">
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(59,130,246,0.1),transparent_50%)]"></div>
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_80%_20%,rgba(139,92,246,0.1),transparent_50%)]"></div>
-        <div className="absolute inset-0 bg-[linear-gradient(to_bottom,transparent_0%,rgba(0,0,0,0.5)_100%)]"></div>
-        {/* Grid Pattern */}
-        <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:50px_50px]"></div>
+        {/* Light mode patterns */}
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(18,140,126,0.05),transparent_50%)] dark:hidden"></div>
+        <div className="absolute inset-0 bg-[radial-gradient(circle_at_80%_20%,rgba(18,140,126,0.05),transparent_50%)] dark:hidden"></div>
+        <div className="absolute inset-0 bg-[linear-gradient(to_bottom,transparent_0%,rgba(247,248,250,0.5)_100%)] dark:hidden"></div>
+        <div className="absolute inset-0 bg-[linear-gradient(rgba(18,140,126,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(18,140,126,0.02)_1px,transparent_1px)] bg-[size:50px_50px] dark:hidden"></div>
+        {/* Dark mode patterns */}
+        <div className="hidden dark:block absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(18,140,126,0.1),transparent_50%)]"></div>
+        <div className="hidden dark:block absolute inset-0 bg-[radial-gradient(circle_at_80%_20%,rgba(18,140,126,0.08),transparent_50%)]"></div>
+        <div className="hidden dark:block absolute inset-0 bg-[linear-gradient(to_bottom,transparent_0%,rgba(0,0,0,0.3)_100%)]"></div>
+        <div className="hidden dark:block absolute inset-0 bg-[linear-gradient(rgba(18,140,126,0.05)_1px,transparent_1px),linear-gradient(90deg,rgba(18,140,126,0.05)_1px,transparent_1px)] bg-[size:50px_50px]"></div>
       </div>
 
       {/* Navigation */}
-      <nav className="relative z-50 border-b border-white/10 bg-black/80 backdrop-blur-xl supports-[backdrop-filter]:bg-black/60">
-        <div className="container mx-auto px-4 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <MessageSquare className="h-6 w-6 text-primary animate-pulse-glow" />
-              <span className="text-xl font-bold gradient-text">
+      <nav className="relative z-50 border-b border-primary/20 bg-gradient-to-r from-primary to-whatsapp-teal backdrop-blur-xl shadow-soft sticky top-0">
+        <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-4">
+          <div className="flex items-center justify-between w-full">
+            <div className="flex items-center gap-2 flex-shrink-0">
+              <MessageSquare className="h-6 w-6 text-white animate-pulse-glow" />
+              <span className="text-xl font-bold text-white whitespace-nowrap">
                 WhatsApp AI Assistant
               </span>
             </div>
-            <div className="flex items-center gap-4">
+            <div className="flex items-center gap-4 flex-shrink-0 ml-auto">
               <Link to="/auth">
-                <Button variant="ghost" className="hover:bg-white/10 transition-all duration-300">
+                <Button variant="ghost" className="hover:bg-white/10 transition-all duration-300 text-white whitespace-nowrap text-base font-semibold px-4 py-2">
                   Login
                 </Button>
               </Link>
               <Link to="/auth">
-                <Button className="bg-gradient-primary shadow-glow hover:shadow-[0_0_40px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105">
+                <Button className="bg-white text-primary shadow-lg hover:bg-white/90 hover:shadow-xl transition-all duration-300 hover:scale-105 whitespace-nowrap text-base font-semibold px-5 py-2">
                   Get Started
                   <ArrowRight className="ml-2 h-4 w-4" />
                 </Button>
@@ -78,12 +83,12 @@ const Index = () => {
       <section className="relative z-10 container mx-auto px-4 pt-32 pb-24 text-center">
         <div className="max-w-5xl mx-auto space-y-10 animate-fade-in-up">
           <h1 className="text-6xl md:text-8xl font-bold tracking-tight leading-tight">
-            <span className="text-white">Transform Your Business</span>
-            <span className="block mt-4 gradient-text">
+            <span className="text-foreground dark:text-foreground">Transform Your Business</span>
+            <span className="block mt-4 bg-gradient-to-r from-primary via-whatsapp-teal to-primary bg-clip-text text-transparent dark:from-primary dark:via-primary/90 dark:to-primary">
               with AI-Powered WhatsApp Agents
             </span>
           </h1>
-          <p className="text-xl md:text-2xl text-gray-400 max-w-3xl mx-auto leading-relaxed">
+          <p className="text-xl md:text-2xl text-muted-foreground dark:text-muted-foreground max-w-3xl mx-auto leading-relaxed">
             Automate customer conversations, boost productivity, and scale your business 
             with intelligent WhatsApp agents that work 24/7
           </p>
@@ -91,7 +96,7 @@ const Index = () => {
             <Link to="/auth">
               <Button 
                 size="lg" 
-                className="bg-gradient-primary shadow-glow text-lg px-10 py-6 hover:shadow-[0_0_50px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105 animate-pulse-glow"
+                className="bg-gradient-primary shadow-lg hover:shadow-xl text-lg px-10 py-6 transition-all duration-300 hover:scale-105 text-white dark:text-white"
               >
                 Start Free Trial
                 <ArrowRight className="ml-2 h-5 w-5" />
@@ -100,7 +105,7 @@ const Index = () => {
             <Button 
               size="lg" 
               variant="outline" 
-              className="text-lg px-10 py-6 border-white/20 bg-white/5 hover:bg-white/10 hover:border-white/30 transition-all duration-300"
+              className="text-lg px-10 py-6 border-2 border-primary text-primary hover:bg-primary hover:text-white dark:text-primary dark:border-primary dark:hover:bg-primary dark:hover:text-white transition-all duration-300"
             >
               Watch Demo
             </Button>
@@ -111,10 +116,10 @@ const Index = () => {
       {/* Features Grid */}
       <section className="relative z-10 container mx-auto px-4 py-24">
         <div className="text-center mb-20 animate-fade-in-up">
-          <h2 className="text-4xl md:text-5xl font-bold mb-6 text-white">
+          <h2 className="text-4xl md:text-5xl font-bold mb-6 text-foreground dark:text-foreground">
             Everything You Need to Succeed
           </h2>
-          <p className="text-xl text-gray-400 max-w-2xl mx-auto">
+          <p className="text-xl text-muted-foreground dark:text-muted-foreground max-w-2xl mx-auto">
             Powerful features designed to help you automate, scale, and grow your business
           </p>
         </div>
@@ -123,14 +128,14 @@ const Index = () => {
           {features.map((feature, index) => (
             <div 
               key={index}
-              className="glass-card p-8 hover:scale-105 transition-all duration-300 hover:border-primary/50 group animate-fade-in-up"
+              className="bg-card dark:bg-card border border-border dark:border-border rounded-xl p-8 hover:scale-105 transition-all duration-300 hover:border-primary dark:hover:border-primary hover:shadow-lg dark:hover:shadow-xl group animate-fade-in-up stagger-item"
               style={{ animationDelay: `${index * 0.1}s` }}
             >
-              <div className="text-primary mb-6 group-hover:scale-110 transition-transform duration-300">
+              <div className="w-12 h-12 bg-whatsapp-mint dark:bg-primary/20 text-primary dark:text-primary rounded-lg flex items-center justify-center mb-6 group-hover:scale-110 transition-transform duration-300">
                 {feature.icon}
               </div>
-              <h3 className="text-xl font-semibold mb-3 text-white">{feature.title}</h3>
-              <p className="text-gray-400 leading-relaxed">{feature.description}</p>
+              <h3 className="text-xl font-semibold mb-3 text-foreground dark:text-foreground">{feature.title}</h3>
+              <p className="text-muted-foreground dark:text-muted-foreground leading-relaxed">{feature.description}</p>
             </div>
           ))}
         </div>
@@ -138,17 +143,17 @@ const Index = () => {
 
       {/* CTA Section */}
       <section className="relative z-10 container mx-auto px-4 py-24">
-        <div className="glass-card p-12 md:p-16 text-center shadow-glow hover:shadow-[0_0_50px_hsl(var(--primary)/0.4)] transition-all duration-500 max-w-4xl mx-auto">
-          <h2 className="text-4xl md:text-6xl font-bold text-white mb-6">
+        <div className="bg-gradient-to-br from-primary to-whatsapp-teal p-12 md:p-16 text-center rounded-2xl shadow-xl hover:shadow-2xl transition-all duration-500 max-w-4xl mx-auto text-white group">
+          <h2 className="text-4xl md:text-6xl font-bold mb-6 text-white group-hover:text-white">
             Ready to Get Started?
           </h2>
-          <p className="text-xl text-gray-300 mb-10 max-w-2xl mx-auto">
+          <p className="text-xl text-white/90 mb-10 max-w-2xl mx-auto group-hover:text-white/90">
             Join thousands of businesses already using AI to transform their customer communications
           </p>
           <Link to="/auth">
             <Button 
               size="lg" 
-              className="bg-gradient-primary shadow-glow text-lg px-10 py-6 hover:shadow-[0_0_50px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105"
+              className="bg-white text-primary shadow-lg hover:shadow-xl text-lg px-10 py-6 transition-all duration-300 hover:scale-105 font-semibold hover:bg-white hover:text-primary"
             >
               Create Your First Agent
               <ArrowRight className="ml-2 h-5 w-5" />
@@ -158,17 +163,17 @@ const Index = () => {
       </section>
 
       {/* Footer */}
-      <footer className="relative z-10 border-t border-white/10 py-12 bg-black/80 backdrop-blur-xl">
+      <footer className="relative z-10 border-t border-primary/20 py-12 bg-gradient-to-r from-primary to-whatsapp-teal">
         <div className="container mx-auto px-4">
           <div className="grid md:grid-cols-3 gap-8 mb-8">
             <div>
               <div className="flex items-center gap-2 mb-4">
-                <MessageSquare className="h-6 w-6 text-primary" />
-                <span className="text-xl font-bold gradient-text">
+                <MessageSquare className="h-6 w-6 text-white" />
+                <span className="text-xl font-bold text-white">
                   WhatsApp AI Assistant
                 </span>
               </div>
-              <p className="text-gray-400 text-sm">
+              <p className="text-white/90 text-sm">
                 Transform your business with AI-powered WhatsApp agents that work 24/7.
               </p>
             </div>
@@ -176,12 +181,12 @@ const Index = () => {
               <h3 className="text-white font-semibold mb-4">Legal</h3>
               <ul className="space-y-2">
                 <li>
-                  <Link to="/privacy" className="text-gray-400 hover:text-primary transition-colors text-sm">
+                  <Link to="/privacy" className="text-white/80 hover:text-white transition-colors text-sm">
                     Privacy Policy
                   </Link>
                 </li>
                 <li>
-                  <Link to="/terms" className="text-gray-400 hover:text-primary transition-colors text-sm">
+                  <Link to="/terms" className="text-white/80 hover:text-white transition-colors text-sm">
                     Terms of Service
                   </Link>
                 </li>
@@ -191,19 +196,19 @@ const Index = () => {
               <h3 className="text-white font-semibold mb-4">Company</h3>
               <ul className="space-y-2">
                 <li>
-                  <Link to="/" className="text-gray-400 hover:text-primary transition-colors text-sm">
+                  <Link to="/" className="text-white/80 hover:text-white transition-colors text-sm">
                     Home
                   </Link>
                 </li>
                 <li>
-                  <Link to="/auth" className="text-gray-400 hover:text-primary transition-colors text-sm">
+                  <Link to="/auth" className="text-white/80 hover:text-white transition-colors text-sm">
                     Sign Up
                   </Link>
                 </li>
               </ul>
             </div>
           </div>
-          <div className="border-t border-white/10 pt-8 text-center text-gray-400 text-sm">
+          <div className="border-t border-white/20 pt-8 text-center text-white/80 text-sm">
             <p>&copy; 2024 WhatsApp AI Assistant. All rights reserved.</p>
           </div>
         </div>

@@ -38,7 +38,7 @@ const ContactCountBadge = ({ agentId }: { agentId: string }) => {
   }
 
   return (
-    <div className="flex items-center gap-1 text-sm font-semibold text-gray-900 dark:text-white">
+    <div className="flex items-center gap-1 text-sm font-semibold text-foreground">
       <span>{count} contacts</span>
     </div>
   );
@@ -137,18 +137,31 @@ const Dashboard = () => {
 
   // Memoize header content
   const headerContent = useMemo(() => (
+<<<<<<< Updated upstream
     <div className="flex items-center justify-between gap-4 w-full">
       <div>
         <h1 className="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">
           Welcome back{user?.name ? `, ${user.name.split(' ')[0]}` : ''}! 👋
         </h1>
         <p className="text-gray-600 dark:text-gray-400 text-xs sm:text-sm mt-1 hidden sm:block">
+=======
+    <div className="flex items-center justify-between gap-4 w-full animate-fade-in-down">
+      <div>
+        <h1 className="text-xl sm:text-2xl font-bold text-foreground">
+          Welcome back{user?.name ? `, ${user.name.split(' ')[0]}` : ''}! 👋
+        </h1>
+        <p className="text-muted-foreground text-xs sm:text-sm mt-1 hidden sm:block">
+>>>>>>> Stashed changes
           Manage your AI agents and monitor conversations
         </p>
       </div>
       <Button 
         onClick={handleCreateAgent}
+<<<<<<< Updated upstream
         className="bg-gradient-primary shadow-glow hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105 text-sm sm:text-base"
+=======
+        className="bg-gradient-primary text-white shadow-lg hover:opacity-90 hover:shadow-xl transition-all duration-300 hover:scale-105 text-sm sm:text-base font-semibold"
+>>>>>>> Stashed changes
         size="sm"
         aria-label={ariaLabels.actions.create('agent')}
       >
@@ -164,15 +177,17 @@ const Dashboard = () => {
       <div className="pl-0 pr-4 sm:pr-6 pt-0 pb-4 sm:pb-6">
           {/* Quick Stats */}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6 mb-6 sm:mb-8">
-            <Card className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-primary/30 transition-all duration-300 hover:scale-105">
+            <Card className="bg-gradient-to-br from-primary to-whatsapp-teal text-white border-0 shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105 stagger-item animate-fade-in-up">
               <CardHeader className="flex flex-row items-center justify-between pb-2">
-                <CardTitle className="text-sm font-medium text-gray-700 dark:text-gray-300">Total Agents</CardTitle>
+                <CardTitle className="text-sm font-semibold text-white/90">Total Agents</CardTitle>
                 <div className="flex items-center gap-2">
-                  <Bot className="h-5 w-5 text-primary" />
+                  <div className="bg-white/20 p-2 rounded-full animate-float">
+                    <Bot className="h-5 w-5 text-white" />
+                  </div>
                   <Button
                     variant="ghost"
                     size="sm"
-                    className="h-6 w-6 p-0 hover:bg-white/10"
+                    className="h-6 w-6 p-0 hover:bg-white/20 text-white"
                     onClick={handleRefreshStats}
                     disabled={statsLoading}
                     aria-label={ariaLabels.actions.refresh('dashboard stats')}
@@ -185,14 +200,14 @@ const Dashboard = () => {
               </CardHeader>
               <CardContent>
                 {statsLoading ? (
-                  <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                  <Loader2 className="h-8 w-8 animate-spin text-white" />
                 ) : statsError ? (
-                  <div className="flex items-center gap-2 text-red-400">
+                  <div className="flex items-center gap-2 text-white/80">
                     <AlertCircle className="h-4 w-4" />
                     <span className="text-sm">Error</span>
                   </div>
                 ) : (
-                  <div className="text-3xl font-bold text-gray-900 dark:text-white">
+                  <div className="text-3xl font-bold text-white animate-count-up">
                     {dashboardStats?.total_agents ?? 0}
                   </div>
                 )}
@@ -243,9 +258,9 @@ const Dashboard = () => {
           {/* Agents Section */}
           <div className="mb-4 sm:mb-6">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-4">
-              <div>
-                <h2 className="text-2xl sm:text-3xl font-bold text-gray-900 dark:text-white mb-1 sm:mb-2">Your Agents</h2>
-                <p className="text-gray-600 dark:text-gray-400 text-sm sm:text-base">Manage and monitor your AI agents</p>
+              <div className="animate-fade-in-up">
+                <h2 className="text-2xl sm:text-3xl font-bold text-foreground mb-1 sm:mb-2">Your Agents</h2>
+                <p className="text-muted-foreground text-sm sm:text-base">Manage and monitor your AI agents</p>
               </div>
               {agents.length > 0 && (
                 <div className="w-full sm:w-80">
@@ -267,17 +282,17 @@ const Dashboard = () => {
               ))}
             </div>
           ) : agents.length === 0 ? (
-            <Card className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-center py-16 border-dashed">
+            <Card className="bg-card border border-border text-center py-16 border-dashed animate-fade-in-up">
               <CardContent className="space-y-6">
-                <Bot className="h-20 w-20 mx-auto text-gray-400 dark:text-gray-600" />
+                <Bot className="h-20 w-20 mx-auto text-muted-foreground animate-float" />
                 <div>
-                  <h3 className="text-2xl font-semibold mb-2 text-gray-900 dark:text-white">No agents yet</h3>
-                  <p className="text-gray-600 dark:text-gray-400 mb-6">
+                  <h3 className="text-2xl font-semibold mb-2 text-foreground">No agents yet</h3>
+                  <p className="text-muted-foreground mb-6">
                     Create your first AI agent to get started
                   </p>
                   <Button 
                     onClick={handleCreateAgent}
-                    className="bg-gradient-primary shadow-glow hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105"
+                    className="bg-gradient-primary shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105 animate-pulse-glow"
                   >
                     <Plus className="mr-2 h-4 w-4" />
                     Create Your First Agent
@@ -286,12 +301,12 @@ const Dashboard = () => {
               </CardContent>
             </Card>
           ) : filteredAgents.length === 0 && debouncedSearchTerm ? (
-            <Card className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 text-center py-16 border-dashed">
+            <Card className="bg-card border border-border text-center py-16 border-dashed animate-fade-in-up">
               <CardContent className="space-y-6">
-                <Bot className="h-20 w-20 mx-auto text-gray-400 dark:text-gray-600" />
+                <Bot className="h-20 w-20 mx-auto text-muted-foreground" />
                 <div>
-                  <h3 className="text-2xl font-semibold mb-2 text-gray-900 dark:text-white">No agents found</h3>
-                  <p className="text-gray-600 dark:text-gray-400 mb-6">
+                  <h3 className="text-2xl font-semibold mb-2 text-foreground">No agents found</h3>
+                  <p className="text-muted-foreground mb-6">
                     No agents match "{debouncedSearchTerm}"
                   </p>
                   <Button 
@@ -304,22 +319,23 @@ const Dashboard = () => {
               </CardContent>
             </Card>
           ) : (
-            <div className="flex flex-wrap gap-4 sm:gap-6">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 sm:gap-6">
               {filteredAgents.map((agent) => (
                 <Card 
                   key={agent.id} 
-                  className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 hover:border-blue-500 dark:hover:border-primary/50 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-300 hover:scale-[1.02] sm:hover:scale-105 w-full sm:w-[calc(50%-0.75rem)] lg:w-[calc(33.333%-1rem)]"
+                  className="bg-card border border-border hover:border-primary hover:shadow-lg transition-all duration-300 hover:scale-[1.02] sm:hover:scale-105 max-w-full stagger-item animate-scale-in"
+                  style={{ animationDelay: `${(filteredAgents.indexOf(agent) % 6) * 0.1}s` }}
                 >
                   <CardHeader>
                     <div className="flex items-start justify-between gap-2 mb-3">
                       <div className="flex-1 min-w-0">
-                        <CardTitle className="text-gray-900 dark:text-white text-lg sm:text-xl font-bold mb-2 truncate">
+                        <CardTitle className="text-foreground text-lg sm:text-xl font-bold mb-2 truncate">
                           {agent.agent_name}
                         </CardTitle>
                         
                         {/* Description */}
                         {agent.description && (
-                          <p className="text-xs sm:text-sm text-gray-600 dark:text-gray-400 line-clamp-2 font-medium">
+                          <p className="text-xs sm:text-sm text-muted-foreground line-clamp-2 font-medium">
                             {agent.description}
                           </p>
                         )}
@@ -328,7 +344,7 @@ const Dashboard = () => {
                       {/* Status Badge */}
                       <Badge 
                         variant={agent.is_active ? 'default' : 'secondary'}
-                        className={`${agent.is_active ? 'bg-green-500 text-white font-bold' : 'font-semibold'} shrink-0 text-xs`}
+                        className={`${agent.is_active ? 'bg-primary text-white font-bold active-badge' : 'font-semibold bg-muted text-muted-foreground'} shrink-0 text-xs`}
                       >
                         {agent.is_active ? 'active' : 'inactive'}
                       </Badge>
@@ -339,26 +355,26 @@ const Dashboard = () => {
                     {/* Owner Name */}
                     {agent.agent_owner_name && (
                       <div className="flex items-center gap-2 text-sm sm:text-base">
-                        <User className="w-4 h-4 sm:w-5 sm:h-5 text-gray-600 dark:text-gray-400 shrink-0" />
-                        <span className="text-gray-900 dark:text-white truncate font-semibold">{agent.agent_owner_name}</span>
+                        <User className="w-4 h-4 sm:w-5 sm:h-5 text-muted-foreground shrink-0" />
+                        <span className="text-foreground truncate font-semibold">{agent.agent_owner_name}</span>
                       </div>
                     )}
 
                     {/* WhatsApp Number */}
                     {agent.whatsapp_phone_number && (
                       <div className="flex items-center gap-2 text-sm sm:text-base">
-                        <MessageSquare className="w-4 h-4 sm:w-5 sm:h-5 text-green-500 dark:text-green-400 shrink-0" />
-                        <span className="text-gray-700 dark:text-gray-300 shrink-0 font-semibold">WhatsApp:</span>
-                        <span className="text-gray-900 dark:text-white truncate font-semibold">{agent.whatsapp_phone_number}</span>
+                        <MessageSquare className="w-4 h-4 sm:w-5 sm:h-5 text-primary shrink-0" />
+                        <span className="text-muted-foreground shrink-0 font-semibold">WhatsApp:</span>
+                        <span className="text-foreground truncate font-semibold">{agent.whatsapp_phone_number}</span>
                       </div>
                     )}
 
                     {/* Languages */}
                     {agent.response_languages && agent.response_languages.length > 0 && (
                       <div className="flex items-center gap-2 text-sm sm:text-base">
-                        <Globe className="w-4 h-4 sm:w-5 sm:h-5 text-blue-500 dark:text-blue-400 shrink-0" />
-                        <span className="text-gray-700 dark:text-gray-300 shrink-0 font-semibold">Languages:</span>
-                        <span className="text-gray-900 dark:text-white truncate font-semibold">
+                        <Globe className="w-4 h-4 sm:w-5 sm:h-5 text-accent shrink-0" />
+                        <span className="text-muted-foreground shrink-0 font-semibold">Languages:</span>
+                        <span className="text-foreground truncate font-semibold">
                           {agent.response_languages.length === 1 
                             ? agent.response_languages[0]
                             : agent.response_languages.join(', ')
@@ -369,19 +385,19 @@ const Dashboard = () => {
 
                     {/* Contact Count */}
                     <div className="flex items-center gap-2 text-sm sm:text-base">
-                      <Users className="w-4 h-4 sm:w-5 sm:h-5 text-cyan-500 dark:text-cyan-400 shrink-0" />
-                      <span className="text-gray-700 dark:text-gray-300 shrink-0 font-semibold">Contacts:</span>
+                      <Users className="w-4 h-4 sm:w-5 sm:h-5 text-accent shrink-0" />
+                      <span className="text-muted-foreground shrink-0 font-semibold">Contacts:</span>
                       <ContactCountBadge agentId={agent.id} />
                     </div>
 
                     {/* Created Date */}
                     <div className="flex items-center gap-2 text-sm sm:text-base">
-                      <CalendarIcon className="w-4 h-4 sm:w-5 sm:h-5 text-gray-600 dark:text-gray-400 shrink-0" />
-                      <span className="text-gray-700 dark:text-gray-300 truncate font-semibold">{formatDistanceToNow(new Date(agent.created_at), { addSuffix: true })}</span>
+                      <CalendarIcon className="w-4 h-4 sm:w-5 sm:h-5 text-muted-foreground shrink-0" />
+                      <span className="text-muted-foreground truncate font-semibold">{formatDistanceToNow(new Date(agent.created_at), { addSuffix: true })}</span>
                     </div>
                   </CardContent>
 
-                  <CardFooter className="flex flex-col sm:flex-row gap-2 border-t border-gray-200 dark:border-gray-700 pt-3 sm:pt-4 flex-wrap">
+                  <CardFooter className="flex flex-col sm:flex-row gap-2 border-t border-border pt-3 sm:pt-4 flex-wrap">
                     <Button
                       size="sm"
                       variant="outline"
@@ -453,6 +469,7 @@ const Dashboard = () => {
         }}
         agentId={selectedAgentId}
       />
+      
     </AppLayout>
   );
 };

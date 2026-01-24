@@ -94,42 +94,43 @@ export function AppSidebar({ isOpen, onClose }: AppSidebarProps) {
       <aside
         className={cn(
           "fixed lg:static inset-y-0 left-0 z-50",
-          "w-64 bg-[#0a0a0a] border-r border-white/5 flex flex-col h-screen",
+          "w-64 flex-shrink-0 bg-sidebar border-r border-sidebar-border flex flex-col h-screen",
           "transform transition-transform duration-300 ease-in-out",
-          "lg:translate-x-0",
+          "lg:translate-x-0 animate-slide-in-left",
           isOpen ? "translate-x-0" : "-translate-x-full"
         )}
         aria-label={ariaLabels.navigation.mainMenu}
       >
-        <div className="p-5 border-b border-white/5">
+        <div className="p-5 border-b border-sidebar-border">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-whatsapp-green-primary to-whatsapp-teal flex items-center justify-center shadow-lg animate-scale-in">
               <Sparkles className="h-5 w-5 text-white" aria-hidden="true" />
             </div>
             <div>
-              <span className="text-lg font-bold text-white">
+              <span className="text-xl font-bold text-sidebar-foreground">
                 PA Agent
               </span>
-              <p className="text-[10px] text-gray-500 -mt-0.5">AI Powered Assistant</p>
+              <p className="text-xs text-sidebar-foreground -mt-0.5">AI Powered Assistant</p>
             </div>
           </div>
         </div>
         
-        <nav className="flex-1 p-3 space-y-1" aria-label="Primary navigation">
-          {navItems.map((item) => (
-            <NavButton
-              key={item.to}
-              to={item.to}
-              icon={item.icon}
-              label={item.label}
-              ariaLabel={item.ariaLabel}
-              onClick={onClose}
-            />
+        <nav className="flex-1 p-3 space-y-1 overflow-y-auto" aria-label="Primary navigation">
+          {navItems.map((item, index) => (
+            <div key={item.to} className="stagger-item animate-fade-in-up" style={{ animationDelay: `${index * 0.1}s` }}>
+              <NavButton
+                to={item.to}
+                icon={item.icon}
+                label={item.label}
+                ariaLabel={item.ariaLabel}
+                onClick={onClose}
+              />
+            </div>
           ))}
         </nav>
         
         <div className="pt-4 pb-2 px-3">
-          <p className="text-[10px] uppercase tracking-wider text-gray-600 font-medium">
+          <p className="text-xs uppercase tracking-wider text-sidebar-foreground font-semibold">
             Settings
           </p>
         </div>
@@ -147,7 +148,7 @@ export function AppSidebar({ isOpen, onClose }: AppSidebarProps) {
           ))}
         </nav>
 
-        <div className="p-4 border-t border-white/5">
+        <div className="p-4 border-t border-sidebar-border">
           <ProfileAvatarMenu />
         </div>
       </aside>

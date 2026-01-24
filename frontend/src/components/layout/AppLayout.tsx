@@ -4,6 +4,7 @@ import { Breadcrumbs } from './Breadcrumbs';
 import { Button } from '@/components/ui/button';
 import { Menu, X } from 'lucide-react';
 import { ariaLabels } from '@/lib/accessibility';
+import { ThemeToggle } from '@/components/ThemeToggle';
 
 interface AppLayoutProps {
   children: ReactNode;
@@ -14,28 +15,30 @@ export function AppLayout({ children, headerContent }: AppLayoutProps) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   return (
-    <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex">
+    <div className="min-h-screen bg-background flex animate-fade-in">
       <AppSidebar 
         isOpen={sidebarOpen} 
         onClose={() => setSidebarOpen(false)} 
       />
       
-      <div className="flex-1 lg:ml-64 w-full flex flex-col bg-gray-50 dark:bg-gray-900">
+      {/* Main content wrapper - flex-1 to fill remaining space, min-w-0 to prevent overflow */}
+      <div className="flex-1 min-w-0 flex flex-col bg-background">
         {/* Desktop Header */}
         {headerContent && (
           <header 
-            className="hidden lg:block sticky top-0 z-30 border-b border-gray-200 dark:border-gray-800 bg-gray-50/80 dark:bg-gray-900/80 backdrop-blur-xl"
+            className="hidden lg:block sticky top-0 z-30 border-b border-border bg-background/80 backdrop-blur-xl shadow-soft animate-fade-in-down"
             role="banner"
           >
-            <div className="pl-0 pr-4 sm:pr-6 py-4">
-              {headerContent}
+            <div className="px-4 sm:px-6 py-4 flex items-center justify-between">
+              <div className="flex-1">{headerContent}</div>
+              <ThemeToggle />
             </div>
           </header>
         )}
 
         {/* Mobile header */}
         <header 
-          className="lg:hidden sticky top-0 z-30 border-b border-gray-200 dark:border-gray-800 bg-gray-50/80 dark:bg-gray-900/80 backdrop-blur-xl"
+          className="lg:hidden sticky top-0 z-30 border-b border-border bg-sidebar backdrop-blur-xl shadow-soft"
           role="banner"
         >
           <div className="px-4 py-3">
@@ -46,7 +49,7 @@ export function AppLayout({ children, headerContent }: AppLayoutProps) {
                 onClick={() => setSidebarOpen(!sidebarOpen)}
                 aria-label={sidebarOpen ? ariaLabels.navigation.closeMenu : ariaLabels.navigation.toggleMenu}
                 aria-expanded={sidebarOpen}
-                className="text-gray-400 hover:text-white hover:bg-white/10"
+                className="text-sidebar-foreground hover:bg-white/10"
               >
                 {sidebarOpen ? (
                   <X className="h-5 w-5" aria-hidden="true" />
@@ -57,11 +60,11 @@ export function AppLayout({ children, headerContent }: AppLayoutProps) {
               
               {headerContent || (
                 <div className="flex items-center gap-2">
-                  <span className="font-semibold text-white">PA Agent</span>
+                  <span className="font-semibold text-sidebar-foreground">PA Agent</span>
                 </div>
               )}
               
-              <div className="w-10" /> {/* Spacer for alignment */}
+              <ThemeToggle />
             </div>
           </div>
         </header>
@@ -70,7 +73,7 @@ export function AppLayout({ children, headerContent }: AppLayoutProps) {
         <main 
           id="main-content" 
           role="main"
-          className="flex-1 overflow-auto bg-gray-50 dark:bg-gray-900"
+          className="flex-1 overflow-auto bg-background"
           tabIndex={-1}
         >
           <a 
@@ -79,7 +82,7 @@ export function AppLayout({ children, headerContent }: AppLayoutProps) {
           >
             Skip to main content
           </a>
-          <div className="pl-0 pr-4 sm:pr-6 py-4">
+          <div className="px-4 sm:px-6 py-4">
             <Breadcrumbs />
             {children}
           </div>

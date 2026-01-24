@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
+import { AppLayout } from "@/components/layout/AppLayout";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -8,8 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useToast } from "@/hooks/use-toast";
-import { Calendar as CalendarIcon, Plus, Trash2, Loader2, AlertCircle, MessageSquare, MessageCircle, LayoutDashboard, Settings, Home, Sparkles, Key } from "lucide-react";
-import ProfileAvatarMenu from "@/components/ProfileAvatarMenu";
+import { Calendar as CalendarIcon, Plus, Trash2, Loader2, AlertCircle } from "lucide-react";
 import { format, startOfMonth, endOfMonth, eachDayOfInterval, isSameMonth, isSameDay, addMonths, subMonths } from "date-fns";
 
 type SupabaseMeeting = {
@@ -30,7 +30,6 @@ type CalendarMeeting = SupabaseMeeting & {
 
 const Calendar = () => {
   const navigate = useNavigate();
-  const location = useLocation();
   const { toast } = useToast();
   const [currentDate, setCurrentDate] = useState(new Date());
   const [meetings, setMeetings] = useState<CalendarMeeting[]>([]);
@@ -51,7 +50,6 @@ const Calendar = () => {
     contactPhone: "",
   });
 
-  const isActive = (path: string) => location.pathname === path;
 
   // Initialize authentication
   useEffect(() => {
@@ -193,15 +191,6 @@ const Calendar = () => {
 
     const formattedDateTime = format(meetingDateTime, "yyyy-MM-dd HH:mm:ss");
 
-    if (!currentUserId && !currentUserPhone) {
-      toast({
-        variant: "destructive",
-        title: "Unauthorized",
-        description: "You must be logged in to schedule meetings.",
-      });
-      return;
-    }
-
     if (!currentUserId) {
       toast({
         variant: "destructive",
@@ -342,10 +331,10 @@ const Calendar = () => {
   // Loading state
   if (isLoading && !currentUserId) {
     return (
-      <div className="min-h-screen bg-black flex items-center justify-center">
+      <div className="min-h-screen bg-off-white flex items-center justify-center">
         <div className="text-center">
           <Loader2 className="h-12 w-12 animate-spin text-primary mx-auto mb-4" />
-          <p className="text-gray-400">Loading calendar...</p>
+          <p className="text-muted-foreground">Loading calendar...</p>
         </div>
       </div>
     );
@@ -354,11 +343,11 @@ const Calendar = () => {
   // Error state
   if (error && meetings.length === 0) {
     return (
-      <div className="min-h-screen bg-black flex items-center justify-center">
+      <div className="min-h-screen bg-off-white flex items-center justify-center">
         <div className="text-center max-w-md">
-          <AlertCircle className="w-16 h-16 text-red-500 mx-auto mb-4" />
-          <h3 className="text-xl font-semibold text-white mb-2">Failed to Load Meetings</h3>
-          <p className="text-gray-400 mb-6">{error}</p>
+          <AlertCircle className="w-16 h-16 text-destructive mx-auto mb-4" />
+          <h3 className="text-xl font-semibold text-foreground mb-2">Failed to Load Meetings</h3>
+          <p className="text-muted-foreground mb-6">{error}</p>
           <Button onClick={() => window.location.reload()} className="bg-gradient-primary">
             Try Again
           </Button>
@@ -367,116 +356,39 @@ const Calendar = () => {
     );
   }
 
+  const headerContent = (
+    <div className="flex items-center justify-between gap-4 w-full">
+      <div>
+        <h1 className="text-xl sm:text-2xl font-bold text-foreground">My Calendar</h1>
+        <p className="text-muted-foreground text-xs sm:text-sm mt-1">
+          Manage your schedule and events
+        </p>
+      </div>
+      <Button
+        onClick={() => {
+          setSelectedDate(new Date());
+          setShowEventDialog(true);
+        }}
+        className="bg-gradient-primary shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105"
+      >
+        <Plus className="mr-2 h-4 w-4" />
+        Schedule Meeting
+      </Button>
+    </div>
+  );
+
   return (
-    <div className="min-h-screen bg-black flex">
-      {/* Sidebar */}
-      <aside className="w-64 bg-[#0a0a0a] border-r border-white/5 flex flex-col fixed h-screen z-40">
-        <div className="p-5 border-b border-white/5">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center">
-              <Sparkles className="h-5 w-5 text-white" />
-            </div>
-            <div>
-              <span className="text-lg font-bold text-white">
-                PA Agent
-              </span>
-              <p className="text-[10px] text-gray-500 -mt-0.5">AI Powered Assistant</p>
-            </div>
-          </div>
-        </div>
-        
-        <nav className="flex-1 p-3 space-y-1">
-          <NavButton
-            icon={<LayoutDashboard className="h-4 w-4" />}
-            label="Dashboard"
-            active={isActive("/dashboard")}
-            onClick={() => navigate("/dashboard")}
-          />
-          <NavButton
-            icon={<MessageCircle className="h-4 w-4" />}
-            label="Agent Chat"
-            active={isActive("/agent-chat")}
-            onClick={() => navigate("/agent-chat")}
-          />
-          <NavButton
-            icon={<Plus className="h-4 w-4" />}
-            label="Create Agent"
-            active={isActive("/create-agent")}
-            onClick={() => navigate("/create-agent")}
-          />
-          <NavButton
-            icon={<CalendarIcon className="h-4 w-4" />}
-            label="Calendar"
-            active={isActive("/calendar")}
-            onClick={() => navigate("/calendar")}
-          />
-          <NavButton
-            icon={<Key className="h-4 w-4" />}
-            label="Email Integration"
-            active={isActive("/email-integration")}
-            onClick={() => navigate("/email-integration")}
-          />
-          
-          <div className="pt-4 pb-2">
-            <p className="px-3 text-[10px] uppercase tracking-wider text-gray-600 font-medium">
-              Settings
-            </p>
-          </div>
-          
-          <NavButton
-            icon={<Settings className="h-4 w-4" />}
-            label="Profile Settings"
-            active={isActive("/profile")}
-            onClick={() => navigate("/profile")}
-          />
-          <NavButton
-            icon={<Home className="h-4 w-4" />}
-            label="Back to Home"
-            active={false}
-            onClick={() => navigate("/")}
-          />
-        </nav>
-
-        <div className="p-4 border-t border-white/5">
-          <ProfileAvatarMenu />
-        </div>
-      </aside>
-
-      {/* Main Content */}
-      <div className="flex-1 ml-64">
-        <header className="border-b border-white/10 bg-black/80 backdrop-blur-xl sticky top-0 z-30">
-          <div className="px-6 py-4">
-            <div className="flex items-center justify-between">
-          <div>
-                <h1 className="text-2xl font-bold text-white mb-1">My Calendar</h1>
-                <p className="text-gray-400 text-sm">
-              Manage your schedule and events
-            </p>
-              </div>
-              <Button
-                onClick={() => {
-                  setSelectedDate(new Date());
-                  setShowEventDialog(true);
-                }}
-                className="bg-gradient-primary shadow-glow hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105"
-              >
-                <Plus className="mr-2 h-4 w-4" />
-                Schedule Meeting
-              </Button>
-            </div>
-          </div>
-        </header>
-
-        <div className="p-6">
+    <AppLayout headerContent={headerContent}>
+      <div className="space-y-6">
 
           {/* Empty State */}
           {meetings.length === 0 && !isLoading && (
-            <Card className="glass-card text-center py-16 border-dashed">
+            <Card className="bg-card border border-border text-center py-16 border-dashed animate-fade-in-up">
               <CardContent className="space-y-6">
-                <CalendarIcon className="h-20 w-20 mx-auto text-gray-600" />
+                <CalendarIcon className="h-20 w-20 mx-auto text-muted-foreground animate-float" />
                 <div>
-                  <h3 className="text-2xl font-semibold mb-2 text-white">No Scheduled Meetings</h3>
-                  <p className="text-gray-400 mb-6">
+                  <h3 className="text-2xl font-semibold mb-2 text-foreground">No Scheduled Meetings</h3>
+                  <p className="text-muted-foreground mb-6">
                     Your scheduled meetings will appear here
                   </p>
                   <Button
@@ -484,7 +396,7 @@ const Calendar = () => {
                       setSelectedDate(new Date());
                       setShowEventDialog(true);
                     }}
-                    className="bg-gradient-primary shadow-glow hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105"
+                    className="bg-gradient-primary shadow-lg hover:shadow-xl transition-all duration-300 hover:scale-105"
                   >
                     <Plus className="mr-2 h-4 w-4" />
                     Schedule Your First Meeting
@@ -496,10 +408,10 @@ const Calendar = () => {
 
           {/* Calendar */}
           {meetings.length > 0 && (
-            <Card className="glass-card shadow-glow border-white/10">
+            <Card className="bg-card border border-border shadow-sm">
           <CardHeader>
             <div className="flex items-center justify-between">
-                  <CardTitle className="flex items-center gap-2 text-white">
+                  <CardTitle className="flex items-center gap-2 text-foreground">
                     <CalendarIcon className="h-5 w-5 text-primary" />
                 {format(currentDate, "MMMM yyyy")}
               </CardTitle>
@@ -508,7 +420,7 @@ const Calendar = () => {
                   variant="outline"
                   size="sm"
                   onClick={() => setCurrentDate(subMonths(currentDate, 1))}
-                      className="border-white/20 hover:bg-white/10 text-gray-300"
+                      className="border-border hover:bg-muted"
                 >
                   Previous
                 </Button>
@@ -516,7 +428,7 @@ const Calendar = () => {
                   variant="outline"
                   size="sm"
                   onClick={() => setCurrentDate(new Date())}
-                      className="border-white/20 hover:bg-white/10 text-gray-300"
+                      className="border-border hover:bg-muted"
                 >
                   Today
                 </Button>
@@ -524,7 +436,7 @@ const Calendar = () => {
                   variant="outline"
                   size="sm"
                   onClick={() => setCurrentDate(addMonths(currentDate, 1))}
-                      className="border-white/20 hover:bg-white/10 text-gray-300"
+                      className="border-border hover:bg-muted"
                 >
                   Next
                 </Button>
@@ -534,7 +446,7 @@ const Calendar = () => {
           <CardContent>
             <div className="grid grid-cols-7 gap-2 mb-4">
               {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map(day => (
-                    <div key={day} className="text-center font-semibold text-sm text-gray-300">
+                    <div key={day} className="text-center font-semibold text-sm text-muted-foreground">
                   {day}
                 </div>
               ))}
@@ -548,22 +460,22 @@ const Calendar = () => {
                 return (
                   <div
                     key={day.toString()}
-                        className={`min-h-[100px] rounded-lg border p-2 cursor-pointer hover:bg-white/5 transition-all duration-300 ${
-                          isToday ? "border-primary bg-primary/10" : "border-white/10"
+                        className={`min-h-[100px] rounded-lg border p-2 cursor-pointer hover:bg-muted transition-all duration-300 ${
+                          isToday ? "border-primary bg-whatsapp-mint" : "border-border"
                         } ${!isSameMonth(day, currentDate) ? "opacity-30" : ""}`}
                     onClick={() => {
                       setSelectedDate(day);
                       setShowEventDialog(true);
                     }}
                   >
-                        <div className={`font-semibold text-sm mb-1 ${isToday ? "text-primary" : "text-white"}`}>
+                        <div className={`font-semibold text-sm mb-1 ${isToday ? "text-primary" : "text-foreground"}`}>
                       {format(day, "d")}
                     </div>
                     <div className="space-y-1">
                       {dayMeetings.map(meeting => (
                         <div
                           key={meeting.id}
-                              className="relative bg-primary/20 border border-primary/30 rounded px-2 py-1 text-xs leading-tight group hover:bg-primary/30 transition-colors"
+                              className="relative bg-primary/10 border border-primary/30 rounded px-2 py-1 text-xs leading-tight group hover:bg-primary/20 transition-colors"
                           onClick={(e) => {
                             e.stopPropagation();
                             setViewMeeting(meeting);
@@ -571,19 +483,19 @@ const Calendar = () => {
                           }}
                           title={`${meeting.title}\n${meeting.purpose}\n${meeting.location ?? ""}\n${meeting.contact_name ?? ""} ${meeting.contact_phone ?? ""}`}
                         >
-                              <div className="font-semibold truncate text-white">
+                              <div className="font-semibold truncate text-foreground">
                             {format(meeting.parsedDate, "HH:mm")} · {meeting.title}
                           </div>
-                              <div className="text-[11px] text-gray-300 truncate">
+                              <div className="text-[11px] text-muted-foreground truncate">
                             {meeting.purpose}
                           </div>
                           {meeting.location && (
-                                <div className="text-[11px] text-gray-400 truncate">
+                                <div className="text-[11px] text-muted-foreground truncate">
                               📍 {meeting.location}
                             </div>
                           )}
                           {(meeting.contact_name || meeting.contact_phone) && (
-                                <div className="text-[11px] text-gray-400 truncate">
+                                <div className="text-[11px] text-muted-foreground truncate">
                               👤 {meeting.contact_name || "N/A"}
                               {meeting.contact_phone && ` • ${meeting.contact_phone}`}
                             </div>
@@ -591,13 +503,13 @@ const Calendar = () => {
                           <Button
                             variant="ghost"
                             size="sm"
-                                className="absolute top-1 right-1 h-4 w-4 p-0 opacity-0 group-hover:opacity-100 hover:bg-red-500/20"
+                                className="absolute top-1 right-1 h-4 w-4 p-0 opacity-0 group-hover:opacity-100 hover:bg-destructive/10"
                             onClick={(e) => {
                               e.stopPropagation();
                               handleDeleteMeeting(meeting.id);
                             }}
                           >
-                                <Trash2 className="h-3 w-3 text-red-400" />
+                                <Trash2 className="h-3 w-3 text-destructive" />
                           </Button>
                         </div>
                       ))}
@@ -611,91 +523,86 @@ const Calendar = () => {
           )}
 
         <Dialog open={showEventDialog} onOpenChange={setShowEventDialog}>
-          <DialogContent className="glass-card border-white/10 bg-[#0a0a0a] text-white">
+          <DialogContent className="bg-card border-border">
             <DialogHeader>
-              <DialogTitle className="text-white">
+              <DialogTitle className="text-foreground">
                 Schedule Meeting - {selectedDate && format(selectedDate, "MMMM d, yyyy")}
               </DialogTitle>
             </DialogHeader>
             <div className="space-y-4">
               <div className="space-y-2">
-                <Label htmlFor="meeting-title" className="text-gray-300">Title *</Label>
+                <Label htmlFor="meeting-title">Title *</Label>
                 <Input
                   id="meeting-title"
                   placeholder="Meeting title"
                   value={meetingForm.title}
                   onChange={(e) => setMeetingForm({ ...meetingForm, title: e.target.value })}
-                  className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50"
                 />
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="meeting-purpose" className="text-gray-300">Purpose *</Label>
+                <Label htmlFor="meeting-purpose">Purpose *</Label>
                 <Textarea
                   id="meeting-purpose"
                   placeholder="Describe the purpose of this meeting"
                   rows={3}
                   value={meetingForm.purpose}
                   onChange={(e) => setMeetingForm({ ...meetingForm, purpose: e.target.value })}
-                  className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50 resize-none"
+                  className="resize-none"
                 />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="meeting-time" className="text-gray-300">Time *</Label>
+                  <Label htmlFor="meeting-time">Time *</Label>
                   <Input
                     id="meeting-time"
                     type="time"
                     value={meetingForm.time}
                     onChange={(e) => setMeetingForm({ ...meetingForm, time: e.target.value })}
-                    className="bg-white/5 border-white/10 text-white focus:border-primary focus:ring-primary/50"
                   />
                 </div>
 
                 <div className="space-y-2">
-                  <Label htmlFor="meeting-location" className="text-gray-300">Location</Label>
+                  <Label htmlFor="meeting-location">Location</Label>
                   <Input
                     id="meeting-location"
                     placeholder="Optional location"
                     value={meetingForm.location}
                     onChange={(e) => setMeetingForm({ ...meetingForm, location: e.target.value })}
-                    className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50"
                   />
                 </div>
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="meeting-notes" className="text-gray-300">Notes</Label>
+                <Label htmlFor="meeting-notes">Notes</Label>
                 <Textarea
                   id="meeting-notes"
                   placeholder="Additional notes (optional)"
                   rows={2}
                   value={meetingForm.notes}
                   onChange={(e) => setMeetingForm({ ...meetingForm, notes: e.target.value })}
-                  className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50 resize-none"
+                  className="resize-none"
                 />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
-                  <Label htmlFor="meeting-contact-name" className="text-gray-300">Contact Name</Label>
+                  <Label htmlFor="meeting-contact-name">Contact Name</Label>
                   <Input
                     id="meeting-contact-name"
                     placeholder="Point of contact"
                     value={meetingForm.contactName}
                     onChange={(e) => setMeetingForm({ ...meetingForm, contactName: e.target.value })}
-                    className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50"
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="meeting-contact-phone" className="text-gray-300">Contact Phone</Label>
+                  <Label htmlFor="meeting-contact-phone">Contact Phone</Label>
                   <Input
                     id="meeting-contact-phone"
                     placeholder="Contact phone"
                     value={meetingForm.contactPhone}
                     onChange={(e) => setMeetingForm({ ...meetingForm, contactPhone: e.target.value })}
-                    className="bg-white/5 border-white/10 text-white placeholder:text-gray-500 focus:border-primary focus:ring-primary/50"
                   />
                 </div>
               </div>
@@ -707,13 +614,12 @@ const Calendar = () => {
                     setShowEventDialog(false);
                     setMeetingForm({ title: "", purpose: "", time: "", location: "", notes: "", contactName: "", contactPhone: "" });
                   }}
-                  className="border-white/20 hover:bg-white/10 text-gray-300"
                 >
                   Cancel
                 </Button>
                 <Button
                   onClick={handleCreateMeeting}
-                  className="bg-gradient-primary shadow-glow hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)]"
+                  className="bg-gradient-primary"
                 >
                   <Plus className="mr-2 h-4 w-4" />
                   Schedule Meeting
@@ -732,64 +638,63 @@ const Calendar = () => {
             }
           }}
         >
-          <DialogContent className="glass-card border-white/10 bg-[#0a0a0a] text-white">
+          <DialogContent className="bg-card border-border">
             <DialogHeader>
-              <DialogTitle className="text-white">
+              <DialogTitle className="text-foreground">
                 Meeting Details {viewMeeting ? `- ${format(viewMeeting.parsedDate, "MMMM d, yyyy")}` : ""}
               </DialogTitle>
             </DialogHeader>
             {viewMeeting && (
               <div className="space-y-4 text-sm">
                 <div>
-                  <Label className="text-xs uppercase text-gray-400 mb-1 block">Title</Label>
-                  <div className="font-semibold text-white">{viewMeeting.title}</div>
+                  <Label className="text-xs uppercase text-muted-foreground mb-1 block">Title</Label>
+                  <div className="font-semibold text-foreground">{viewMeeting.title}</div>
                 </div>
                 <div>
-                  <Label className="text-xs uppercase text-gray-400 mb-1 block">Purpose</Label>
-                  <div className="text-gray-300">{viewMeeting.purpose}</div>
+                  <Label className="text-xs uppercase text-muted-foreground mb-1 block">Purpose</Label>
+                  <div className="text-muted-foreground">{viewMeeting.purpose}</div>
                 </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <Label className="text-xs uppercase text-gray-400 mb-1 block">Date</Label>
-                    <div className="text-white">{format(viewMeeting.parsedDate, "MMMM d, yyyy")}</div>
+                    <Label className="text-xs uppercase text-muted-foreground mb-1 block">Date</Label>
+                    <div className="text-foreground">{format(viewMeeting.parsedDate, "MMMM d, yyyy")}</div>
                   </div>
                   <div>
-                    <Label className="text-xs uppercase text-gray-400 mb-1 block">Time</Label>
-                    <div className="text-white">{format(viewMeeting.parsedDate, "HH:mm")}</div>
+                    <Label className="text-xs uppercase text-muted-foreground mb-1 block">Time</Label>
+                    <div className="text-foreground">{format(viewMeeting.parsedDate, "HH:mm")}</div>
                   </div>
                 </div>
                 {viewMeeting.location && (
                   <div>
-                    <Label className="text-xs uppercase text-gray-400 mb-1 block">Location</Label>
-                    <div className="text-gray-300">📍 {viewMeeting.location}</div>
+                    <Label className="text-xs uppercase text-muted-foreground mb-1 block">Location</Label>
+                    <div className="text-muted-foreground">📍 {viewMeeting.location}</div>
                   </div>
                 )}
                 {(viewMeeting.contact_name || viewMeeting.contact_phone) && (
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <Label className="text-xs uppercase text-gray-400 mb-1 block">Contact Name</Label>
-                      <div className="text-white">{viewMeeting.contact_name || "—"}</div>
+                      <Label className="text-xs uppercase text-muted-foreground mb-1 block">Contact Name</Label>
+                      <div className="text-foreground">{viewMeeting.contact_name || "—"}</div>
                     </div>
                     <div>
-                      <Label className="text-xs uppercase text-gray-400 mb-1 block">Contact Phone</Label>
-                      <div className="text-white">{viewMeeting.contact_phone || "—"}</div>
+                      <Label className="text-xs uppercase text-muted-foreground mb-1 block">Contact Phone</Label>
+                      <div className="text-foreground">{viewMeeting.contact_phone || "—"}</div>
                     </div>
                   </div>
                 )}
                 {viewMeeting.notes && (
                   <div>
-                    <Label className="text-xs uppercase text-gray-400 mb-1 block">Notes</Label>
-                    <div className="text-gray-300">{viewMeeting.notes}</div>
+                    <Label className="text-xs uppercase text-muted-foreground mb-1 block">Notes</Label>
+                    <div className="text-muted-foreground">{viewMeeting.notes}</div>
                   </div>
                 )}
-                <div className="flex justify-end gap-2 pt-4 border-t border-white/10">
+                <div className="flex justify-end gap-2 pt-4 border-t border-border">
                   <Button
                     variant="outline"
                     onClick={() => {
                       setShowViewDialog(false);
                       setViewMeeting(null);
                     }}
-                    className="border-white/20 hover:bg-white/10 text-gray-300"
                   >
                     Close
                   </Button>
@@ -802,7 +707,6 @@ const Calendar = () => {
                         setViewMeeting(null);
                       }
                     }}
-                    className="hover:bg-red-600"
                   >
                     Delete Meeting
                   </Button>
@@ -811,36 +715,9 @@ const Calendar = () => {
             )}
           </DialogContent>
         </Dialog>
-        </div>
       </div>
-    </div>
+    </AppLayout>
   );
 };
-
-// Navigation Button Component
-interface NavButtonProps {
-  icon: React.ReactNode;
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}
-
-const NavButton: React.FC<NavButtonProps> = ({ icon, label, active, onClick }) => (
-  <Button
-    variant="ghost"
-    className={`
-      w-full justify-start gap-3 h-10 px-3 text-sm font-medium
-      transition-all duration-200
-      ${active 
-        ? "bg-violet-500/10 text-violet-400 border-l-2 border-violet-500 rounded-l-none" 
-        : "text-gray-400 hover:text-white hover:bg-white/5"
-      }
-    `}
-    onClick={onClick}
-  >
-    {icon}
-    {label}
-  </Button>
-);
 
 export default Calendar;

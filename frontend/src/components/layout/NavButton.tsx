@@ -24,15 +24,15 @@ export const NavButton = memo(function NavButton({
       onClick={onClick}
       aria-label={ariaLabel || label}
       className={({ isActive }) => cn(
-        "flex items-center gap-3 px-3 py-2 rounded-lg h-10 text-sm font-medium",
+        "flex items-center gap-3 px-4 py-3 rounded-lg h-12 text-base font-semibold",
         "transition-all duration-200",
         isActive
-          ? "bg-violet-500/10 text-violet-400 border-l-2 border-violet-500 rounded-l-none"
-          : "text-gray-400 hover:text-white hover:bg-white/5",
+          ? "bg-primary/20 text-white border-l-4 border-primary rounded-l-none shadow-sm"
+          : "text-sidebar-foreground hover:text-white hover:bg-white/10",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       )}
     >
-      <Icon className="h-4 w-4" aria-hidden="true" />
+      <Icon className="h-5 w-5" aria-hidden="true" />
       <span>{label}</span>
     </NavLink>
   );

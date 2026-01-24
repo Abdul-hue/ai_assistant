@@ -39,11 +39,18 @@ export default {
         accent: {
           DEFAULT: "hsl(var(--accent))",
           foreground: "hsl(var(--accent-foreground))",
-          glow: "hsl(var(--accent-glow))",
         },
         success: {
           DEFAULT: "hsl(var(--success))",
           foreground: "hsl(var(--success-foreground))",
+        },
+        warning: {
+          DEFAULT: "hsl(var(--warning))",
+          foreground: "hsl(var(--warning-foreground))",
+        },
+        info: {
+          DEFAULT: "hsl(var(--info))",
+          foreground: "hsl(var(--info-foreground))",
         },
         popover: {
           DEFAULT: "hsl(var(--popover))",
@@ -63,6 +70,18 @@ export default {
           border: "hsl(var(--sidebar-border))",
           ring: "hsl(var(--sidebar-ring))",
         },
+        whatsapp: {
+          green: {
+            DEFAULT: "hsl(var(--whatsapp-green-primary))",
+            dark: "hsl(var(--whatsapp-green-dark))",
+            light: "hsl(var(--whatsapp-green-light))",
+          },
+          teal: "hsl(var(--whatsapp-teal))",
+        },
+        message: {
+          sent: "hsl(var(--message-sent))",
+          received: "hsl(var(--message-received))",
+        },
       },
       backgroundImage: {
         'gradient-primary': 'var(--gradient-primary)',
@@ -72,6 +91,7 @@ export default {
       boxShadow: {
         'card': 'var(--shadow-card)',
         'glow': 'var(--shadow-glow)',
+        'soft': 'var(--shadow-soft)',
       },
       borderRadius: {
         lg: "var(--radius)",

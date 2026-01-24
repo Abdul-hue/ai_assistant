@@ -259,10 +259,10 @@ export default function CreateAgent() {
     return (
       <AppLayout headerContent={headerContent}>
         <div className="container mx-auto px-4 py-12 max-w-2xl">
-          <div className="glass-card shadow-glow border-primary/20 rounded-lg p-6">
+          <div className="bg-card border border-border shadow-lg rounded-xl p-6">
             <div className="text-center mb-6">
-              <h1 className="text-3xl font-bold text-white mb-2">Agent Created Successfully!</h1>
-              <p className="text-gray-400">
+              <h1 className="text-3xl font-bold text-foreground mb-2">Agent Created Successfully!</h1>
+              <p className="text-muted-foreground">
                 Scan this QR code with WhatsApp to connect your agent
               </p>
             </div>
@@ -301,7 +301,7 @@ export default function CreateAgent() {
             <Button 
               variant="ghost" 
         onClick={() => navigate('/dashboard')}
-              className="hover:bg-gray-100 dark:hover:bg-white/10 text-gray-700 dark:text-gray-300"
+              className="hover:bg-muted"
         aria-label="Go back to dashboard"
             >
         <ArrowLeft className="mr-2 h-4 w-4" aria-hidden="true" />
@@ -314,9 +314,9 @@ export default function CreateAgent() {
     <AppLayout headerContent={headerContent}>
       <div className="max-w-4xl mx-auto p-6">
         {/* Header */}
-        <div className="mb-6">
-          <h1 className="text-3xl font-bold bg-gradient-to-r from-purple-600 to-blue-600 bg-clip-text text-transparent">Create New Agent</h1>
-          <p className="text-gray-600 dark:text-gray-400 mt-2">
+        <div className="mb-6 animate-fade-in-up">
+          <h1 className="text-3xl font-bold bg-gradient-to-r from-primary to-whatsapp-teal bg-clip-text text-transparent">Create New Agent</h1>
+          <p className="text-muted-foreground mt-2">
             Set up your AI agent by filling out the form below
           </p>
         </div>

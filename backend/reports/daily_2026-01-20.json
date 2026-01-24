@@ -1,0 +1,11 @@
+{
+  "type": "daily",
+  "generatedAt": "2026-01-20T19:00:00.059Z",
+  "period": {
+    "start": "2026-01-19T19:00:00.059Z",
+    "end": "2026-01-20T19:00:00.059Z"
+  },
+  "snapshots": 0,
+  "summary": {},
+  "degradation": {}
+}

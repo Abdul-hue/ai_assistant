@@ -4,230 +4,421 @@
 
 /* Email Content Readability Styles */
 .email-content {
-  color: #e5e7eb !important;
-  font-size: 15px !important;
-  line-height: 1.6 !important;
+  color: hsl(var(--foreground)) !important;
+  font-size: 16px !important;
+  line-height: 1.7 !important;
   background-color: transparent !important;
+  max-width: 100% !important;
+  word-wrap: break-word !important;
+  overflow-wrap: break-word !important;
 }
 
-.email-content * {
-  color: #e5e7eb !important;
+/* Force all text elements to use theme colors - override inline styles */
+.email-content *,
+.email-content *[style*="color"],
+.email-content *[style*="background-color"],
+.email-content *[style*="background"] {
+  color: hsl(var(--foreground)) !important;
+  background-color: transparent !important;
+  max-width: 100% !important;
 }
 
-.email-content *[style*="color"] {
-  color: #e5e7eb !important;
-}
-
+/* Override inline color styles on specific elements */
 .email-content p[style*="color"],
 .email-content div[style*="color"],
 .email-content span[style*="color"],
 .email-content td[style*="color"],
-.email-content th[style*="color"] {
-  color: #e5e7eb !important;
+.email-content th[style*="color"],
+.email-content li[style*="color"],
+.email-content a[style*="color"],
+.email-content h1[style*="color"],
+.email-content h2[style*="color"],
+.email-content h3[style*="color"],
+.email-content h4[style*="color"],
+.email-content h5[style*="color"],
+.email-content h6[style*="color"] {
+  color: hsl(var(--foreground)) !important;
 }
 
+/* Override background colors in email content */
+.email-content *[style*="background-color"],
+.email-content *[style*="background"] {
+  background-color: transparent !important;
+}
+
+/* Preserve table cell backgrounds but make them theme-aware */
+.email-content td[style*="background"],
+.email-content th[style*="background"] {
+  background-color: hsl(var(--muted)) !important;
+}
+
+/* Paragraphs */
 .email-content p {
-  color: #e5e7eb !important;
   margin-bottom: 1em !important;
+  line-height: 1.7 !important;
 }
 
+/* Links */
 .email-content a {
-  color: #60a5fa !important;
+  color: hsl(var(--primary)) !important;
   text-decoration: underline !important;
 }
 
 .email-content a:hover {
-  color: #93c5fd !important;
+  color: hsl(var(--primary)) !important;
+  opacity: 0.8 !important;
 }
 
-.email-content strong,
-.email-content b {
-  color: #f3f4f6 !important;
-  font-weight: 600 !important;
-}
-
+/* Headings */
 .email-content h1,
 .email-content h2,
 .email-content h3,
 .email-content h4,
 .email-content h5,
 .email-content h6 {
-  color: #f9fafb !important;
   font-weight: 700 !important;
   margin-top: 1.5em !important;
   margin-bottom: 0.5em !important;
+  line-height: 1.3 !important;
 }
 
-.email-content code {
-  color: #f3f4f6 !important;
-  background-color: rgba(255, 255, 255, 0.1) !important;
-  padding: 0.2em 0.4em !important;
-  border-radius: 0.25rem !important;
-}
+.email-content h1 { font-size: 2em !important; }
+.email-content h2 { font-size: 1.5em !important; }
+.email-content h3 { font-size: 1.25em !important; }
 
-.email-content pre {
-  color: #f3f4f6 !important;
-  background-color: rgba(255, 255, 255, 0.05) !important;
-  padding: 1em !important;
-  border-radius: 0.5rem !important;
-  overflow-x: auto !important;
-}
-
-.email-content blockquote {
-  color: #d1d5db !important;
-  border-left: 4px solid #60a5fa !important;
-  padding-left: 1em !important;
+/* Images - Critical for preventing overflow */
+.email-content img {
+  max-width: 100% !important;
+  height: auto !important;
+  display: block !important;
   margin: 1em 0 !important;
+  border-radius: 0.5rem !important;
 }
 
+/* Tables */
+.email-content table {
+  border-collapse: collapse !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 1em 0 !important;
+  overflow-x: auto !important;
+  display: block !important;
+}
+
+.email-content th,
+.email-content td {
+  border: 1px solid hsl(var(--border)) !important;
+  padding: 0.5em !important;
+  word-wrap: break-word !important;
+}
+
+.email-content th {
+  background-color: hsl(var(--muted)) !important;
+  font-weight: 600 !important;
+}
+
+/* Lists */
 .email-content ul,
 .email-content ol {
-  color: #e5e7eb !important;
   margin: 1em 0 !important;
   padding-left: 2em !important;
 }
 
 .email-content li {
-  color: #e5e7eb !important;
   margin: 0.5em 0 !important;
+  line-height: 1.7 !important;
 }
 
-.email-content table {
-  color: #e5e7eb !important;
-  border-collapse: collapse !important;
-  width: 100% !important;
+/* Code blocks */
+.email-content code {
+  background-color: hsl(var(--muted)) !important;
+  padding: 0.2em 0.4em !important;
+  border-radius: 0.25rem !important;
+  font-size: 0.9em !important;
+}
+
+.email-content pre {
+  background-color: hsl(var(--muted)) !important;
+  padding: 1em !important;
+  border-radius: 0.5rem !important;
+  overflow-x: auto !important;
+  max-width: 100% !important;
+}
+
+.email-content pre code {
+  background-color: transparent !important;
+  padding: 0 !important;
+}
+
+/* Blockquotes */
+.email-content blockquote {
+  border-left: 4px solid hsl(var(--primary)) !important;
+  padding-left: 1em !important;
   margin: 1em 0 !important;
+  font-style: italic !important;
 }
 
-.email-content th,
-.email-content td {
-  color: #e5e7eb !important;
-  border: 1px solid rgba(255, 255, 255, 0.1) !important;
-  padding: 0.5em !important;
+/* Plain text email styling */
+.email-plain-text {
+  white-space: pre-wrap !important;
+  word-wrap: break-word !important;
+  overflow-wrap: break-word !important;
+  max-width: 100% !important;
+  color: hsl(var(--foreground)) !important;
+  font-size: 16px !important;
+  line-height: 1.7 !important;
 }
 
-.email-content th {
-  background-color: rgba(255, 255, 255, 0.05) !important;
-  font-weight: 600 !important;
+/* Light mode email content - ensure dark text on light background */
+.email-content {
+  color: hsl(var(--foreground)) !important;
 }
 
-/* Definition of the design system. All colors, gradients, fonts, etc should be defined here. 
-All colors MUST be HSL.
+/* Light mode specific overrides */
+.email-content p[style*="color"],
+.email-content div[style*="color"],
+.email-content span[style*="color"],
+.email-content td[style*="color"],
+.email-content th[style*="color"],
+.email-content li[style*="color"] {
+  color: hsl(var(--foreground)) !important;
+}
+
+.email-content a,
+.email-content a[style*="color"] {
+  color: hsl(var(--primary)) !important;
+}
+
+.email-content a:hover {
+  color: hsl(var(--primary-glow)) !important;
+  opacity: 0.9 !important;
+}
+
+/* Dark mode email content adjustments - Force theme colors */
+.dark .email-content {
+  color: hsl(var(--foreground)) !important;
+  background-color: transparent !important;
+}
+
+/* Override ALL inline color styles in dark mode */
+.dark .email-content *,
+.dark .email-content *[style*="color"],
+.dark .email-content *[style*="background-color"],
+.dark .email-content *[style*="background"] {
+  color: hsl(var(--foreground)) !important;
+  background-color: transparent !important;
+}
+
+/* Specific element overrides for dark mode */
+.dark .email-content p,
+.dark .email-content div,
+.dark .email-content span,
+.dark .email-content td,
+.dark .email-content th,
+.dark .email-content li,
+.dark .email-content p[style*="color"],
+.dark .email-content div[style*="color"],
+.dark .email-content span[style*="color"],
+.dark .email-content td[style*="color"],
+.dark .email-content th[style*="color"],
+.dark .email-content li[style*="color"] {
+  color: hsl(var(--foreground)) !important;
+}
+
+.dark .email-content a,
+.dark .email-content a[style*="color"] {
+  color: hsl(var(--primary)) !important;
+}
+
+.dark .email-content a:hover {
+  color: hsl(var(--primary-glow)) !important;
+  opacity: 0.9 !important;
+}
+
+.dark .email-content strong,
+.dark .email-content b,
+.dark .email-content strong[style*="color"],
+.dark .email-content b[style*="color"] {
+  color: hsl(var(--foreground)) !important;
+  font-weight: 700 !important;
+}
+
+.dark .email-content h1,
+.dark .email-content h2,
+.dark .email-content h3,
+.dark .email-content h4,
+.dark .email-content h5,
+.dark .email-content h6,
+.dark .email-content h1[style*="color"],
+.dark .email-content h2[style*="color"],
+.dark .email-content h3[style*="color"],
+.dark .email-content h4[style*="color"],
+.dark .email-content h5[style*="color"],
+.dark .email-content h6[style*="color"] {
+  color: hsl(var(--foreground)) !important;
+}
+
+/* Table backgrounds in dark mode */
+.dark .email-content td[style*="background"],
+.dark .email-content th[style*="background"] {
+  background-color: hsl(var(--muted)) !important;
+}
+
+.dark .email-content th {
+  background-color: hsl(var(--muted)) !important;
+  color: hsl(var(--foreground)) !important;
+}
+
+/* WhatsApp-Inspired Design System
+   All colors, gradients, fonts, etc should be defined here.
+   All colors MUST be HSL for consistency.
 */
 
 @layer base {
   :root {
-    /* Black Theme - Deep blacks and dark grays */
-    --background: 0 0% 0%;
-    --foreground: 0 0% 100%;
+    /* WhatsApp-Inspired Color Palette */
+    
+    /* Primary Colors - Teal Theme */
+    --whatsapp-green-primary: 180 50% 45%;      /* Main teal color (from user's image) */
+    --whatsapp-green-dark: 180 55% 35%;         /* Darker teal for headers/sidebar */
+    --whatsapp-green-light: 180 40% 85%;        /* Light teal for highlights */
+    --whatsapp-teal: 180 60% 25%;                /* Deep teal accent */
 
-    --card: 0 0% 4%;
-    --card-foreground: 0 0% 100%;
+    /* Background Colors - White & Light */
+    --background: 0 0% 100%;                    /* Pure white */
+    --foreground: 0 0% 12%;                     /* Dark text on light bg */
+    --off-white: 210 20% 98%;                   /* #F7F8FA - Subtle off-white */
+    --chat-bg: 30 20% 90%;                      /* #ECE5DD - Chat background (beige) */
 
-    --popover: 0 0% 4%;
-    --popover-foreground: 0 0% 100%;
+    /* Card Colors */
+    --card: 0 0% 100%;                          /* White cards */
+    --card-foreground: 0 0% 12%;                /* Dark text on cards */
 
-    /* Primary: Vibrant Blue */
-    --primary: 217 91% 60%;
-    --primary-foreground: 0 0% 100%;
-    --primary-glow: 217 91% 70%;
+    /* Popover Colors */
+    --popover: 0 0% 100%;                       /* White popovers */
+    --popover-foreground: 0 0% 12%;             /* Dark text */
 
-    /* Secondary: Dark gray */
-    --secondary: 0 0% 10%;
-    --secondary-foreground: 0 0% 100%;
+    /* Primary (Teal) */
+    --primary: 180 50% 45%;                     /* Main teal color */
+    --primary-foreground: 0 0% 100%;           /* White text on teal */
+    --primary-glow: 180 50% 55%;               /* Lighter teal for glow */
 
-    /* Muted: Medium gray */
-    --muted: 0 0% 15%;
-    --muted-foreground: 0 0% 64%;
+    /* Secondary (Light Gray) */
+    --secondary: 210 20% 96%;                   /* Very light gray */
+    --secondary-foreground: 0 0% 12%;           /* Dark text */
 
-    /* Accent: Electric Purple */
-    --accent: 262 83% 58%;
-    --accent-foreground: 0 0% 100%;
-    --accent-glow: 262 83% 68%;
+    /* Muted Colors */
+    --muted: 210 20% 96%;                      /* Light gray backgrounds */
+    --muted-foreground: 210 10% 50%;            /* #667781 - Muted text, timestamps */
 
-    /* Success: Emerald Green */
-    --success: 142 71% 45%;
-    --success-foreground: 0 0% 100%;
+    /* Accent Colors */
+    --accent: 200 100% 60%;                     /* #34B7F1 - Blue for links, icons */
+    --accent-foreground: 0 0% 100%;             /* White text */
+    --accent-orange: 30 100% 50%;               /* #FF9800 - Orange for notifications */
 
-    --destructive: 0 84.2% 60.2%;
-    --destructive-foreground: 0 0% 100%;
+    /* Success (Teal) */
+    --success: 180 50% 45%;                      /* Main teal color */
+    --success-foreground: 0 0% 100%;            /* White text */
 
-    --border: 0 0% 15%;
-    --input: 0 0% 15%;
-    --ring: 217 91% 60%;
+    /* Destructive (Error Red) */
+    --destructive: 0 70% 65%;                   /* #F15C5C - Error red */
+    --destructive-foreground: 0 0% 100%;        /* White text */
 
-    --radius: 0.75rem;
+    /* Warning (Orange) */
+    --warning: 30 100% 50%;                     /* #FF9800 */
+    --warning-foreground: 0 0% 100%;            /* White text */
+
+    /* Info (Blue) */
+    --info: 200 100% 60%;                       /* #34B7F1 */
+    --info-foreground: 0 0% 100%;                /* White text */
+
+    /* Border & Input Colors */
+    --border: 210 20% 92%;                     /* #E9EDEF - Subtle borders */
+    --input: 210 20% 96%;                      /* Light gray input bg */
+    --ring: 180 50% 45%;                       /* Teal focus ring */
+
+    /* Text Colors */
+    --text-primary: 0 0% 12%;                   /* #1F1F1F - Dark text */
+    --text-secondary: 210 10% 50%;              /* #667781 - Secondary text */
+    --text-muted: 210 10% 60%;                 /* #8696A0 - Muted/placeholder text */
+
+    /* Message Colors */
+    --message-sent: 88 50% 85%;                /* #DCF8C6 - Sent message bubble */
+    --message-received: 0 0% 100%;              /* White - Received message bubble */
+
+    /* Border Radius */
+    --radius: 0.75rem;                         /* 12px - Consistent rounded corners */
 
     /* Gradients */
-    --gradient-primary: linear-gradient(135deg, hsl(217 91% 60%) 0%, hsl(262 83% 58%) 100%);
-    --gradient-hero: linear-gradient(180deg, hsl(0 0% 0%) 0%, hsl(0 0% 4%) 50%, hsl(0 0% 7%) 100%);
-    --gradient-success: linear-gradient(135deg, hsl(142 71% 45%) 0%, hsl(142 71% 55%) 100%);
+    --gradient-primary: linear-gradient(135deg, hsl(180 50% 45%) 0%, hsl(180 55% 35%) 100%);
+    --gradient-hero: linear-gradient(180deg, hsl(0 0% 100%) 0%, hsl(210 20% 98%) 50%, hsl(210 20% 96%) 100%);
+    --gradient-success: linear-gradient(135deg, hsl(180 50% 45%) 0%, hsl(180 50% 55%) 100%);
 
-    /* Shadows */
-    --shadow-card: 0 4px 6px -1px hsl(0 0% 0% / 0.5), 0 2px 4px -2px hsl(0 0% 0% / 0.5);
-    --shadow-glow: 0 0 30px hsl(217 91% 60% / 0.4);
+    /* Shadows - Soft and subtle */
+    --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.06);
+    --shadow-glow: 0 0 30px rgba(18, 140, 126, 0.25);
+    --shadow-soft: 0 2px 4px rgba(0, 0, 0, 0.08);
 
-    /* Sidebar */
-    --sidebar-background: 0 0% 4%;
-    --sidebar-foreground: 0 0% 100%;
-    --sidebar-primary: 217 91% 60%;
-    --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 0 0% 10%;
-    --sidebar-accent-foreground: 0 0% 100%;
-    --sidebar-border: 0 0% 15%;
-    --sidebar-ring: 217 91% 60%;
+    /* Sidebar - Teal header style */
+    --sidebar-background: 180 55% 35%;          /* Dark teal for sidebar */
+    --sidebar-foreground: 0 0% 100%;            /* White text */
+    --sidebar-primary: 180 50% 45%;             /* Main teal */
+    --sidebar-primary-foreground: 0 0% 100%;   /* White text */
+    --sidebar-accent: 180 50% 30%;              /* Darker teal accent */
+    --sidebar-accent-foreground: 0 0% 100%;     /* White text */
+    --sidebar-border: 180 40% 25%;              /* Dark teal border */
+    --sidebar-ring: 180 50% 45%;                /* Teal focus ring */
   }
 
   .dark {
-    /* Same as root - black theme is default */
-    --background: 0 0% 0%;
-    --foreground: 0 0% 100%;
+    /* Dark mode - Keep teal but with darker backgrounds */
+    --background: 0 0% 8%;                     /* Very dark gray */
+    --foreground: 0 0% 95%;                     /* Light text */
 
-    --card: 0 0% 4%;
-    --card-foreground: 0 0% 100%;
+    --card: 0 0% 12%;                           /* Dark cards */
+    --card-foreground: 0 0% 95%;                /* Light text */
 
-    --popover: 0 0% 4%;
-    --popover-foreground: 0 0% 100%;
+    --popover: 0 0% 12%;                        /* Dark popovers */
+    --popover-foreground: 0 0% 95%;             /* Light text */
 
-    --primary: 217 91% 60%;
-    --primary-foreground: 0 0% 100%;
-    --primary-glow: 217 91% 70%;
+    --primary: 180 50% 45%;                     /* Main teal */
+    --primary-foreground: 0 0% 100%;            /* White text */
+    --primary-glow: 180 50% 55%;               /* Lighter teal glow */
 
-    --secondary: 0 0% 10%;
-    --secondary-foreground: 0 0% 100%;
+    --secondary: 0 0% 15%;                      /* Dark gray */
+    --secondary-foreground: 0 0% 95%;           /* Light text */
 
-    --muted: 0 0% 15%;
-    --muted-foreground: 0 0% 64%;
+    --muted: 0 0% 15%;                          /* Dark muted bg */
+    --muted-foreground: 210 10% 60%;            /* Muted text */
 
-    --accent: 262 83% 58%;
-    --accent-foreground: 0 0% 100%;
-    --accent-glow: 262 83% 68%;
+    --accent: 200 100% 60%;                     /* Blue accent */
+    --accent-foreground: 0 0% 100%;             /* White text */
 
-    --success: 142 71% 45%;
-    --success-foreground: 0 0% 100%;
+    --success: 180 50% 45%;                      /* Teal */
+    --success-foreground: 0 0% 100%;            /* White text */
 
-    --destructive: 0 62.8% 50%;
-    --destructive-foreground: 0 0% 100%;
+    --destructive: 0 70% 65%;                    /* Error red */
+    --destructive-foreground: 0 0% 100%;        /* White text */
 
-    --border: 0 0% 15%;
-    --input: 0 0% 15%;
-    --ring: 217 91% 60%;
+    --border: 0 0% 20%;                         /* Dark borders */
+    --input: 0 0% 15%;                          /* Dark input bg */
+    --ring: 180 50% 45%;                        /* Teal focus ring */
 
-    --gradient-primary: linear-gradient(135deg, hsl(217 91% 60%) 0%, hsl(262 83% 58%) 100%);
-    --gradient-hero: linear-gradient(180deg, hsl(0 0% 0%) 0%, hsl(0 0% 4%) 50%, hsl(0 0% 7%) 100%);
-    --gradient-success: linear-gradient(135deg, hsl(142 71% 45%) 0%, hsl(142 71% 55%) 100%);
+    --gradient-primary: linear-gradient(135deg, hsl(180 50% 45%) 0%, hsl(180 55% 35%) 100%);
+    --gradient-hero: linear-gradient(180deg, hsl(0 0% 8%) 0%, hsl(0 0% 12%) 50%, hsl(0 0% 15%) 100%);
+    --gradient-success: linear-gradient(135deg, hsl(180 50% 45%) 0%, hsl(180 50% 55%) 100%);
 
-    --shadow-card: 0 4px 6px -1px hsl(0 0% 0% / 0.5), 0 2px 4px -2px hsl(0 0% 0% / 0.5);
-    --shadow-glow: 0 0 30px hsl(217 91% 60% / 0.4);
+    --shadow-card: 0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -2px rgba(0, 0, 0, 0.2);
+    --shadow-glow: 0 0 30px rgba(18, 140, 126, 0.4);
 
-    --sidebar-background: 0 0% 4%;
-    --sidebar-foreground: 0 0% 100%;
-    --sidebar-primary: 217 91% 60%;
-    --sidebar-primary-foreground: 0 0% 100%;
-    --sidebar-accent: 0 0% 10%;
-    --sidebar-accent-foreground: 0 0% 100%;
-    --sidebar-border: 0 0% 15%;
-    --sidebar-ring: 217 91% 60%;
+    --sidebar-background: 180 55% 35%;          /* Dark teal */
+    --sidebar-foreground: 0 0% 100%;            /* White text */
+    --sidebar-primary: 180 50% 45%;             /* Main teal */
+    --sidebar-primary-foreground: 0 0% 100%;   /* White text */
+    --sidebar-accent: 180 50% 30%;              /* Darker teal */
+    --sidebar-accent-foreground: 0 0% 100%;     /* White text */
+    --sidebar-border: 180 40% 25%;              /* Dark teal border */
+    --sidebar-ring: 180 50% 45%;                /* Teal focus ring */
   }
 }
 
@@ -239,26 +430,27 @@ All colors MUST be HSL.
   body {
     @apply bg-background text-foreground;
     font-feature-settings: "rlig" 1, "calt" 1;
+    font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
   }
 
-  /* Custom scrollbar for black theme */
+  /* Custom scrollbar - WhatsApp style (light) */
   ::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: 8px;
+    height: 8px;
   }
 
   ::-webkit-scrollbar-track {
-    @apply bg-black;
+    background: hsl(var(--off-white));
   }
 
   ::-webkit-scrollbar-thumb {
-    @apply bg-[#1a1a1a] rounded-full;
-    border: 2px solid transparent;
-    background-clip: padding-box;
+    background: hsl(var(--text-muted));
+    border-radius: 4px;
+    border: 2px solid hsl(var(--off-white));
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    @apply bg-[#242424];
+    background: hsl(var(--text-secondary));
   }
 }
 
@@ -282,13 +474,16 @@ All colors MUST be HSL.
     outline-offset: 2px;
   }
 
-  /* Input focus */
+  /* Input focus - Teal */
   input:focus-visible,
   textarea:focus-visible,
   select:focus-visible {
     outline: 2px solid hsl(var(--ring));
     outline-offset: 0;
-    box-shadow: 0 0 0 3px hsl(var(--ring) / 0.1);
+    box-shadow: 0 0 0 3px rgba(18, 140, 126, 0.1);
+    border-color: hsl(var(--primary));
+    transform: scale(1.01);
+    transition: all 0.2s ease;
   }
 }
 
@@ -334,18 +529,21 @@ All colors MUST be HSL.
     position: absolute;
   }
 
-  /* Glassmorphism utility */
-  .glass {
-    @apply bg-white/5 backdrop-blur-md border border-white/10;
+  /* WhatsApp-style Card */
+  .whatsapp-card {
+    @apply bg-white rounded-xl shadow-sm border border-border;
+    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   }
 
-  .glass-card {
-    @apply bg-white/5 backdrop-blur-md border border-white/10 rounded-2xl shadow-2xl;
+  .whatsapp-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+    border-color: hsl(var(--primary));
   }
 
-  /* Gradient text utility */
+  /* Gradient text utility - Teal */
   .gradient-text {
-    @apply bg-gradient-to-r from-blue-500 via-purple-500 to-blue-500 bg-clip-text text-transparent;
+    @apply bg-gradient-to-r from-teal-500 via-teal-600 to-teal-500 bg-clip-text text-transparent;
     background-size: 200% auto;
     animation: shimmer 3s linear infinite;
   }
@@ -371,14 +569,42 @@ All colors MUST be HSL.
     }
   }
 
-  /* Glow effect utility */
+  /* Glow effect utility - Teal */
   .glow-effect {
-    @apply shadow-[0_0_20px_hsl(var(--primary)/0.3)];
+    box-shadow: 0 0 20px rgba(18, 140, 126, 0.3);
     transition: box-shadow 0.3s ease;
   }
 
   .glow-effect:hover {
-    @apply shadow-[0_0_30px_hsl(var(--primary)/0.5)];
+    box-shadow: 0 0 30px rgba(18, 140, 126, 0.5);
+  }
+
+  /* WhatsApp Chat Message Bubbles */
+  .message-sent {
+    background: hsl(var(--message-sent));
+    border-radius: 8px 8px 0 8px;
+    padding: 8px 12px;
+    margin-left: auto;
+    max-width: 70%;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+    animation: slideInRight 0.3s ease-out;
+  }
+
+  .message-received {
+    background: hsl(var(--message-received));
+    border-radius: 8px 8px 8px 0;
+    padding: 8px 12px;
+    margin-right: auto;
+    max-width: 70%;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+    animation: slideInLeft 0.3s ease-out;
+  }
+
+  .message-timestamp {
+    font-size: 0.75rem;
+    color: hsl(var(--text-muted));
+    margin-top: 4px;
+    text-align: right;
   }
 
   /* Chat Interface Improvements */
@@ -407,12 +633,12 @@ All colors MUST be HSL.
   }
 
   .chat-messages::-webkit-scrollbar-thumb {
-    background: hsl(var(--muted-foreground) / 0.3);
+    background: hsl(var(--text-muted) / 0.3);
     border-radius: 3px;
   }
 
   .chat-messages::-webkit-scrollbar-thumb:hover {
-    background: hsl(var(--muted-foreground) / 0.5);
+    background: hsl(var(--text-muted) / 0.5);
   }
 
   /* Message bubble hover effect */
@@ -427,5 +653,217 @@ All colors MUST be HSL.
   /* Smooth scroll behavior */
   .chat-messages {
     scroll-behavior: smooth;
+  }
+
+  /* Animation Keyframes Library */
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  @keyframes fadeInUp {
+    from {
+      opacity: 0;
+      transform: translateY(20px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes fadeInDown {
+    from {
+      opacity: 0;
+      transform: translateY(-20px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes slideInLeft {
+    from {
+      opacity: 0;
+      transform: translateX(-30px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes slideInRight {
+    from {
+      opacity: 0;
+      transform: translateX(30px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes slideInUp {
+    from {
+      opacity: 0;
+      transform: translateY(30px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes scaleIn {
+    from {
+      opacity: 0;
+      transform: scale(0.9);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes pulse {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.8;
+      transform: scale(1.05);
+    }
+  }
+
+  @keyframes float {
+    0%, 100% {
+      transform: translateY(0);
+    }
+    50% {
+      transform: translateY(-10px);
+    }
+  }
+
+  @keyframes bounce {
+    0%, 20%, 50%, 80%, 100% {
+      transform: translateY(0);
+    }
+    40% {
+      transform: translateY(-10px);
+    }
+    60% {
+      transform: translateY(-5px);
+    }
+  }
+
+  @keyframes rotate {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @keyframes countUp {
+    from {
+      opacity: 0;
+      transform: scale(0.5);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  @keyframes checkmark {
+    0% {
+      transform: scale(0);
+    }
+    50% {
+      transform: scale(1.2);
+    }
+    100% {
+      transform: scale(1);
+    }
+  }
+
+  /* Animation Utility Classes */
+  .animate-fade-in {
+    animation: fadeIn 0.5s ease-out;
+  }
+
+  .animate-fade-in-up {
+    animation: fadeInUp 0.6s ease-out;
+  }
+
+  .animate-fade-in-down {
+    animation: fadeInDown 0.6s ease-out;
+  }
+
+  .animate-slide-in-left {
+    animation: slideInLeft 0.4s ease-out;
+  }
+
+  .animate-slide-in-right {
+    animation: slideInRight 0.4s ease-out;
+  }
+
+  .animate-slide-in-up {
+    animation: slideInUp 0.4s ease-out;
+  }
+
+  .animate-scale-in {
+    animation: scaleIn 0.3s ease-out;
+  }
+
+  .animate-pulse {
+    animation: pulse 2s infinite;
+  }
+
+  .animate-float {
+    animation: float 3s ease-in-out infinite;
+  }
+
+  .animate-bounce {
+    animation: bounce 1s ease-in-out;
+  }
+
+  .animate-rotate {
+    animation: rotate 1s linear infinite;
+  }
+
+  /* Staggered animations for lists */
+  .stagger-item:nth-child(1) { animation-delay: 0.1s; }
+  .stagger-item:nth-child(2) { animation-delay: 0.2s; }
+  .stagger-item:nth-child(3) { animation-delay: 0.3s; }
+  .stagger-item:nth-child(4) { animation-delay: 0.4s; }
+  .stagger-item:nth-child(5) { animation-delay: 0.5s; }
+  .stagger-item:nth-child(6) { animation-delay: 0.6s; }
+
+  /* Loading Skeleton */
+  .skeleton {
+    background: linear-gradient(
+      90deg,
+      #f0f0f0 25%,
+      #e0e0e0 50%,
+      #f0f0f0 75%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+
+  /* Active Badge with Pulse */
+  .active-badge {
+    background: hsl(var(--primary));
+    color: white;
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    animation: pulse 2s infinite;
   }
 }

@@ -5,7 +5,8 @@ const {
   Browsers,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-  downloadMediaMessage
+  downloadMediaMessage,
+  makeInMemoryStore
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
@@ -20,6 +21,10 @@ const {
   syncContactsForAgent,
   setupContactUpdateListeners,
 } = require('./contactSyncService');
+const {
+  syncGroupsForAgent,
+  setupGroupUpdateListeners,
+} = require('./groupSyncService');
 
 const STORAGE_BUCKET = 'agent-files';
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
@@ -952,6 +957,131 @@ async function backupCredentials(agentId) {
   }
 }
 
+<<<<<<< Updated upstream
+=======
+// FIX 3: Smart status check to determine if credentials should be deleted
+// Returns true if credentials should be deleted, false if they should be kept
+async function shouldDeleteCredentials(agentId) {
+  try {
+    // Get current database status
+    const { data: agent, error } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status, updated_at')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    if (error) {
+      console.warn(`[BAILEYS] ⚠️ Error checking status for credential deletion:`, error.message);
+      // On error, be conservative and keep credentials
+      return false;
+    }
+    
+    if (!agent) {
+      // No agent record - safe to delete (fresh start)
+      return true;
+    }
+    
+    // If status is 'disconnected' AND last update was > 5 minutes ago
+    // Then it's a real disconnect, delete credentials
+    if (agent.status === 'disconnected') {
+      const lastUpdate = new Date(agent.updated_at);
+      const now = new Date();
+      const minutesSinceUpdate = (now - lastUpdate) / 1000 / 60;
+      
+      if (minutesSinceUpdate > 5) {
+        loggers.connection.info({
+          agentId: shortId(agentId),
+          minutesSinceUpdate: minutesSinceUpdate.toFixed(1)
+        }, 'Old disconnect detected, clearing credentials');
+        return true;
+      }
+      
+      loggers.connection.info({
+        agentId: shortId(agentId),
+        minutesSinceUpdate: minutesSinceUpdate.toFixed(1)
+      }, 'Recent disconnect, keeping credentials for reconnect');
+      return false;
+    }
+    
+    // For 'connected', 'authenticated', or other statuses, keep credentials
+    loggers.connection.debug({
+      agentId: shortId(agentId),
+      status: agent.status
+    }, 'Keeping credentials - status is not disconnected');
+    return false;
+  } catch (error) {
+    console.error(`[BAILEYS] ❌ Error in shouldDeleteCredentials:`, error.message);
+    // On error, be conservative and keep credentials
+    return false;
+  }
+}
+
+/**
+ * Clear all authentication state (DB + local files) for 401/loggedOut scenarios
+ * This is a CRITICAL function that must be called on ANY 401 disconnect
+ */
+async function clearAuthState(agentId) {
+  console.log(`[BAILEYS] 🗑️ Clearing all auth state for agent ${agentId.substring(0, 8)}...`);
+  
+  try {
+    // 1. Delete local auth directory
+    const authDir = path.join(__dirname, '../../auth_sessions', agentId);
+    if (fs.existsSync(authDir)) {
+      try {
+        fs.rmSync(authDir, { recursive: true, force: true });
+        console.log(`[BAILEYS] ✅ Local auth directory deleted`);
+      } catch (deleteError) {
+        console.error(`[BAILEYS] ❌ Failed to delete local auth directory:`, deleteError.message);
+      }
+    }
+    
+    // 2. Clear database session data
+    await supabaseAdmin
+      .from('whatsapp_sessions')
+      .update({
+        session_data: null,
+        qr_code: null,
+        qr_generated_at: null,
+        is_active: false,
+        status: 'logged_out', // Use 'logged_out' instead of 'conflict' for 401
+        phone_number: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('agent_id', agentId);
+    
+    console.log(`[BAILEYS] ✅ Database auth state cleared`);
+    
+    // 3. Remove from active sessions
+    await removeAgentFromActiveSessions(agentId);
+    
+    // 4. Clear connection locks
+    connectionLocks.delete(agentId);
+    
+    // 5. Record 401 failure to prevent auto-retry
+    last401Failure.set(agentId, Date.now());
+    
+    console.log(`[BAILEYS] ✅ Auth state cleared completely - QR pairing required on next init`);
+    return true;
+  } catch (error) {
+    console.error(`[BAILEYS] ❌ Error clearing auth state:`, error.message);
+    throw error;
+  }
+}
+
+/**
+ * Disable auto-reconnect for an agent (prevents multiple reconnection attempts)
+ */
+function disableAutoReconnect(agentId) {
+  // Use the existing clearReconnectionState function (defined later in file)
+  clearReconnectionState(agentId);
+  
+  // Record 401 failure to prevent future auto-retries
+  last401Failure.set(agentId, Date.now());
+  
+  console.log(`[BAILEYS] 🚫 Auto-reconnect disabled for agent ${agentId.substring(0, 8)}...`);
+}
+
+>>>>>>> Stashed changes
 // Validate credential freshness before using existing credentials
 // Returns { valid: boolean, reason: string }
 async function validateCredentialFreshness(agentId, creds) {
@@ -1900,7 +2030,46 @@ async function initializeWhatsApp(agentId, userId = null) {
     const hasDeviceId = !!state.creds?.me?.id;
     const hasSignalKeys = !!(state.creds?.noiseKey && state.creds?.signedIdentityKey);
     const hasPairedDevice = hasDeviceId && hasSignalKeys;
+<<<<<<< Updated upstream
     const shouldGenerateQR = !hasPairedDevice;
+=======
+    
+    // FIX 4: Check database status for reconnecting after pairing
+    const { data: sessionStatus } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status, last_paired_at')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    const justPairedRecently = sessionStatus?.last_paired_at 
+      ? (Date.now() - new Date(sessionStatus.last_paired_at).getTime()) < 300000 // 5 minutes
+      : false;
+    
+    const isReconnectingAfterPairing = 
+      sessionStatus?.status === 'reconnecting_after_pairing' ||
+      sessionStatus?.status === 'pairing_complete';
+    
+    // ✅ FIX 4: Check for logged_out status - FORCE QR generation
+    const { data: dbStatus } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('status')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    const isLoggedOut = dbStatus?.status === 'logged_out';
+    
+    // ✅ FIX 4: Force QR if logged_out OR no credentials
+    // If status is 'logged_out', we MUST generate QR (credentials were cleared)
+    const willUseCredentials = !isLoggedOut && 
+                              ((hasPairedDevice && hasSignalKeys && hasDeviceId) || 
+                               (isReconnectingAfterPairing && justPairedRecently && hasSignalKeys));
+    
+    const shouldGenerateQR = isLoggedOut || !willUseCredentials;
+    
+    if (isLoggedOut) {
+      console.log('[BAILEYS] 🚨 Status is "logged_out" - FORCING QR generation (credentials invalidated)');
+    }
+>>>>>>> Stashed changes
     
     console.log('[BAILEYS] 🔍 Connection Strategy:', {
       hasDeviceId,
@@ -1926,26 +2095,44 @@ async function initializeWhatsApp(agentId, userId = null) {
     console.log(`[BAILEYS] 🔌 Creating WebSocket connection...`);
     
     // CRITICAL: Enhanced logger to intercept raw protocol messages and extract sender_pn for @lid messages
-    // Use trace level to catch ALL logs, and intercept at PARENT logger level (not just child)
-    const customLogger = pino({ level: 'trace' });
+    // Use 'error' level for output (only show errors), but intercept ALL levels (trace, debug, info) silently
+    // This prevents verbose protocol logs while still capturing sender_pn data
+    const customLogger = pino({ 
+      level: 'error', // Only output errors, not trace/debug/info
+      enabled: true // Still enabled to intercept
+    });
     
     // Intercept at PARENT logger level (trace, debug, info) to catch protocol messages BEFORE processing
+    // But don't actually log them - just intercept for data extraction
     const originalTrace = customLogger.trace.bind(customLogger);
     const originalDebug = customLogger.debug.bind(customLogger);
     const originalInfo = customLogger.info.bind(customLogger);
     
     customLogger.trace = function(obj, msg) {
       interceptSenderPn(obj);
-      return originalTrace(obj, msg);
+      // Don't actually log trace messages - just intercept
+      return; // Silent interception
     };
     
     customLogger.debug = function(obj, msg) {
       interceptSenderPn(obj);
-      return originalDebug(obj, msg);
+      // Don't actually log debug messages - just intercept
+      return; // Silent interception
     };
     
     customLogger.info = function(obj, msg) {
       interceptSenderPn(obj);
+      // Only log important info messages, filter out verbose protocol logs
+      // Check if it's a verbose protocol log (contains XML-like data or participant lists)
+      if (msg && (
+        msg.includes('<group') || 
+        msg.includes('<participant') || 
+        msg.includes('@lid') ||
+        (typeof obj === 'object' && obj.recv && obj.recv.attrs)
+      )) {
+        // Skip verbose protocol logs
+        return;
+      }
       return originalInfo(obj, msg);
     };
     
@@ -1988,18 +2175,36 @@ async function initializeWhatsApp(agentId, userId = null) {
     const originalChild = customLogger.child.bind(customLogger);
     customLogger.child = function(bindings) {
       const child = originalChild(bindings);
-      // Intercept all log methods to catch protocol messages
+      // Intercept all log methods to catch protocol messages, but don't output verbose logs
       ['info', 'debug', 'trace'].forEach(method => {
         const originalMethod = child[method];
         if (originalMethod && typeof originalMethod === 'function') {
           child[method] = function(obj, msg) {
             interceptSenderPn(obj);
+            // For trace and debug, don't actually log - just intercept silently
+            if (method === 'trace' || method === 'debug') {
+              return; // Silent interception
+            }
+            // For info, filter out verbose protocol logs
+            if (method === 'info') {
+              if (msg && (
+                msg.includes('<group') || 
+                msg.includes('<participant') || 
+                msg.includes('@lid') ||
+                (typeof obj === 'object' && obj.recv && obj.recv.attrs)
+              )) {
+                return; // Skip verbose protocol logs
+              }
+            }
             return originalMethod.call(this, obj, msg);
           };
         }
       });
       return child;
     };
+    
+    // ✅ FIX: Create in-memory store for message storage (required for media downloads)
+    const store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
     
     const sock = makeWASocket({
       // CRITICAL: Use proper auth structure with cacheable signal key store
@@ -2011,6 +2216,9 @@ async function initializeWhatsApp(agentId, userId = null) {
       printQRInTerminal: true, // CRITICAL: Enable for debugging!
       logger: customLogger, // Use custom logger to intercept sender_pn
       browser: Browsers.ubuntu('Chrome'),
+      
+      // ✅ FIX: Add store configuration for message storage (required for media downloads)
+      store: store,
       
       // CRITICAL: Proper keepalive configuration
       keepAliveIntervalMs: 30000, // Changed from 10s to 30s (less aggressive)
@@ -2033,6 +2241,9 @@ async function initializeWhatsApp(agentId, userId = null) {
       syncFullHistory: false,
       markOnlineOnConnect: true // Changed to true - helps maintain connection
     });
+    
+    // ✅ FIX: Bind store to socket events so messages are stored automatically
+    store.bind(sock.ev);
 
     console.log(`[BAILEYS] ✅ Socket created with EXTENDED timeouts for pairing (3min)`);
     console.log(`[BAILEYS] ℹ️  This allows more time for QR scan -> credential exchange`);
@@ -2143,6 +2354,7 @@ async function initializeWhatsApp(agentId, userId = null) {
     // Store session with health monitoring
     const sessionData = {
       socket: sock,
+      store: store, // ✅ FIX: Store the store instance in session for direct access
       state: state,
       saveCreds: saveCreds,
       phoneNumber: null,
@@ -2156,6 +2368,11 @@ async function initializeWhatsApp(agentId, userId = null) {
       failureReason: null,
       failureAt: null
     };
+    
+    // ✅ FIX: Verify store is attached to socket
+    // #region debug log
+    fetch('http://127.0.0.1:7242/ingest/57baeca8-31de-45dc-82e3-6e00affba741',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location:'baileysService.js:3942',message:'Session created with store',data:{agentId:agentId.substring(0,8),hasSocket:!!sock,hasStore:!!store,hasSocketStore:!!sock.store,storeType:typeof store,socketStoreType:typeof sock.store},timestamp:Date.now(),sessionId:'debug-session',runId:'run1',hypothesisId:'G'})}).catch(()=>{});
+    // #endregion
     
     activeSessions.set(agentId, sessionData);
 
@@ -2418,6 +2635,32 @@ async function initializeWhatsApp(agentId, userId = null) {
             console.error(`[BAILEYS] ⚠️ Contact sync setup error (non-critical):`, syncError.message);
             // Don't fail connection if sync setup fails
           }
+
+          // ━━━ GROUP SYNCHRONIZATION ━━━
+          // Sync WhatsApp groups when connection is established
+          try {
+            console.log(`[BAILEYS] 👥 Starting group synchronization...`);
+            
+            // Setup real-time group update listeners
+            setupGroupUpdateListeners(agentId, sock);
+            
+            // Trigger initial group sync (non-blocking)
+            syncGroupsForAgent(agentId, sock)
+              .then((result) => {
+                if (result.total > 0) {
+                  console.log(`[BAILEYS] ✅ Initial group sync: ${result.success}/${result.total} groups synced`);
+                } else {
+                  console.log(`[BAILEYS] ℹ️ Groups will be synced via real-time events as they load`);
+                }
+              })
+              .catch((syncError) => {
+                console.error(`[BAILEYS] ⚠️ Group sync error (non-critical):`, syncError.message);
+                // Don't fail connection if sync fails
+              });
+          } catch (syncError) {
+            console.error(`[BAILEYS] ⚠️ Group sync setup error (non-critical):`, syncError.message);
+            // Don't fail connection if sync setup fails
+          }
           
           // ━━━ START MONITORING ━━━
           // Disconnection detection via:
@@ -2443,6 +2686,20 @@ async function initializeWhatsApp(agentId, userId = null) {
         const wsCloseEvent = sock?.ws && typeof sock.ws === 'object' && 'closeEvent' in sock.ws ? sock.ws.closeEvent : null;
         const session = activeSessions.get(agentId);
 
+<<<<<<< Updated upstream
+=======
+        console.log(`[BAILEYS] 🔌 Connection closed for ${agentId.substring(0, 8)}`);
+        console.log(`[BAILEYS] Status code: ${statusCode}, Reason: ${reason}`);
+        
+        // ✅ FIX 5: Prevent auto-reconnect on 401/loggedOut (handled above)
+        // Check if this is a 401/loggedOut - if so, it's already handled above, skip auto-reconnect
+        if (statusCode === 401 || statusCode === DisconnectReason.loggedOut) {
+          console.log(`[BAILEYS] ⏹️  401/loggedOut already handled - skipping auto-reconnect`);
+          return; // Already handled in the 401 block above
+        }
+        
+        // Update session state
+>>>>>>> Stashed changes
         if (session) {
           session.isConnected = false;
           session.connectionState = 'closed';
@@ -2465,6 +2722,51 @@ async function initializeWhatsApp(agentId, userId = null) {
           session.socketReadyState = session.socket?.ws?.readyState ?? null;
         }
         
+<<<<<<< Updated upstream
+=======
+        // Clear health check interval
+        if (healthCheckIntervals.has(agentId)) {
+          clearInterval(healthCheckIntervals.get(agentId));
+          healthCheckIntervals.delete(agentId);
+        }
+        
+        // Update database status
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({ 
+            status: 'disconnected',
+            is_active: false,
+            disconnected_at: new Date().toISOString(),
+            last_error: `Connection closed: ${statusCode} - ${reason}`,
+            updated_at: new Date().toISOString()
+          })
+          .eq('agent_id', agentId);
+        
+        // ============================================
+        // Automatic Reconnection Logic (only for non-401 errors)
+        // ============================================
+        
+        // Determine if we should attempt reconnection (skip if 401 cooldown active)
+        const has401Cooldown = last401Failure.has(agentId) && 
+                              (Date.now() - last401Failure.get(agentId)) < FAILURE_COOLDOWN_MS;
+        
+        if (statusCode !== DisconnectReason.loggedOut && !has401Cooldown) {
+          console.log(`[BAILEYS] 🔄 Triggering automatic reconnection for ${agentId.substring(0, 8)}`);
+          
+          // Trigger reconnection with exponential backoff
+          attemptReconnection(agentId, statusCode, reason);
+        } else {
+          console.log(`[BAILEYS] ⏹️  Not reconnecting agent ${agentId.substring(0, 8)} - logged out, 401 cooldown, or permanent failure`);
+          
+          // Clear any pending reconnection attempts
+          clearReconnectionState(agentId);
+          
+          // Remove from active sessions
+          await removeAgentFromActiveSessions(agentId);
+        }
+        
+        // Emit disconnected event
+>>>>>>> Stashed changes
         emitAgentEvent(agentId, 'disconnected', {
           reason,
           statusCode
@@ -2746,9 +3048,11 @@ async function initializeWhatsApp(agentId, userId = null) {
           return; // Don't continue processing
         }
         
-        if (statusCode === 401) {
-          console.log(`[BAILEYS] ❌ 401 - Clearing session due to conflict or device removal`);
+        // ✅ FIX 1: Strict 401 Policy - Clear auth state, disable reconnect, force QR
+        if (statusCode === 401 || statusCode === DisconnectReason.loggedOut) {
+          console.log(`[BAILEYS] ❌ 401/LoggedOut - Enforcing strict auth reset policy`);
           
+          // Cleanup socket first
           if (session?.socket) {
             try {
               session.socket.ev.removeAllListeners();
@@ -2758,14 +3062,28 @@ async function initializeWhatsApp(agentId, userId = null) {
             }
           }
 
-          // CRITICAL: Mark session as conflict FIRST to stop health check
-          // The health check will see conflict state and stop itself
-          const failureReason = payload?.error || reason || 'conflict';
+          // Stop all monitoring/intervals
+          if (session?.healthCheckInterval) {
+            clearInterval(session.healthCheckInterval);
+            session.healthCheckInterval = null;
+          }
+          if (session?.heartbeatInterval) {
+            clearInterval(session.heartbeatInterval);
+            session.heartbeatInterval = null;
+          }
+          
+          // Get failure reason from lastDisconnect (fix payload undefined error)
+          const failureReason = lastDisconnect?.error?.message || 
+                                lastDisconnect?.error?.output?.payload?.message || 
+                                reason || 
+                                '401 Unauthorized - Device logged out or removed';
+          
+          // Update session state
           if (session) {
             session.failureReason = failureReason;
             session.failureAt = Date.now();
             session.isConnected = false;
-            session.connectionState = 'conflict'; // This triggers health check to stop
+            session.connectionState = 'logged_out';
             session.qrCode = null;
             session.qrGeneratedAt = null;
             session.socket = null;
@@ -2773,6 +3091,7 @@ async function initializeWhatsApp(agentId, userId = null) {
             session.saveCreds = null;
           }
 
+<<<<<<< Updated upstream
           // Stop health check and heartbeat intervals
           if (session?.healthCheckInterval) {
             clearInterval(session.healthCheckInterval);
@@ -2790,35 +3109,24 @@ async function initializeWhatsApp(agentId, userId = null) {
           activeSessions.delete(agentId);
           console.log(`[BAILEYS] ✅ Session removed from active sessions`);
 
+=======
+          // ✅ CRITICAL: Clear ALL auth state (DB + local files)
+          await clearAuthState(agentId);
+          
+          // ✅ CRITICAL: Disable auto-reconnect
+          disableAutoReconnect(agentId);
+          
+          // Cleanup connection tracking
+>>>>>>> Stashed changes
           connectionLocks.delete(agentId);
           lastConnectionAttempt.set(agentId, Date.now());
           
-          const authDir = path.join(__dirname, '../../auth_sessions', agentId);
-          if (fs.existsSync(authDir)) {
-            fs.rmSync(authDir, { recursive: true, force: true });
-          }
-          
-          await supabaseAdmin
-            .from('whatsapp_sessions')
-            .update({
-              session_data: null,
-              qr_code: null,
-              qr_generated_at: null,
-              is_active: false,
-              status: 'conflict',
-              phone_number: null,
-              updated_at: new Date().toISOString()
-            })
-            .eq('agent_id', agentId);
-          
-          console.log(`[BAILEYS] ✅ Session cleared after 401. Failure reason: ${failureReason}`);
+          console.log(`[BAILEYS] ✅ 401 policy enforced - Auth cleared, reconnect disabled`);
+          console.log(`[BAILEYS] 🚫 Auto-retry disabled - Manual reconnection required`);
+          console.log(`[BAILEYS] 📱 Next init will FORCE QR generation (no credentials)`);
+          console.log(`[BAILEYS] ⚠️  User must click "Connect" to get new QR code`);
 
-          // CRITICAL: Record 401 failure timestamp to prevent automatic retries
-          last401Failure.set(agentId, Date.now());
-          console.log(`[BAILEYS] 🚫 Auto-retry disabled for ${Math.ceil(FAILURE_COOLDOWN_MS / 60000)} minutes after 401 error`);
-          console.log(`[BAILEYS] ⚠️  Manual reconnection required - user must click "Connect" to get new QR code`);
-
-          return;
+          return; // Don't continue - no retries with invalid credentials
         }
 
         // CRITICAL: Handle error 404 - Session Not Found (FATAL)
@@ -2999,7 +3307,14 @@ async function initializeWhatsApp(agentId, userId = null) {
         return;
       }
 
+<<<<<<< Updated upstream
       const shouldProcessMessage = (message) => {
+=======
+      // Messages will be queued individually via queueMessageForBatch()
+      // No need to collect in array - queue handles batching automatically
+
+      const shouldProcessMessage = async (message) => {
+>>>>>>> Stashed changes
         const remoteJid = message?.key?.remoteJid || '';
 
         if (!remoteJid) {
@@ -3007,9 +3322,61 @@ async function initializeWhatsApp(agentId, userId = null) {
           return false;
         }
 
+        // Check if message is from a group
         if (remoteJid.endsWith('@g.us')) {
-          console.log('[BAILEYS] 🚫 Skipping group message from:', remoteJid);
-          return false;
+          // Check if this group is marked as important for this agent
+          try {
+            const { data: groupData, error: groupError } = await supabaseAdmin
+              .from('groups')
+              .select('is_important, name')
+              .eq('agent_id', agentId)
+              .eq('whatsapp_group_id', remoteJid)
+              .single();
+
+            if (groupError || !groupData) {
+              console.log('[BAILEYS] 🚫 Skipping group message - group not found in database:', remoteJid);
+              return false;
+            }
+
+            if (!groupData.is_important) {
+              console.log('[BAILEYS] 🚫 Skipping group message - not marked as important:', groupData.name);
+              return false;
+            }
+
+            console.log('[BAILEYS] ✅ Processing group message from important group:', groupData.name);
+            // Continue processing group message...
+          } catch (error) {
+            console.error('[BAILEYS] ❌ Error checking group importance:', error.message);
+            // On error, skip the message to be safe
+            return false;
+          }
+        } else if (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid')) {
+          // Check if this contact is marked as important for this agent
+          // Only check for individual contacts (not groups, broadcasts, status, etc.)
+          try {
+            const contactNumber = sanitizeNumberFromJid(remoteJid);
+            if (contactNumber) {
+              const { data: contactData, error: contactError } = await supabaseAdmin
+                .from('contacts')
+                .select('is_important, name')
+                .eq('agent_id', agentId)
+                .eq('phone_number', contactNumber)
+                .single();
+
+              // If contact exists in database, check importance
+              if (!contactError && contactData) {
+                if (!contactData.is_important) {
+                  console.log('[BAILEYS] 🚫 Skipping message from contact - not marked as important:', contactData.name || contactNumber);
+                  return false;
+                }
+                console.log('[BAILEYS] ✅ Processing message from important contact:', contactData.name || contactNumber);
+              }
+              // If contact doesn't exist in database, allow processing (new contact)
+            }
+          } catch (error) {
+            console.error('[BAILEYS] ❌ Error checking contact importance:', error.message);
+            // On error, allow processing to be safe (don't block new contacts)
+          }
         }
 
         if (remoteJid.endsWith('@broadcast')) {
@@ -3066,7 +3433,8 @@ async function initializeWhatsApp(agentId, userId = null) {
       };
 
       for (const msg of messages) {
-        if (!shouldProcessMessage(msg)) {
+        const shouldProcess = await shouldProcessMessage(msg);
+        if (!shouldProcess) {
           continue;
         }
 
@@ -3585,7 +3953,80 @@ async function initializeWhatsApp(agentId, userId = null) {
           messageId,
         };
 
-        const wrappedAudioMessage = unwrapMessageContent(msg.message)?.audioMessage;
+        // Extract media message types (document, image, video)
+        const unwrappedMessage = unwrapMessageContent(msg.message);
+        const documentMessage = unwrappedMessage?.documentMessage;
+        const imageMessage = unwrappedMessage?.imageMessage;
+        const videoMessage = unwrappedMessage?.videoMessage;
+        const wrappedAudioMessage = unwrappedMessage?.audioMessage;
+
+        // Handle document messages
+        if (documentMessage) {
+          messageType = 'DOCUMENT';
+          mediaMimetype = documentMessage.mimetype || 'application/octet-stream';
+          mediaSize = documentMessage.fileLength ? Number(documentMessage.fileLength) : null;
+          
+          if (documentMessage.fileName) {
+            messageMetadata.fileName = documentMessage.fileName;
+          }
+          
+          if (documentMessage.caption) {
+            content = documentMessage.caption;
+          } else if (content && content.startsWith('[Document]')) {
+            // Keep the placeholder if no caption
+            content = content;
+          }
+          
+          console.log('[BAILEYS] 📄 Document message detected:', { 
+            messageId, 
+            mimetype: mediaMimetype, 
+            fileName: documentMessage.fileName,
+            size: mediaSize 
+          });
+        }
+        // Handle image messages
+        else if (imageMessage) {
+          messageType = 'IMAGE';
+          mediaMimetype = imageMessage.mimetype || 'image/jpeg';
+          mediaSize = imageMessage.fileLength ? Number(imageMessage.fileLength) : null;
+          
+          if (imageMessage.caption) {
+            content = imageMessage.caption;
+          } else if (content && content.startsWith('[Image]')) {
+            // Keep the placeholder if no caption
+            content = content;
+          }
+          
+          console.log('[BAILEYS] 🖼️ Image message detected:', { 
+            messageId, 
+            mimetype: mediaMimetype, 
+            size: mediaSize 
+          });
+        }
+        // Handle video messages
+        else if (videoMessage) {
+          messageType = 'VIDEO';
+          mediaMimetype = videoMessage.mimetype || 'video/mp4';
+          mediaSize = videoMessage.fileLength ? Number(videoMessage.fileLength) : null;
+          
+          if (videoMessage.seconds) {
+            messageMetadata.durationSeconds = videoMessage.seconds;
+          }
+          
+          if (videoMessage.caption) {
+            content = videoMessage.caption;
+          } else if (content && content.startsWith('[Video]')) {
+            // Keep the placeholder if no caption
+            content = content;
+          }
+          
+          console.log('[BAILEYS] 🎥 Video message detected:', { 
+            messageId, 
+            mimetype: mediaMimetype, 
+            size: mediaSize,
+            duration: videoMessage.seconds 
+          });
+        }
 
         if (wrappedAudioMessage) {
           messageType = 'AUDIO';
@@ -3840,16 +4281,37 @@ async function initializeWhatsApp(agentId, userId = null) {
           // Give logger a moment to intercept the protocol message and populate cache
           await new Promise(resolve => setTimeout(resolve, 50)); // 50ms delay
           
+          // ✅ FIX: Declare cachedPhoneNumber OUTSIDE the if block
+          let cachedPhoneNumber = null;
+          
           // Check cache now (logger should have populated it by now)
+<<<<<<< Updated upstream
           if (lidToPhoneCache.has(remoteJid)) {
             const cachedSenderJid = lidToPhoneCache.get(remoteJid);
             const cachedPhoneNumber = sanitizeNumberFromJid(cachedSenderJid);
+=======
+          const cachedSenderJid = lidToPhoneCache.get(remoteJid);
+          if (cachedSenderJid !== undefined) {
+            cacheStats.lidToPhone.hits++;
+            cachedPhoneNumber = sanitizeNumberFromJid(cachedSenderJid);
+>>>>>>> Stashed changes
             if (cachedPhoneNumber) {
               webhookFromNumber = cachedPhoneNumber;
               console.log(`[BAILEYS] ✅ Using cached sender_pn for webhook: ${remoteJid} -> ${webhookFromNumber}`);
             }
           } else {
+<<<<<<< Updated upstream
             console.log(`[BAILEYS] ⚠️ Cache not populated yet for ${remoteJid}, using fallback: ${webhookFromNumber}`);
+=======
+            cacheStats.lidToPhone.misses++;
+          }
+          
+          // ✅ Now cachedPhoneNumber is accessible here
+          if (webhookFromNumber && cachedPhoneNumber) {
+            loggers.database.debug({ remoteJid, phone: webhookFromNumber }, 'Using cached sender_pn for webhook');
+          } else {
+            loggers.database.debug({ remoteJid }, 'Cache not populated yet, using fallback');
+>>>>>>> Stashed changes
           }
         }
 
@@ -3887,13 +4349,175 @@ async function initializeWhatsApp(agentId, userId = null) {
         // 1. TEXT message with content (even if it's a placeholder like [Image], [Video], etc.)
         // 2. BUTTON_RESPONSE message (user clicked a button)
         // 3. AUDIO message with mediaUrl
+        // 4. DOCUMENT/IMAGE/VIDEO messages (need media processing)
         // Note: We forward TEXT messages even with placeholder content so webhook can handle all message types
         const shouldForward =
           (messageType === 'TEXT' && content && content.trim().length > 0) ||
           (messageType === 'BUTTON_RESPONSE' && buttonResponse) ||
-          (messageType === 'AUDIO' && Boolean(mediaUrl));
+          (messageType === 'AUDIO' && Boolean(mediaUrl)) ||
+          (messageType === 'DOCUMENT' && mediaMimetype) ||
+          (messageType === 'IMAGE' && mediaMimetype) ||
+          (messageType === 'VIDEO' && mediaMimetype);
+        
+        // ✅ ARCHITECTURAL FIX: Explicitly persist message to store BEFORE queuing media job
+        // Queue document/image/video messages for media processing (download & upload to Supabase)
+        if ((messageType === 'DOCUMENT' || messageType === 'IMAGE' || messageType === 'VIDEO') && mediaMimetype) {
+          // ✅ FIX: Check if media already processed (prevent duplicate queueing)
+          try {
+            const { getMessageByMessageId } = require('./dbService');
+            const existingMessage = await getMessageByMessageId(messageId);
+            if (existingMessage && existingMessage.media_url) {
+              console.log(`[BAILEYS] ⏭️ Media already processed for message ${messageId}, skipping queue`);
+              continue; // Skip to next message
+            }
+          } catch (checkError) {
+            // If check fails, proceed with processing (non-critical)
+            console.debug(`[BAILEYS] Could not check existing message, proceeding: ${checkError.message}`);
+          }
+          
+          try {
+            // CRITICAL: Verify store exists
+            const session = activeSessions.get(agentId);
+            if (!session || !session.store) {
+              console.error(`[BAILEYS] ❌ MEDIA_SKIPPED_NOT_PERSISTED: Baileys store not initialized for message ${messageId}`);
+              throw new Error('MEDIA_PIPELINE_BROKEN: Baileys store not initialized - media cannot be downloaded');
+            }
+            
+            const store = session.store;
+            
+            // ✅ FIX ORDERING: Determine correct remoteJid for store key
+            // For @lid messages: use resolved JID (actualSenderJid for incoming, actualRecipientJid for outgoing)
+            // For regular messages: use remoteJid as-is
+            let storeRemoteJid = remoteJid;
+            if (remoteJid.endsWith('@lid')) {
+              // OUTGOING @lid: use actualRecipientJid (resolved @s.whatsapp.net)
+              // INCOMING @lid: use actualSenderJid (resolved @s.whatsapp.net)
+              storeRemoteJid = fromMe ? actualRecipientJid : actualSenderJid;
+              
+              // Fallback to remoteJid if resolution failed
+              if (!storeRemoteJid || storeRemoteJid === remoteJid) {
+                storeRemoteJid = remoteJid;
+                console.warn(`[BAILEYS] ⚠️ Could not resolve @lid ${remoteJid}, using original for store key`);
+              }
+            }
+            
+            // ✅ FIX ORDERING: Explicitly persist message to store BEFORE queuing
+            let persisted = false;
+            try {
+              // Ensure store.messages structure exists
+              if (!store.messages) {
+                store.messages = {};
+              }
+              
+              // Ensure conversation exists
+              if (!store.messages[storeRemoteJid]) {
+                store.messages[storeRemoteJid] = {};
+              }
+              
+              // Explicitly persist the message
+              store.messages[storeRemoteJid][messageId] = msg;
+              persisted = true;
+              
+              console.log(`[BAILEYS] ✅ Message persisted to store: ${messageId} in ${storeRemoteJid}`);
+              
+            } catch (persistError) {
+              console.error(`[BAILEYS] ❌ Failed to persist message to store:`, {
+                messageId,
+                storeRemoteJid,
+                error: persistError.message
+              });
+              throw new Error(`MEDIA_PIPELINE_BROKEN: Failed to persist message ${messageId} to store: ${persistError.message}`);
+            }
+            
+            // ✅ FIX ORDERING: Verify persistence succeeded
+            if (!persisted) {
+              console.error(`[BAILEYS] ❌ MEDIA_SKIPPED_NOT_PERSISTED: Message ${messageId} persistence failed`);
+              throw new Error(`MEDIA_PIPELINE_BROKEN: Message ${messageId} not persisted to store - media job skipped`);
+            }
+            
+            // Double-check: verify message is actually in store
+            const verifyMessage = store.messages[storeRemoteJid]?.[messageId];
+            if (!verifyMessage) {
+              console.error(`[BAILEYS] ❌ MEDIA_SKIPPED_NOT_PERSISTED: Message ${messageId} verification failed after persistence`);
+              throw new Error(`MEDIA_PIPELINE_BROKEN: Message ${messageId} not found in store after persistence - media job skipped`);
+            }
+            
+            console.log(`[BAILEYS] ✅ Message persistence verified: ${messageId} in store under ${storeRemoteJid}`);
+            
+            // Import media worker queue (lazy import to avoid circular dependencies)
+            const { queueMessage: queueMediaMessage } = require('../workers/mediaWorker');
+            
+            // ✅ FIX: Include storeRemoteJid in metadata so downloadService can find the message
+            await queueMediaMessage({
+              messageId: messageId,
+              agentId: agentId,
+              metadata: {
+                messageType: messageType,
+                mimetype: mediaMimetype,
+                mediaUrl: null, // Will be set after download/upload
+                conversationId: actualSenderJid,
+                senderName: senderName,
+                // ✅ CRITICAL: Store the remoteJid used in store (for @lid message lookup)
+                storeRemoteJid: storeRemoteJid, // Use resolved JID for @lid messages
+                originalRemoteJid: remoteJid, // Keep original for reference
+                // ✅ Include webhook payload for deferred webhook sending
+                webhookPayload: {
+                  id: messageId,
+                  messageId,
+                  from: webhookFromNumber || sanitizedFromNumber || actualSenderJid,
+                  to: sanitizedToNumber,
+                  senderName: senderName,
+                  conversationId: actualSenderJid,
+                  messageType,
+                  type: messageType.toLowerCase(),
+                  content: content || null,
+                  mediaUrl: null, // Will be set after upload
+                  mimetype: mediaMimetype || null,
+                  timestamp: timestampIso,
+                  fromMe: fromMe,
+                  buttonResponse: buttonResponse || null,
+                  metadata: {
+                    ...cleanedMetadata,
+                    senderName: senderName,
+                  },
+                  source: isDashboardMessage ? 'dashboard' : 'whatsapp',
+                }
+              }
+            });
+            
+            console.log(`[BAILEYS] 📤 Queued ${messageType} message for media processing:`, { 
+              messageId, 
+              mimetype: mediaMimetype, 
+              persisted: true,
+              storeRemoteJid: storeRemoteJid,
+              originalRemoteJid: remoteJid
+            });
+          } catch (queueError) {
+            // ✅ FIX: Log explicit error when persistence fails
+            const isPersistenceError = queueError.message.includes('not persisted') || 
+                                      queueError.message.includes('persistence failed') ||
+                                      queueError.message.includes('MEDIA_SKIPPED_NOT_PERSISTED');
+            
+            if (isPersistenceError) {
+              console.error(`[BAILEYS] ❌ MEDIA_SKIPPED_NOT_PERSISTED: Message ${messageId} - ${queueError.message}`);
+            } else {
+              console.error(`[BAILEYS] ❌ MEDIA_PIPELINE_BROKEN: Failed to queue message for media processing:`, {
+                messageId,
+                error: queueError.message,
+                isStoreError: queueError.message.includes('store') || queueError.message.includes('MEDIA_PIPELINE_BROKEN')
+              });
+            }
+            // Don't break message processing, but mark as failed
+          }
+        }
 
-        if (shouldForward) {
+        // ✅ ARCHITECTURAL FIX: Defer webhook for media messages until after upload
+        // For IMAGE/DOCUMENT/VIDEO: webhook will be sent by media worker after upload
+        // For TEXT/AUDIO/BUTTON_RESPONSE: send webhook immediately
+        const isMediaMessage = (messageType === 'DOCUMENT' || messageType === 'IMAGE' || messageType === 'VIDEO') && mediaMimetype;
+        const shouldSendWebhookNow = shouldForward && !isMediaMessage; // Defer media messages
+        
+        if (shouldSendWebhookNow) {
           // CRITICAL: Check if this is a duplicate (echo of dashboard message)
           // Only check for incoming messages (not fromMe) to avoid blocking legitimate outgoing messages
           let isDuplicate = false;
@@ -3937,6 +4561,12 @@ async function initializeWhatsApp(agentId, userId = null) {
             });
             await forwardMessageToWebhook(agentId, webhookPayload);
           }
+        } else if (isMediaMessage) {
+          console.log(`[BAILEYS][WEBHOOK] ⏸️ Deferring webhook for ${messageType} message - will be sent after media upload:`, {
+            messageId,
+            from: sanitizedFromNumber,
+            mimetype: mediaMimetype,
+          });
         } else {
           console.log(`[BAILEYS] ⚠️ Skipping webhook forwarding:`, {
             messageId,
@@ -5132,6 +5762,23 @@ async function reconnectAllAgents() {
   }
 }
 
+/**
+ * Get session for an agent (for media processing)
+ * @param {string} agentId - Agent ID
+ * @returns {Object|null} Session object with socket or null
+ */
+function getSessionForAgent(agentId) {
+  return activeSessions.get(agentId) || null;
+}
+
+/**
+ * Get all active agent IDs
+ * @returns {Array<string>} List of agent IDs
+ */
+function getActiveAgentIds() {
+  return Array.from(activeSessions.keys());
+}
+
 module.exports = {
   initializeWhatsApp,
   safeInitializeWhatsApp,
@@ -5154,5 +5801,36 @@ module.exports = {
   cleanupMonitoring,
   startAllMonitoring,
   connectionMonitors,
+<<<<<<< Updated upstream
   healthCheckIntervals
+=======
+  healthCheckIntervals,
+  clearAllCaches,
+  warmSessionCache,
+  getInstanceHealth,
+  getCacheStats,
+  getUserIdByAgentId,
+  batchUpdateSessionStatus,
+  // Socket management for media processing
+  getSessionForAgent,
+  getActiveAgentIds,
+  // Webhook forwarding (for media worker)
+  forwardMessageToWebhook,
+  // Prometheus metrics registry (for /metrics endpoint)
+  metricsRegistry,
+  // Prometheus custom metrics (for advanced monitoring)
+  connectionMetrics,
+  messageMetrics,
+  cacheMetrics,
+  databaseMetrics,
+  errorMetrics,
+  // Performance tracking
+  OperationTracker,
+  // Performance reporting
+  performanceReporter,
+  // Error tracking
+  errorTracker,
+  // Alerting
+  alertingService
+>>>>>>> Stashed changes
 };
