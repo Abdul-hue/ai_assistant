@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node app.js",
     "dev": "nodemon app.js",
+    "kill-server": "node scripts/kill-server.js",
     "migrate": "node scripts/migrate.js",
     "migrate:prod": "NODE_ENV=production node scripts/migrate.js",
     "cleanup-db": "node scripts/cleanup-db.js",

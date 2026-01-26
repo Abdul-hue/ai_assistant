@@ -962,15 +962,9 @@ const UnifiedEmailInbox = () => {
                 <div className="h-10 w-10 rounded-full bg-gradient-to-br from-primary to-whatsapp-teal flex items-center justify-center text-white font-bold text-sm shadow-md">
                   {accountInfo.email.charAt(0).toUpperCase()}
                 </div>
-<<<<<<< Updated upstream
-                <p className="text-sm font-medium text-gray-900 dark:text-gray-100 truncate flex-1">
+                <p className="text-sm font-semibold text-foreground dark:text-foreground truncate flex-1">
                   {accountInfo.email}
                 </p>
-=======
-                <p className="text-sm font-semibold text-foreground dark:text-foreground truncate flex-1">
-                {accountInfo.email}
-              </p>
->>>>>>> Stashed changes
               </div>
             </div>
           )}
@@ -1070,11 +1064,10 @@ const UnifiedEmailInbox = () => {
               )}
             </div>
             <div className="flex items-center gap-2">
-<<<<<<< Updated upstream
               <Button
                 variant="outline"
                 size="icon"
-                className="h-10 w-10 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-110"
+                className="h-10 w-10 rounded-xl border-2 hover:border-primary hover:bg-whatsapp-mint transition-all duration-200 hover:scale-110"
                 onClick={() => {
                   setLastRefresh(new Date());
                   loadImapEmails();
@@ -1087,7 +1080,7 @@ const UnifiedEmailInbox = () => {
               <Button
                 variant="outline"
                 size="sm"
-                className="h-10 px-4 rounded-xl border-2 hover:border-blue-500 dark:hover:border-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 transition-all duration-200 hover:scale-105 font-medium"
+                className="h-10 px-4 rounded-xl border-2 hover:border-primary hover:bg-whatsapp-mint transition-all duration-200 hover:scale-105 font-medium"
                 onClick={() => {
                   console.log('🔄 Manual sync from IMAP triggered');
                   triggerInitialSync();
@@ -1098,35 +1091,6 @@ const UnifiedEmailInbox = () => {
                 <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
                 Sync from IMAP
               </Button>
-=======
-            <Button
-              variant="outline"
-              size="icon"
-                className="h-10 w-10 rounded-xl border-2 hover:border-primary hover:bg-whatsapp-mint transition-all duration-200 hover:scale-110"
-              onClick={() => {
-                setLastRefresh(new Date());
-                loadImapEmails();
-              }}
-              disabled={loading}
-              title="Refresh emails (auto-refreshes every 15 minutes)"
-            >
-                <RefreshCw className={`h-5 w-5 ${loading ? "animate-spin" : ""}`} />
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-                className="h-10 px-4 rounded-xl border-2 hover:border-primary hover:bg-whatsapp-mint transition-all duration-200 hover:scale-105 font-medium"
-              onClick={() => {
-                console.log('🔄 Manual sync from IMAP triggered');
-                triggerInitialSync();
-              }}
-              disabled={loading}
-              title="Sync emails from IMAP server"
-            >
-              <RefreshCw className={`h-4 w-4 mr-2 ${loading ? "animate-spin" : ""}`} />
-              Sync from IMAP
-            </Button>
->>>>>>> Stashed changes
             </div>
           </div>
 
@@ -1223,21 +1187,12 @@ const UnifiedEmailInbox = () => {
                             <p className={`font-semibold truncate ${
                               !email.isRead ? 'text-foreground text-lg' : 'text-foreground'
                             }`}>
-<<<<<<< Updated upstream
                               {email.from || email.fromEmail || "Unknown"}
                             </p>
                             {!email.isRead && (
-                              <div className="h-2 w-2 rounded-full bg-blue-500 animate-pulse flex-shrink-0"></div>
+                              <div className="h-2 w-2 rounded-full bg-primary animate-pulse flex-shrink-0"></div>
                             )}
                           </div>
-=======
-                          {email.from || email.fromEmail || "Unknown"}
-                        </p>
-                        {!email.isRead && (
-                              <div className="h-2 w-2 rounded-full bg-primary animate-pulse flex-shrink-0"></div>
-                        )}
-                      </div>
->>>>>>> Stashed changes
                           <p className={`text-base font-medium truncate mb-2 ${
                             !email.isRead ? 'text-foreground' : 'text-foreground'
                           }`}>
@@ -1304,13 +1259,8 @@ const UnifiedEmailInbox = () => {
                       <div className="h-12 w-12 rounded-full bg-gradient-to-br from-primary to-whatsapp-teal flex items-center justify-center text-white font-bold text-lg shadow-lg">
                         {(selectedEmail.from || selectedEmail.fromEmail || "U").charAt(0).toUpperCase()}
                       </div>
-<<<<<<< Updated upstream
                       <div>
-                        <p className="font-semibold text-lg text-gray-900 dark:text-gray-100">
-=======
-                  <div>
                         <p className="font-semibold text-lg text-foreground">
->>>>>>> Stashed changes
                           {selectedEmail.from || selectedEmail.fromEmail}
                         </p>
                         <p className="text-sm text-muted-foreground">
@@ -1363,21 +1313,7 @@ const UnifiedEmailInbox = () => {
               </div>
               <div className="border-t border-border pt-6">
                 {selectedEmail.bodyHtml ? (
-<<<<<<< Updated upstream
-                  <div className="bg-gray-950 dark:bg-gray-950 rounded-lg p-6 -mx-6">
-                    <div
-                      dangerouslySetInnerHTML={{ __html: selectedEmail.bodyHtml }}
-                      className="email-content prose prose-sm dark:prose-invert max-w-none"
-                      style={{
-                        color: '#e5e7eb !important',
-                        fontSize: '15px',
-                        lineHeight: '1.6'
-                      }}
-                    />
-                  </div>
-=======
                   <EmailHtmlContent html={selectedEmail.bodyHtml} />
->>>>>>> Stashed changes
                 ) : (
                   <div className="bg-card rounded-lg p-6 md:p-8 border border-border">
                     <div className="email-plain-text">

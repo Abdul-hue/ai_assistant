@@ -110,10 +110,10 @@ const imapSmtpRoutes = require('./src/routes/imapSmtp');
 const folderManagementRoutes = require('./src/routes/folderManagement');
 const fetchNewMailRoutes = require('./src/routes/fetchNewMail');
 const { fetchNewUnreadEmailsForAllAccounts } = require('./src/routes/fetchNewMail');
-const healthRoutes = require('./src/routes/health');
-const metricsRoutes = require('./src/routes/metrics');
+// const healthRoutes = require('./src/routes/health');
+// const metricsRoutes = require('./src/routes/metrics');
 const mediaWebhookRoutes = require('./src/routes/mediaWebhook');
-const { performanceTrackingMiddleware, startResourceMonitoring } = require('./src/middleware/performanceTracking');
+// const { performanceTrackingMiddleware, startResourceMonitoring } = require('./src/middleware/performanceTracking');
 
 // ============================================================================
 // ENVIRONMENT VALIDATION

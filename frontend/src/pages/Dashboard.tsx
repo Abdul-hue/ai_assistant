@@ -137,31 +137,18 @@ const Dashboard = () => {
 
   // Memoize header content
   const headerContent = useMemo(() => (
-<<<<<<< Updated upstream
-    <div className="flex items-center justify-between gap-4 w-full">
-      <div>
-        <h1 className="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white">
-          Welcome back{user?.name ? `, ${user.name.split(' ')[0]}` : ''}! 👋
-        </h1>
-        <p className="text-gray-600 dark:text-gray-400 text-xs sm:text-sm mt-1 hidden sm:block">
-=======
     <div className="flex items-center justify-between gap-4 w-full animate-fade-in-down">
       <div>
         <h1 className="text-xl sm:text-2xl font-bold text-foreground">
           Welcome back{user?.name ? `, ${user.name.split(' ')[0]}` : ''}! 👋
         </h1>
         <p className="text-muted-foreground text-xs sm:text-sm mt-1 hidden sm:block">
->>>>>>> Stashed changes
           Manage your AI agents and monitor conversations
         </p>
       </div>
       <Button 
         onClick={handleCreateAgent}
-<<<<<<< Updated upstream
-        className="bg-gradient-primary shadow-glow hover:shadow-[0_0_30px_hsl(var(--primary)/0.6)] transition-all duration-300 hover:scale-105 text-sm sm:text-base"
-=======
         className="bg-gradient-primary text-white shadow-lg hover:opacity-90 hover:shadow-xl transition-all duration-300 hover:scale-105 text-sm sm:text-base font-semibold"
->>>>>>> Stashed changes
         size="sm"
         aria-label={ariaLabels.actions.create('agent')}
       >

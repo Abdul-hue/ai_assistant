@@ -64,8 +64,8 @@ async function forwardToN8N(messageRecord) {
     
     // Send to N8N
     const response = await axios.post(N8N_WEBHOOK_URL, payload, {
-      headers: {
-        'Content-Type': 'application/json',
+        headers: {
+          'Content-Type': 'application/json',
         'User-Agent': 'WhatsApp-Media-Processor/1.0'
       },
       timeout: TIMEOUT
@@ -76,7 +76,7 @@ async function forwardToN8N(messageRecord) {
       status: response.status 
     }, 'Successfully forwarded to N8N');
     
-    return {
+          return { 
       success: true,
       status: response.status,
       data: response.data
