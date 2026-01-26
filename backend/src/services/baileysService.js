@@ -63,6 +63,7 @@ const qrGenerationTracker = new Map();
 const connectionLocks = new Map(); // agentId -> boolean
 const lastConnectionAttempt = new Map(); // agentId -> timestamp ms
 const last401Failure = new Map(); // agentId -> timestamp ms (prevents auto-retry after 401)
+const recentPairings = new Map(); // agentId -> timestamp ms (tracks when credentials were last saved from QR scan)
 // Cache for @lid JID to actual phone number mapping (for linked device messages)
 // Format: "@lid JID" -> "phone@s.whatsapp.net"
 const lidToPhoneCache = new Map();
@@ -957,8 +958,6 @@ async function backupCredentials(agentId) {
   }
 }
 
-<<<<<<< Updated upstream
-=======
 // FIX 3: Smart status check to determine if credentials should be deleted
 // Returns true if credentials should be deleted, false if they should be kept
 async function shouldDeleteCredentials(agentId) {
@@ -1069,10 +1068,23 @@ async function clearAuthState(agentId) {
 }
 
 /**
+ * Clear reconnection state for an agent (cancels pending reconnections)
+ */
+function clearReconnectionState(agentId) {
+  try {
+    const { cancelReconnection } = require('../utils/reconnectionManager');
+    cancelReconnection(agentId);
+    console.log(`[BAILEYS] ✅ Reconnection state cleared for ${agentId.substring(0, 8)}`);
+  } catch (error) {
+    console.warn(`[BAILEYS] ⚠️ Error clearing reconnection state:`, error.message);
+  }
+}
+
+/**
  * Disable auto-reconnect for an agent (prevents multiple reconnection attempts)
  */
 function disableAutoReconnect(agentId) {
-  // Use the existing clearReconnectionState function (defined later in file)
+  // Clear any pending reconnection attempts
   clearReconnectionState(agentId);
   
   // Record 401 failure to prevent future auto-retries
@@ -1081,7 +1093,6 @@ function disableAutoReconnect(agentId) {
   console.log(`[BAILEYS] 🚫 Auto-reconnect disabled for agent ${agentId.substring(0, 8)}...`);
 }
 
->>>>>>> Stashed changes
 // Validate credential freshness before using existing credentials
 // Returns { valid: boolean, reason: string }
 async function validateCredentialFreshness(agentId, creds) {
@@ -1742,13 +1753,55 @@ async function initializeWhatsApp(agentId, userId = null) {
       console.warn(`[BAILEYS] ⚠️ Error checking database status:`, dbStatusError);
     }
     
-    // CRITICAL: If status is 'disconnected', force fresh start (delete local files, clear DB)
+    // CRITICAL: Check if credentials were just saved (recent pairing) - declare at function level
+    // This is used in multiple places below
+    const recentPairing = recentPairings.get(agentId);
+    const justPaired = recentPairing && (Date.now() - recentPairing) < 120000; // 2 minutes
+    const authPath = path.join(__dirname, '../../auth_sessions', agentId);
+    const credsPath = path.join(authPath, 'creds.json');
+    const credsFileExists = fs.existsSync(credsPath);
+    
+    // Check credential file modification time if it exists
+    let credsFileAge = Infinity;
+    if (credsFileExists) {
+      try {
+        const stats = fs.statSync(credsPath);
+        credsFileAge = Date.now() - stats.mtimeMs;
+      } catch (e) {
+        // Ignore stat errors
+      }
+    }
+    
+    const credsRecentlyModified = credsFileAge < 120000; // Modified within last 2 minutes
+    
+    // Check if disconnected status is old (> 5 minutes) - only then delete credentials
+    const disconnectedAt = dbSessionStatus?.disconnected_at ? new Date(dbSessionStatus.disconnected_at).getTime() : null;
+    const disconnectedAge = disconnectedAt ? Date.now() - disconnectedAt : Infinity;
+    const isOldDisconnect = disconnectedAge > 5 * 60 * 1000; // 5 minutes
+    
     if (dbSessionStatus && dbSessionStatus.status === 'disconnected') {
-      console.log(`[BAILEYS] ⚠️ Database status is 'disconnected' - forcing fresh start`);
-      console.log(`[BAILEYS] This indicates a manual disconnect - all credentials must be cleared`);
-      
-      // Delete local auth directory completely (with error handling)
-      const authPath = path.join(__dirname, '../../auth_sessions', agentId);
+      // EXCEPTION: Preserve credentials if they were just saved (QR scan just happened)
+      if (justPaired || credsRecentlyModified) {
+        console.log(`[BAILEYS] ✅ Recent pairing detected (${Math.round((Date.now() - recentPairing) / 1000)}s ago) - preserving credentials`);
+        console.log(`[BAILEYS] ✅ Credential file recently modified (${Math.round(credsFileAge / 1000)}s ago) - preserving credentials`);
+        console.log(`[BAILEYS] 🔄 Will reconnect using saved credentials instead of generating new QR`);
+        
+        // Update database to indicate we're reconnecting after pairing
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({
+            status: 'reconnecting_after_pairing',
+            updated_at: new Date().toISOString()
+          })
+          .eq('agent_id', agentId);
+        
+        // Skip credential deletion - proceed to use them
+      } else if (isOldDisconnect) {
+        // Only delete if disconnect is old (> 5 minutes) - indicates manual disconnect
+        console.log(`[BAILEYS] ⚠️ Database status is 'disconnected' (${Math.round(disconnectedAge / 60000)} minutes old) - forcing fresh start`);
+        console.log(`[BAILEYS] This indicates a manual disconnect - all credentials must be cleared`);
+        
+        // Delete local auth directory completely (with error handling)
       if (fs.existsSync(authPath)) {
         console.log(`[BAILEYS] 🗑️ Deleting local auth directory (disconnected session)...`);
         try {
@@ -1790,6 +1843,10 @@ async function initializeWhatsApp(agentId, userId = null) {
       
       console.log(`[BAILEYS] ✅ Fresh start complete - will generate fresh QR`);
       // Continue to fresh QR generation below
+      } else {
+        // Disconnect is recent but not from pairing - preserve credentials but mark as disconnected
+        console.log(`[BAILEYS] ⚠️ Recent disconnect detected (${Math.round(disconnectedAge / 1000)}s ago) - preserving credentials for potential reconnect`);
+      }
     }
     
     // Mark session as initializing in database before proceeding
@@ -1811,30 +1868,51 @@ async function initializeWhatsApp(agentId, userId = null) {
 
     // Load auth state using Baileys' built-in function
     console.log(`[BAILEYS] 📂 Loading authentication state...`);
-    const authPath = path.join(__dirname, '../../auth_sessions', agentId);
+    // authPath already declared above
 
-    // CRITICAL FIX B: Only check local files if status is NOT 'disconnected'
-    // If we just cleared everything above, skip local file check
-    const credsFile = path.join(authPath, 'creds.json');
-    const hasValidCreds = fs.existsSync(credsFile) && 
-                         dbSessionStatus && 
-                         dbSessionStatus.status !== 'disconnected';
+    // CRITICAL FIX B: Check for valid credentials with improved logic
+    // Consider credentials valid if:
+    // 1. File exists AND
+    // 2. Either: status is not 'disconnected' OR credentials were just saved (recent pairing)
+    // Use variables already declared above (recentPairing, justPaired, credsFileExists, credsFileAge, credsRecentlyModified)
+    
+    // Credentials are valid if file exists AND (status is not disconnected OR recently saved)
+    const hasValidCreds = credsFileExists && 
+                         (dbSessionStatus?.status !== 'disconnected' || justPaired || credsRecentlyModified);
     
     let useFileAuth = false;
     
     if (hasValidCreds) {
       try {
-        const credsContent = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
+        const credsContent = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
         
-        // Simple check: Do we have a paired device?
-        const isPaired = credsContent.me && credsContent.me.id;
+        // IMPROVED: Check multiple indicators of valid credentials
+        const hasDeviceId = credsContent.me && credsContent.me.id;
+        const hasNoiseKey = credsContent.noiseKey && credsContent.noiseKey.private;
+        const hasSignedIdentityKey = credsContent.signedIdentityKey && credsContent.signedIdentityKey.private;
+        const isRegistered = credsContent.registered !== false;
         
-        if (isPaired) {
-          console.log(`[BAILEYS] ✅ Found credentials with paired device - loading...`);
-          console.log(`[BAILEYS] Device ID: ${credsContent.me.id.split(':')[0]}`);
+        // Use credentials if:
+        // 1. Has device ID (paired device) OR
+        // 2. Has required keys (noiseKey + signedIdentityKey) OR
+        // 3. Credentials were just saved (within last 60 seconds) - force use them
+        const shouldUseCreds = hasDeviceId || 
+                              (hasNoiseKey && hasSignedIdentityKey) ||
+                              (justPaired && credsFileAge < 60000);
+        
+        if (shouldUseCreds) {
+          if (hasDeviceId) {
+            console.log(`[BAILEYS] ✅ Found credentials with paired device - loading...`);
+            console.log(`[BAILEYS] Device ID: ${credsContent.me.id.split(':')[0]}`);
+          } else if (justPaired && credsFileAge < 60000) {
+            console.log(`[BAILEYS] ✅ Credentials just saved (${Math.round(credsFileAge / 1000)}s ago) - FORCING use (QR was scanned)`);
+          } else {
+            console.log(`[BAILEYS] ✅ Found valid credentials with required keys - loading...`);
+          }
           useFileAuth = true;
         } else {
-          console.log(`[BAILEYS] ℹ️  Credentials exist but no paired device - will generate QR`);
+          console.log(`[BAILEYS] ℹ️  Credentials exist but incomplete - will generate QR`);
+          console.log(`[BAILEYS] Missing: deviceId=${!hasDeviceId}, noiseKey=${!hasNoiseKey}, signedIdentityKey=${!hasSignedIdentityKey}`);
         }
       } catch (error) {
         console.log(`[BAILEYS] ⚠️ Error reading credentials:`, error.message);
@@ -1845,7 +1923,7 @@ async function initializeWhatsApp(agentId, userId = null) {
         }
       }
     } else {
-      if (!fs.existsSync(credsFile)) {
+      if (!fs.existsSync(credsPath)) {
         console.log(`[BAILEYS] 🆕 No credentials file found locally`);
       } else if (dbSessionStatus?.status === 'disconnected') {
         console.log(`[BAILEYS] ⚠️ Local credentials exist but status is 'disconnected' - ignoring local file`);
@@ -2030,9 +2108,6 @@ async function initializeWhatsApp(agentId, userId = null) {
     const hasDeviceId = !!state.creds?.me?.id;
     const hasSignalKeys = !!(state.creds?.noiseKey && state.creds?.signedIdentityKey);
     const hasPairedDevice = hasDeviceId && hasSignalKeys;
-<<<<<<< Updated upstream
-    const shouldGenerateQR = !hasPairedDevice;
-=======
     
     // FIX 4: Check database status for reconnecting after pairing
     const { data: sessionStatus } = await supabaseAdmin
@@ -2069,7 +2144,6 @@ async function initializeWhatsApp(agentId, userId = null) {
     if (isLoggedOut) {
       console.log('[BAILEYS] 🚨 Status is "logged_out" - FORCING QR generation (credentials invalidated)');
     }
->>>>>>> Stashed changes
     
     console.log('[BAILEYS] 🔍 Connection Strategy:', {
       hasDeviceId,
@@ -2331,6 +2405,10 @@ async function initializeWhatsApp(agentId, userId = null) {
         currentCreds._keysChecksum = keysChecksum;
         
         console.log(`[BAILEYS] ✅ Credential validation passed, saving...`);
+        
+        // Track recent pairing to preserve credentials during reconnection
+        recentPairings.set(agentId, Date.now());
+        console.log(`[BAILEYS] 📝 Recent pairing tracked for ${agentId.substring(0, 8)}...`);
         
         // saveCreds handles both file save and database sync with atomic writes
         await saveCreds();
@@ -2686,20 +2764,10 @@ async function initializeWhatsApp(agentId, userId = null) {
         const wsCloseEvent = sock?.ws && typeof sock.ws === 'object' && 'closeEvent' in sock.ws ? sock.ws.closeEvent : null;
         const session = activeSessions.get(agentId);
 
-<<<<<<< Updated upstream
-=======
         console.log(`[BAILEYS] 🔌 Connection closed for ${agentId.substring(0, 8)}`);
         console.log(`[BAILEYS] Status code: ${statusCode}, Reason: ${reason}`);
         
-        // ✅ FIX 5: Prevent auto-reconnect on 401/loggedOut (handled above)
-        // Check if this is a 401/loggedOut - if so, it's already handled above, skip auto-reconnect
-        if (statusCode === 401 || statusCode === DisconnectReason.loggedOut) {
-          console.log(`[BAILEYS] ⏹️  401/loggedOut already handled - skipping auto-reconnect`);
-          return; // Already handled in the 401 block above
-        }
-        
         // Update session state
->>>>>>> Stashed changes
         if (session) {
           session.isConnected = false;
           session.connectionState = 'closed';
@@ -2722,8 +2790,6 @@ async function initializeWhatsApp(agentId, userId = null) {
           session.socketReadyState = session.socket?.ws?.readyState ?? null;
         }
         
-<<<<<<< Updated upstream
-=======
         // Clear health check interval
         if (healthCheckIntervals.has(agentId)) {
           clearInterval(healthCheckIntervals.get(agentId));
@@ -2743,6 +2809,176 @@ async function initializeWhatsApp(agentId, userId = null) {
           .eq('agent_id', agentId);
         
         // ============================================
+        // Specific Error Code Handlers (must run BEFORE general reconnection)
+        // ============================================
+        
+        // ✅ CRITICAL: Handle 401 FIRST - must clear credentials before any other logic
+        if (statusCode === 401 || statusCode === DisconnectReason.loggedOut) {
+          console.log(`[BAILEYS] ❌ 401/LoggedOut - Enforcing strict auth reset policy`);
+          
+          // Cleanup socket first
+          if (session?.socket) {
+            try {
+              session.socket.ev.removeAllListeners();
+              session.socket.end?.();
+            } catch (err) {
+              console.log('[BAILEYS] Socket cleanup after 401 failed:', err.message);
+            }
+          }
+
+          // Stop all monitoring/intervals
+          if (session?.healthCheckInterval) {
+            clearInterval(session.healthCheckInterval);
+            session.healthCheckInterval = null;
+          }
+          if (session?.heartbeatInterval) {
+            clearInterval(session.heartbeatInterval);
+            session.heartbeatInterval = null;
+          }
+          
+          // Get failure reason
+          const failureReason = lastDisconnect?.error?.message || 
+                                lastDisconnect?.error?.output?.payload?.message || 
+                                reason || 
+                                '401 Unauthorized - Device logged out or removed';
+          
+          // Update session state
+          if (session) {
+            session.failureReason = failureReason;
+            session.failureAt = Date.now();
+            session.isConnected = false;
+            session.connectionState = 'logged_out';
+            session.qrCode = null;
+            session.qrGeneratedAt = null;
+            session.socket = null;
+            session.state = null;
+            session.saveCreds = null;
+          }
+
+          // Remove from active sessions IMMEDIATELY
+          activeSessions.delete(agentId);
+          console.log(`[BAILEYS] ✅ Session removed from active sessions`);
+
+          // ✅ CRITICAL: Clear ALL auth state (DB + local files)
+          await clearAuthState(agentId);
+          
+          // ✅ CRITICAL: Disable auto-reconnect
+          disableAutoReconnect(agentId);
+          
+          // Cleanup connection tracking
+          connectionLocks.delete(agentId);
+          qrGenerationTracker.delete(agentId);
+          lastConnectionAttempt.set(agentId, Date.now());
+          
+          console.log(`[BAILEYS] ✅ 401 policy enforced - Auth cleared, reconnect disabled`);
+          console.log(`[BAILEYS] 🚫 Auto-retry disabled - Manual reconnection required`);
+          console.log(`[BAILEYS] 📱 Next init will FORCE QR generation (no credentials)`);
+          console.log(`[BAILEYS] ⚠️  User must click "Connect" to get new QR code`);
+
+          return; // Don't continue - no retries with invalid credentials
+        }
+        
+        // Error 515 - Restart Required (EXPECTED after QR pairing!)
+        // MUST be checked FIRST to prevent double reconnection
+        if (statusCode === 515) {
+          const session = activeSessions.get(agentId);
+          
+          console.log(`[BAILEYS] 🔄 Error 515 - Restart required`);
+          console.log(`[BAILEYS] 📊 Session state: hasQR=${!!session?.qrCode}`);
+          
+          // Check if credentials were just saved (after QR scan)
+          const authDir = path.join(__dirname, '../../auth_sessions', agentId);
+          const credsPath = path.join(authDir, 'creds.json');
+          const hasSavedCreds = fs.existsSync(credsPath);
+          
+          // Check if credentials were recently saved (within last 60 seconds)
+          const recentPairing = recentPairings.get(agentId);
+          const justPaired = recentPairing && (Date.now() - recentPairing) < 60000; // 60 seconds
+          
+          // Check credential file age
+          let credsFileAge = Infinity;
+          if (hasSavedCreds) {
+            try {
+              const stats = fs.statSync(credsPath);
+              credsFileAge = Date.now() - stats.mtimeMs;
+            } catch (e) {
+              // Ignore stat errors
+            }
+          }
+          const credsRecentlySaved = credsFileAge < 60000; // Modified within last 60 seconds
+          
+          if (hasSavedCreds && (justPaired || credsRecentlySaved)) {
+            console.log(`[BAILEYS] ✅ Credentials exist and were just saved (${Math.round(credsFileAge / 1000)}s ago) - QR was scanned`);
+            console.log(`[BAILEYS] 🔄 Reconnecting WITHOUT re-initialization to preserve credentials...`);
+            
+            // Update database to indicate we're reconnecting after pairing
+            await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                status: 'reconnecting_after_pairing',
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+            
+            // Remove from memory to force clean restart
+            activeSessions.delete(agentId);
+            qrGenerationTracker.delete(agentId);
+            connectionLocks.delete(agentId); // Release lock before reconnect
+            
+            // Wait 2-3 seconds for WhatsApp servers to register the device
+            // Then reconnect using existing credentials (don't go through full init)
+            setTimeout(async () => {
+              console.log(`[BAILEYS] 🔄 Reconnecting after 515 with saved credentials (waiting for WhatsApp to register device)...`);
+              try {
+                // Use smart reconnection which will detect and use existing credentials
+                const { handleSmartReconnection } = require('../utils/reconnectionManager');
+                await handleSmartReconnection(agentId, 'disconnect_515_restart', 1);
+              } catch (error) {
+                console.error(`[BAILEYS] ❌ Reconnection failed after 515:`, error.message);
+              }
+            }, 2500); // 2.5 seconds - give WhatsApp time to register
+          } else if (hasSavedCreds) {
+            // Credentials exist but are old - still try to use them
+            console.log(`[BAILEYS] ✅ Credentials exist (${Math.round(credsFileAge / 1000)}s old) - attempting reconnection...`);
+            
+            activeSessions.delete(agentId);
+            qrGenerationTracker.delete(agentId);
+            connectionLocks.delete(agentId);
+            
+            setTimeout(async () => {
+              console.log(`[BAILEYS] 🔄 Reconnecting after 515 with existing credentials...`);
+              try {
+                const { handleSmartReconnection } = require('../utils/reconnectionManager');
+                await handleSmartReconnection(agentId, 'disconnect_515_restart', 1);
+              } catch (error) {
+                console.error(`[BAILEYS] ❌ Reconnection failed after 515:`, error.message);
+              }
+            }, 2000);
+          } else {
+            console.log(`[BAILEYS] ⚠️ No credentials found - QR timeout or not scanned yet`);
+            
+            // Remove from memory
+            activeSessions.delete(agentId);
+            qrGenerationTracker.delete(agentId);
+            connectionLocks.delete(agentId);
+            
+            // Update database status
+            await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                status: 'qr_pending',
+                is_active: false,
+                qr_code: null,
+                qr_generated_at: null,
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+          }
+          
+          return; // Exit early - don't run general reconnection logic
+        }
+        
+        // ============================================
         // Automatic Reconnection Logic (only for non-401 errors)
         // ============================================
         
@@ -2754,7 +2990,10 @@ async function initializeWhatsApp(agentId, userId = null) {
           console.log(`[BAILEYS] 🔄 Triggering automatic reconnection for ${agentId.substring(0, 8)}`);
           
           // Trigger reconnection with exponential backoff
-          attemptReconnection(agentId, statusCode, reason);
+          const { handleSmartReconnection } = require('../utils/reconnectionManager');
+          handleSmartReconnection(agentId, reason || 'connection_closed', 1).catch(err => {
+            console.error(`[BAILEYS] ❌ Reconnection failed:`, err.message);
+          });
         } else {
           console.log(`[BAILEYS] ⏹️  Not reconnecting agent ${agentId.substring(0, 8)} - logged out, 401 cooldown, or permanent failure`);
           
@@ -2766,7 +3005,6 @@ async function initializeWhatsApp(agentId, userId = null) {
         }
         
         // Emit disconnected event
->>>>>>> Stashed changes
         emitAgentEvent(agentId, 'disconnected', {
           reason,
           statusCode
@@ -2906,31 +3144,6 @@ async function initializeWhatsApp(agentId, userId = null) {
           return;
         }
         
-        // Error 515 - Restart Required (EXPECTED after QR pairing!)
-        if (statusCode === 515) {
-          console.log(`[BAILEYS] 🔄 Error 515 - Restart required (EXPECTED after QR pairing)`);
-          
-          // Remove from memory to force clean restart
-          activeSessions.delete(agentId);
-          qrGenerationTracker.delete(agentId);
-          connectionLocks.delete(agentId); // Release lock before reconnect
-          
-          // Use smart reconnection (515 is expected, so start with attempt 1)
-          const { handleSmartReconnection } = require('../utils/reconnectionManager');
-          
-          // Wait 3 seconds then reconnect (give WhatsApp time to register credentials)
-          setTimeout(async () => {
-            console.log(`[BAILEYS] 🔄 Reconnecting after 515...`);
-            try {
-              await handleSmartReconnection(agentId, 'disconnect_515_restart', 1);
-            } catch (error) {
-              console.error(`[BAILEYS] ❌ Reconnection failed after 515:`, error.message);
-            }
-          }, 3000);
-          
-          return;
-        }
-        
         qrGenerationTracker.delete(agentId);
         
         // CRITICAL: Handle Bad MAC errors (session corruption) - enhanced detection
@@ -3048,87 +3261,6 @@ async function initializeWhatsApp(agentId, userId = null) {
           return; // Don't continue processing
         }
         
-        // ✅ FIX 1: Strict 401 Policy - Clear auth state, disable reconnect, force QR
-        if (statusCode === 401 || statusCode === DisconnectReason.loggedOut) {
-          console.log(`[BAILEYS] ❌ 401/LoggedOut - Enforcing strict auth reset policy`);
-          
-          // Cleanup socket first
-          if (session?.socket) {
-            try {
-              session.socket.ev.removeAllListeners();
-              session.socket.end?.();
-            } catch (err) {
-              console.log('[BAILEYS] Socket cleanup after 401 failed:', err.message);
-            }
-          }
-
-          // Stop all monitoring/intervals
-          if (session?.healthCheckInterval) {
-            clearInterval(session.healthCheckInterval);
-            session.healthCheckInterval = null;
-          }
-          if (session?.heartbeatInterval) {
-            clearInterval(session.heartbeatInterval);
-            session.heartbeatInterval = null;
-          }
-          
-          // Get failure reason from lastDisconnect (fix payload undefined error)
-          const failureReason = lastDisconnect?.error?.message || 
-                                lastDisconnect?.error?.output?.payload?.message || 
-                                reason || 
-                                '401 Unauthorized - Device logged out or removed';
-          
-          // Update session state
-          if (session) {
-            session.failureReason = failureReason;
-            session.failureAt = Date.now();
-            session.isConnected = false;
-            session.connectionState = 'logged_out';
-            session.qrCode = null;
-            session.qrGeneratedAt = null;
-            session.socket = null;
-            session.state = null;
-            session.saveCreds = null;
-          }
-
-<<<<<<< Updated upstream
-          // Stop health check and heartbeat intervals
-          if (session?.healthCheckInterval) {
-            clearInterval(session.healthCheckInterval);
-            session.healthCheckInterval = null;
-            console.log(`[BAILEYS] ✅ Health check interval stopped`);
-          }
-          if (session?.heartbeatInterval) {
-            clearInterval(session.heartbeatInterval);
-            session.heartbeatInterval = null;
-            console.log(`[BAILEYS] ✅ Heartbeat interval stopped`);
-          }
-
-          // Remove from active sessions IMMEDIATELY to stop health check
-          // Health check checks if session exists, so deleting it stops the loop
-          activeSessions.delete(agentId);
-          console.log(`[BAILEYS] ✅ Session removed from active sessions`);
-
-=======
-          // ✅ CRITICAL: Clear ALL auth state (DB + local files)
-          await clearAuthState(agentId);
-          
-          // ✅ CRITICAL: Disable auto-reconnect
-          disableAutoReconnect(agentId);
-          
-          // Cleanup connection tracking
->>>>>>> Stashed changes
-          connectionLocks.delete(agentId);
-          lastConnectionAttempt.set(agentId, Date.now());
-          
-          console.log(`[BAILEYS] ✅ 401 policy enforced - Auth cleared, reconnect disabled`);
-          console.log(`[BAILEYS] 🚫 Auto-retry disabled - Manual reconnection required`);
-          console.log(`[BAILEYS] 📱 Next init will FORCE QR generation (no credentials)`);
-          console.log(`[BAILEYS] ⚠️  User must click "Connect" to get new QR code`);
-
-          return; // Don't continue - no retries with invalid credentials
-        }
-
         // CRITICAL: Handle error 404 - Session Not Found (FATAL)
         if (statusCode === 404) {
           console.log(`[BAILEYS] ❌ 404 - Session not found - clearing credentials`);
@@ -3307,14 +3439,10 @@ async function initializeWhatsApp(agentId, userId = null) {
         return;
       }
 
-<<<<<<< Updated upstream
-      const shouldProcessMessage = (message) => {
-=======
       // Messages will be queued individually via queueMessageForBatch()
       // No need to collect in array - queue handles batching automatically
 
       const shouldProcessMessage = async (message) => {
->>>>>>> Stashed changes
         const remoteJid = message?.key?.remoteJid || '';
 
         if (!remoteJid) {
@@ -4285,25 +4413,13 @@ async function initializeWhatsApp(agentId, userId = null) {
           let cachedPhoneNumber = null;
           
           // Check cache now (logger should have populated it by now)
-<<<<<<< Updated upstream
-          if (lidToPhoneCache.has(remoteJid)) {
-            const cachedSenderJid = lidToPhoneCache.get(remoteJid);
-            const cachedPhoneNumber = sanitizeNumberFromJid(cachedSenderJid);
-=======
           const cachedSenderJid = lidToPhoneCache.get(remoteJid);
           if (cachedSenderJid !== undefined) {
-            cacheStats.lidToPhone.hits++;
             cachedPhoneNumber = sanitizeNumberFromJid(cachedSenderJid);
->>>>>>> Stashed changes
             if (cachedPhoneNumber) {
               webhookFromNumber = cachedPhoneNumber;
               console.log(`[BAILEYS] ✅ Using cached sender_pn for webhook: ${remoteJid} -> ${webhookFromNumber}`);
             }
-          } else {
-<<<<<<< Updated upstream
-            console.log(`[BAILEYS] ⚠️ Cache not populated yet for ${remoteJid}, using fallback: ${webhookFromNumber}`);
-=======
-            cacheStats.lidToPhone.misses++;
           }
           
           // ✅ Now cachedPhoneNumber is accessible here
@@ -4311,7 +4427,6 @@ async function initializeWhatsApp(agentId, userId = null) {
             loggers.database.debug({ remoteJid, phone: webhookFromNumber }, 'Using cached sender_pn for webhook');
           } else {
             loggers.database.debug({ remoteJid }, 'Cache not populated yet, using fallback');
->>>>>>> Stashed changes
           }
         }
 
@@ -4498,8 +4613,16 @@ async function initializeWhatsApp(agentId, userId = null) {
                                       queueError.message.includes('persistence failed') ||
                                       queueError.message.includes('MEDIA_SKIPPED_NOT_PERSISTED');
             
+            const isRedisError = queueError.message.includes('REDIS_CONNECTION_FAILED') ||
+                                queueError.message.includes('ECONNREFUSED') ||
+                                queueError.message.includes('Redis');
+            
             if (isPersistenceError) {
               console.error(`[BAILEYS] ❌ MEDIA_SKIPPED_NOT_PERSISTED: Message ${messageId} - ${queueError.message}`);
+            } else if (isRedisError) {
+              console.error(`[BAILEYS] ❌ REDIS_CONNECTION_FAILED: Cannot queue media job for message ${messageId}`);
+              console.error(`[BAILEYS] ⚠️  Redis server is not running. Media upload will fail until Redis is started.`);
+              console.error(`[BAILEYS] 💡 To fix: Start Redis server (redis-server) or configure REDIS_HOST/REDIS_PORT environment variables`);
             } else {
               console.error(`[BAILEYS] ❌ MEDIA_PIPELINE_BROKEN: Failed to queue message for media processing:`, {
                 messageId,
@@ -5801,36 +5924,10 @@ module.exports = {
   cleanupMonitoring,
   startAllMonitoring,
   connectionMonitors,
-<<<<<<< Updated upstream
-  healthCheckIntervals
-=======
   healthCheckIntervals,
-  clearAllCaches,
-  warmSessionCache,
-  getInstanceHealth,
-  getCacheStats,
-  getUserIdByAgentId,
-  batchUpdateSessionStatus,
   // Socket management for media processing
   getSessionForAgent,
   getActiveAgentIds,
   // Webhook forwarding (for media worker)
-  forwardMessageToWebhook,
-  // Prometheus metrics registry (for /metrics endpoint)
-  metricsRegistry,
-  // Prometheus custom metrics (for advanced monitoring)
-  connectionMetrics,
-  messageMetrics,
-  cacheMetrics,
-  databaseMetrics,
-  errorMetrics,
-  // Performance tracking
-  OperationTracker,
-  // Performance reporting
-  performanceReporter,
-  // Error tracking
-  errorTracker,
-  // Alerting
-  alertingService
->>>>>>> Stashed changes
+  forwardMessageToWebhook
 };

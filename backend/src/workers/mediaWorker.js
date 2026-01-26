@@ -434,20 +434,38 @@ async function queueMessage(messageData) {
   }
   
   // Add to queue with options
-  const job = await mediaQueue.add(jobData, {
-    jobId: `media-${messageId}`, // ✅ Prevent duplicate jobs (Bull will ignore if exists)
-    attempts: parseInt(process.env.RETRY_ATTEMPTS) || 3,
-    backoff: {
-      type: 'exponential',
-      delay: 2000
-    },
-    removeOnComplete: true,
-    removeOnFail: false
-  });
-  
-  logger.info({ messageId, jobId: job.id }, 'Message queued for processing');
-  
-  return job;
+  try {
+    const job = await mediaQueue.add(jobData, {
+      jobId: `media-${messageId}`, // ✅ Prevent duplicate jobs (Bull will ignore if exists)
+      attempts: parseInt(process.env.RETRY_ATTEMPTS) || 3,
+      backoff: {
+        type: 'exponential',
+        delay: 2000
+      },
+      removeOnComplete: true,
+      removeOnFail: false
+    });
+    
+    logger.info({ messageId, jobId: job.id }, 'Message queued for processing');
+    
+    return job;
+  } catch (queueError) {
+    // ✅ FIX: Handle Redis connection errors gracefully
+    if (queueError.message && queueError.message.includes('ECONNREFUSED')) {
+      logger.error({ 
+        messageId, 
+        error: queueError.message,
+        host: redisConfig.host,
+        port: redisConfig.port
+      }, 'Redis connection failed - cannot queue media job. Please start Redis server.');
+      
+      // Return error object so caller can handle it
+      throw new Error(`REDIS_CONNECTION_FAILED: Cannot queue media job - Redis server not running. Please start Redis at ${redisConfig.host}:${redisConfig.port}`);
+    }
+    
+    // Re-throw other errors
+    throw queueError;
+  }
 }
 
 // Queue event handlers

@@ -1,6 +1,4 @@
 require('dotenv').config();
-<<<<<<< Updated upstream
-=======
 
 // ============================================================================
 // PORT AVAILABILITY CHECK - MUST RUN BEFORE ANY SERVICE INITIALIZATION
@@ -60,8 +58,6 @@ if (!checkPortAvailable(PORT)) {
 // ============================================================================
 // NOW it's safe to require modules and initialize services
 // ============================================================================
-
->>>>>>> Stashed changes
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -71,7 +67,7 @@ const cookieParser = require('cookie-parser');
 
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT || 3001;
+// PORT is already declared at the top for port availability check
 
 // Initialize Socket.IO with improved configuration
 const io = new Server(server, {
@@ -114,13 +110,10 @@ const imapSmtpRoutes = require('./src/routes/imapSmtp');
 const folderManagementRoutes = require('./src/routes/folderManagement');
 const fetchNewMailRoutes = require('./src/routes/fetchNewMail');
 const { fetchNewUnreadEmailsForAllAccounts } = require('./src/routes/fetchNewMail');
-<<<<<<< Updated upstream
-=======
 const healthRoutes = require('./src/routes/health');
 const metricsRoutes = require('./src/routes/metrics');
 const mediaWebhookRoutes = require('./src/routes/mediaWebhook');
 const { performanceTrackingMiddleware, startResourceMonitoring } = require('./src/middleware/performanceTracking');
->>>>>>> Stashed changes
 
 // ============================================================================
 // ENVIRONMENT VALIDATION
