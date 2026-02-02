@@ -214,9 +214,16 @@ const defaultAllowedOrigins = [
   'http://localhost:3000',  // React dev server
 ];
 
+// Production allowed origins (always included)
+const productionAllowedOrigins = [
+  'https://cannagx.com',     // Production frontend domain
+  'https://www.cannagx.com', // Production frontend domain (with www)
+];
+
 // Combine environment origins with defaults
 const allowedOrigins = [
   ...allowedOriginsFromEnv,
+  ...productionAllowedOrigins, // Always include production origins
   ...(process.env.NODE_ENV === 'development' ? defaultAllowedOrigins : [])
 ];
 
