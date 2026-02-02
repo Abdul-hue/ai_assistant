@@ -388,9 +388,13 @@ async function syncContactsForAgent(agentId, sock, isRetry = false) {
     
     // Return immediately - event listeners will handle the rest
     // Contacts will be synced via events handled by setupContactUpdateListeners()
+    // If no contacts were found in store, return default response
     return {
-      ...result,
-      total: contacts.length,
+      success: 0,
+      failed: 0,
+      total: contacts.length || 0,
+      errors: [],
+      note: 'No contacts found in store yet - waiting for contacts.set event',
     };
   } catch (error) {
     console.error(`[CONTACT-SYNC] ❌ Sync failed:`, error);

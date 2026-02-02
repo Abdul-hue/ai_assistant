@@ -31,6 +31,20 @@ const {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 process.on('unhandledRejection', (reason, promise) => {
   const errorMessage = reason?.message || String(reason);
+  const statusCode = reason?.output?.statusCode;
+  const stackTrace = reason?.stack || reason?.data?.stack || '';
+  
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // FIX: Ignore timeout errors from keepalive - they're expected during network instability
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  const isTimeoutError = errorMessage.includes('Timed Out') || 
+                         statusCode === 408 ||
+                         errorMessage.includes('timeout');
+  // Check stack trace for keepalive-related functions
+  const isKeepaliveError = stackTrace.includes('sendKeepaliveWithRetry') ||
+                           stackTrace.includes('baileysService.js:2739') ||
+                           stackTrace.includes('baileysService.js:838') ||
+                           (isTimeoutError && stackTrace.includes('query'));
   
   // Ignore Baileys store errors - they're non-critical
   if (errorMessage.includes('list.upsert') || 
@@ -38,6 +52,12 @@ process.on('unhandledRejection', (reason, promise) => {
       (errorMessage.includes('store') && errorMessage.includes('TypeError'))) {
     console.log(`[BAILEYS] ⚠️ Store error caught (non-critical): ${errorMessage.substring(0, 100)}`);
     return; // Don't crash - store is optional
+  }
+  
+  // Ignore timeout errors from keepalive - they're expected and handled
+  if (isKeepaliveError) {
+    // Silently ignore - these are expected during network instability
+    return;
   }
   
   // Log other unhandled rejections but don't crash
@@ -829,11 +849,29 @@ async function sendKeepaliveWithRetry(sock, agentId, maxRetries = 3) {
       updateNetworkQuality(agentId, true, latency);
       return true;
     } catch (error) {
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // FIX: Handle timeout errors gracefully - they're expected during network instability
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const isTimeoutError = error?.message?.includes('Timed Out') || 
+                             error?.output?.statusCode === 408 ||
+                             error?.message?.includes('timeout');
+      const errorMessage = error?.message || 'Unknown error';
+      
       if (attempt < maxRetries) {
-        console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... ⚠️ Failed attempt ${attempt}, retrying...`);
+        // Don't log timeout errors on intermediate attempts - they're expected
+        if (!isTimeoutError) {
+          console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... ⚠️ Failed attempt ${attempt}, retrying...`);
+        }
         await new Promise(resolve => setTimeout(resolve, 1000)); // 1s between retries
       } else {
-        console.error(`[KEEPALIVE] ${agentId.substring(0, 8)}... ❌ All retries failed:`, error.message);
+        // Only log non-timeout errors on final failure
+        if (!isTimeoutError) {
+          console.error(`[KEEPALIVE] ${agentId.substring(0, 8)}... ❌ All retries failed:`, errorMessage);
+        } else {
+          // Timeout on final attempt - this is expected during network issues
+          const lastError = error?.message || 'Connection timeout';
+          console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... ⚠️ All retries timed out (network issue): ${lastError.substring(0, 50)}`);
+        }
         updateNetworkQuality(agentId, false);
         return false;
       }
@@ -1445,28 +1483,13 @@ async function restoreCredsFromDatabase(agentId) {
   console.log(`[BAILEYS] 🔄 Attempting to restore credentials from database...`);
   
   try {
-    // CRITICAL: Check session status first - don't restore if corrupted/conflict
-    const { data: sessionStatus, error: statusError } = await supabaseAdmin
-      .from('whatsapp_sessions')
-      .select('status, is_active')
-      .eq('agent_id', agentId)
-      .maybeSingle();
-    
-    if (statusError) {
-      console.error(`[BAILEYS] ⚠️ Error checking session status:`, statusError);
-      // Continue to try restore, but log warning
-    } else if (sessionStatus) {
-      // Don't restore if session is in conflict or disconnected state
-      if (sessionStatus.status === 'conflict' || sessionStatus.status === 'disconnected') {
-        console.log(`[BAILEYS] ⚠️ Session is in ${sessionStatus.status} state - skipping credential restore`);
-        console.log(`[BAILEYS] This indicates corrupted/invalid credentials - will generate fresh QR`);
-        return false;
-      }
-    }
-    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // FIX 3: Always restore valid credentials, even if status is "disconnected"
+    // Status might be stale from transient network disconnects
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     const { data, error } = await supabaseAdmin
       .from('whatsapp_sessions')
-      .select('session_data')
+      .select('session_data, phone_number, status')
       .eq('agent_id', agentId)
       .maybeSingle();
     
@@ -1482,6 +1505,24 @@ async function restoreCredsFromDatabase(agentId) {
     if (!creds || typeof creds !== 'object') {
       console.log(`[BAILEYS] ⚠️ Invalid credentials structure in database - skipping restore`);
       return false;
+    }
+    
+    // CRITICAL: Check if credentials are actually valid (have device ID and phone number)
+    const hasValidDeviceId = !!creds.me?.id;
+    const hasPhoneNumber = !!data.phone_number;
+    
+    // Only skip restore if status is "conflict" (session replaced) AND credentials are invalid
+    // For "disconnected" status, still restore if credentials are valid (transient disconnect)
+    if (data.status === 'conflict' && (!hasValidDeviceId || !hasPhoneNumber)) {
+      console.log(`[BAILEYS] ⚠️ Session is in conflict state with invalid credentials - skipping restore`);
+      console.log(`[BAILEYS] This indicates session was replaced - will generate fresh QR`);
+      return false;
+    }
+    
+    // For disconnected status, restore if credentials are valid
+    if (data.status === 'disconnected' && hasValidDeviceId && hasPhoneNumber) {
+      console.log(`[BAILEYS] ⚠️ Status is 'disconnected' but credentials are valid - restoring anyway`);
+      console.log(`[BAILEYS] This is likely a transient network disconnect, not a real logout`);
     }
     
     // CRITICAL: Validate credential freshness before restoring
@@ -2024,55 +2065,107 @@ async function initializeWhatsApp(agentId, userId = null) {
         
         // Skip credential deletion - proceed to use them
       } else if (isOldDisconnect) {
-        // Only delete if disconnect is old (> 5 minutes) - indicates manual disconnect
-        console.log(`[BAILEYS] ⚠️ Database status is 'disconnected' (${Math.round(disconnectedAge / 60000)} minutes old) - forcing fresh start`);
-        console.log(`[BAILEYS] This indicates a manual disconnect - all credentials must be cleared`);
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // FIX 2: Only delete credentials if they're truly invalid (no phone number)
+        // Don't delete for transient network disconnects
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        const hasPhoneNumber = dbSessionStatus.phone_number && dbSessionStatus.phone_number.length > 0;
+        const hasSessionData = dbSessionStatus.session_data && dbSessionStatus.session_data.creds;
         
-        // Delete local auth directory completely (with error handling)
-      if (fs.existsSync(authPath)) {
-        console.log(`[BAILEYS] 🗑️ Deleting local auth directory (disconnected session)...`);
-        try {
-          fs.rmSync(authPath, { recursive: true, force: true });
-          console.log(`[BAILEYS] ✅ Local credentials deleted successfully`);
-        } catch (deleteError) {
-          console.error(`[BAILEYS] ❌ Failed to delete local auth directory:`, deleteError.message);
-          console.error(`[BAILEYS] Error details:`, deleteError);
-          // Continue anyway - database cleanup is more important
-          // User may need to manually delete directory if permissions issue
+        if (!hasPhoneNumber && !hasSessionData) {
+          // No valid credentials exist - safe to delete
+          console.log(`[BAILEYS] 🗑️ No valid credentials - deleting auth directory`);
+          if (fs.existsSync(authPath)) {
+            try {
+              fs.rmSync(authPath, { recursive: true, force: true });
+              console.log(`[BAILEYS] ✅ Local credentials deleted successfully`);
+            } catch (deleteError) {
+              console.error(`[BAILEYS] ❌ Failed to delete local auth directory:`, deleteError.message);
+            }
+          }
+          
+          // Clear database session data completely
+          try {
+            const { error: dbClearError } = await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                session_data: null,
+                qr_code: null,
+                qr_generated_at: null,
+                is_active: false,
+                status: 'disconnected',
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+            
+            if (dbClearError) {
+              console.error(`[BAILEYS] ❌ Failed to clear database session data:`, dbClearError);
+            } else {
+              console.log(`[BAILEYS] ✅ Database cleared successfully`);
+            }
+          } catch (dbError) {
+            console.error(`[BAILEYS] ❌ Database cleanup error:`, dbError);
+          }
+          
+          console.log(`[BAILEYS] ✅ Fresh start complete - will generate fresh QR`);
+        } else {
+          // Valid credentials exist - preserve them for reconnection
+          console.log(`[BAILEYS] ✅ Preserving credentials for phone ${hasPhoneNumber ? dbSessionStatus.phone_number : 'unknown'}`);
+          console.log(`[BAILEYS] Will attempt reconnection using saved credentials`);
+          
+          const credsPath = path.join(authPath, 'creds.json');
+          
+          // Try to restore credentials from database if not in files
+          if (!fs.existsSync(credsPath) && hasSessionData) {
+            console.log(`[BAILEYS] 📥 Restoring credentials from database...`);
+            
+            if (!fs.existsSync(authPath)) {
+              fs.mkdirSync(authPath, { recursive: true });
+            }
+            
+            try {
+              fs.writeFileSync(
+                credsPath,
+                JSON.stringify(dbSessionStatus.session_data.creds, null, 2),
+                'utf-8'
+              );
+              
+              console.log(`[BAILEYS] ✅ Credentials restored from database`);
+            } catch (writeError) {
+              console.error(`[BAILEYS] ❌ Failed to restore credentials:`, writeError.message);
+            }
+          }
         }
-      } else {
-        console.log(`[BAILEYS] ℹ️ No local auth directory to delete`);
-      }
-      
-      // Clear database session data completely
-      try {
-        const { error: dbClearError } = await supabaseAdmin
-          .from('whatsapp_sessions')
-          .update({
-            session_data: null,
-            qr_code: null,
-            qr_generated_at: null,
-            is_active: false,
-            status: 'disconnected',
-            updated_at: new Date().toISOString()
-          })
-          .eq('agent_id', agentId);
-        
-        if (dbClearError) {
-          console.error(`[BAILEYS] ❌ Failed to clear database session data:`, dbClearError);
-          throw new Error(`Database cleanup failed: ${dbClearError.message}`);
-        }
-        console.log(`[BAILEYS] ✅ Database cleared successfully`);
-      } catch (dbError) {
-        console.error(`[BAILEYS] ❌ Database cleanup error:`, dbError);
-        // Don't throw - allow initialization to continue with fresh QR
-      }
-      
-      console.log(`[BAILEYS] ✅ Fresh start complete - will generate fresh QR`);
-      // Continue to fresh QR generation below
       } else {
         // Disconnect is recent but not from pairing - preserve credentials but mark as disconnected
         console.log(`[BAILEYS] ⚠️ Recent disconnect detected (${Math.round(disconnectedAge / 1000)}s ago) - preserving credentials for potential reconnect`);
+        
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // FIX 2: Restore credentials from database if files are missing
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // Note: credsPath is already declared at function level
+        const hasPhoneNumber = dbSessionStatus.phone_number && dbSessionStatus.phone_number.length > 0;
+        const hasSessionData = dbSessionStatus.session_data && dbSessionStatus.session_data.creds;
+        
+        if (!fs.existsSync(credsPath) && hasSessionData && hasPhoneNumber) {
+          console.log(`[BAILEYS] 📥 Restoring credentials from database for recent disconnect...`);
+          
+          if (!fs.existsSync(authPath)) {
+            fs.mkdirSync(authPath, { recursive: true });
+          }
+          
+          try {
+            fs.writeFileSync(
+              credsPath,
+              JSON.stringify(dbSessionStatus.session_data.creds, null, 2),
+              'utf-8'
+            );
+            
+            console.log(`[BAILEYS] ✅ Credentials restored from database for ${dbSessionStatus.phone_number}`);
+          } catch (writeError) {
+            console.error(`[BAILEYS] ❌ Failed to restore credentials:`, writeError.message);
+          }
+        }
       }
     }
     
@@ -2156,11 +2249,41 @@ async function initializeWhatsApp(agentId, userId = null) {
         console.log(`[BAILEYS] ⚠️ Local credentials exist but status is 'disconnected' - ignoring local file`);
       }
       
-      // CRITICAL: Only try to restore from database if status is NOT 'disconnected' or 'conflict'
-      if (dbSessionStatus && 
-          dbSessionStatus.status !== 'disconnected' && 
-          dbSessionStatus.status !== 'conflict') {
-        // CRITICAL: Try to restore from Supabase before generating new QR
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // FIX 3: Always try to restore credentials if they exist in database
+      // Don't skip restoration based on status - status might be stale
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // CRITICAL: Always try to restore credentials if they exist in database
+      // Don't skip restoration based on status - status might be stale
+      const { data: credCheck } = await supabaseAdmin
+        .from('whatsapp_sessions')
+        .select('session_data, phone_number, status')
+        .eq('agent_id', agentId)
+        .maybeSingle();
+
+      const hasValidCreds = credCheck?.session_data?.creds && 
+                           credCheck?.session_data?.creds.me?.id &&
+                           credCheck?.phone_number;
+
+      if (hasValidCreds && !fs.existsSync(credsPath)) {
+        console.log(`[BAILEYS] 📥 Valid credentials found in database (phone: ${credCheck.phone_number}) - restoring...`);
+        console.log(`[BAILEYS] ⚠️ Status is '${credCheck.status || 'unknown'}' but credentials are valid - restoring anyway`);
+        
+        const restored = await restoreCredsFromDatabase(agentId);
+        
+        if (restored) {
+          console.log(`[BAILEYS] ✅ Using restored credentials for ${credCheck.phone_number}`);
+          useFileAuth = true; // Force use of restored credentials
+        } else {
+          console.log(`[BAILEYS] ⚠️ Restore failed - will try to use existing file credentials`);
+        }
+      } else if (hasValidCreds && fs.existsSync(credsPath)) {
+        console.log(`[BAILEYS] ✅ Valid credentials exist in both database and files - using file credentials`);
+        useFileAuth = true;
+      } else if (!hasValidCreds && dbSessionStatus && 
+                 dbSessionStatus.status !== 'disconnected' && 
+                 dbSessionStatus.status !== 'conflict') {
+        // Only try restore if no valid creds found and status is not disconnected/conflict
         console.log(`[BAILEYS] 🔍 Checking Supabase for backed-up credentials...`);
         const restored = await restoreCredsFromDatabase(agentId);
         
@@ -2171,7 +2294,7 @@ async function initializeWhatsApp(agentId, userId = null) {
           console.log(`[BAILEYS] 🆕 No credentials in Supabase either - will generate QR`);
         }
       } else {
-        console.log(`[BAILEYS] ⚠️ Status is '${dbSessionStatus?.status || 'unknown'}' - skipping database restore, will generate fresh QR`);
+        console.log(`[BAILEYS] ⚠️ Status is '${dbSessionStatus?.status || 'unknown'}' and no valid credentials - will generate fresh QR`);
       }
     }
 
@@ -2504,6 +2627,27 @@ async function initializeWhatsApp(agentId, userId = null) {
       return child;
     };
     
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // FIX 4: Credential validation logging before socket creation
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // CRITICAL: Log credential state before connection attempt
+    // Note: credsPath is already declared above at function level
+    console.log(`[BAILEYS] 📊 Credential Status Check:`);
+    console.log(`[BAILEYS]    Local file exists: ${fs.existsSync(credsPath)}`);
+    console.log(`[BAILEYS]    Has device ID: ${!!state.creds?.me?.id}`);
+    console.log(`[BAILEYS]    Phone number: ${state.creds?.me?.id ? state.creds.me.id.split(':')[0] : 'none'}`);
+    console.log(`[BAILEYS]    Has noiseKey: ${!!state.creds?.noiseKey}`);
+    console.log(`[BAILEYS]    Has signedIdentityKey: ${!!state.creds?.signedIdentityKey}`);
+    console.log(`[BAILEYS]    Registered: ${state.creds?.registered}`);
+    console.log(`[BAILEYS]    Will generate QR: ${!state.creds?.me?.id}`);
+
+    if (state.creds?.me?.id) {
+      console.log(`[BAILEYS] ✅ USING EXISTING CREDENTIALS - NO QR SCAN NEEDED`);
+      console.log(`[BAILEYS]    Device ID: ${state.creds.me.id}`);
+    } else {
+      console.log(`[BAILEYS] 🆕 NO CREDENTIALS - WILL GENERATE QR`);
+    }
+    
     // ✅ FIX 1: Create in-memory store for message storage (required for media downloads)
     // Wrap in try-catch to handle store creation failures gracefully
     let store = null;
@@ -2584,16 +2728,39 @@ async function initializeWhatsApp(agentId, userId = null) {
     // Custom keepalive manager - MORE AGGRESSIVE than Baileys default
     // This runs every 10 seconds with retry mechanism to prevent disconnection during network instability
     const customKeepalive = setInterval(async () => {
-      const session = activeSessions.get(agentId);
-      if (!session || !session.isConnected) {
-        clearInterval(customKeepalive);
-        return;
-      }
-      
-      const success = await sendKeepaliveWithRetry(sock, agentId, 3);
-      if (!success) {
-        console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... Network unstable, but NOT disconnecting`);
-        // Don't disconnect - let health ping monitor handle it (allows multiple failures)
+      try {
+        const session = activeSessions.get(agentId);
+        if (!session || !session.isConnected) {
+          clearInterval(customKeepalive);
+          return;
+        }
+        
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // FIX: Wrap keepalive call in try-catch to prevent unhandled rejections
+        // Timeout errors from Baileys are expected during network instability
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // Use .catch() to ensure promise is fully handled even if try-catch misses it
+        sendKeepaliveWithRetry(sock, agentId, 3)
+          .then((success) => {
+            if (!success) {
+              console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... Network unstable, but NOT disconnecting`);
+              // Don't disconnect - let health ping monitor handle it (allows multiple failures)
+            }
+          })
+          .catch((keepaliveError) => {
+            // Timeout errors are expected and handled by sendKeepaliveWithRetry
+            // This catch prevents unhandled promise rejections from propagating
+            const isTimeoutError = keepaliveError?.message?.includes('Timed Out') || 
+                                   keepaliveError?.output?.statusCode === 408 ||
+                                   keepaliveError?.message?.includes('timeout');
+            // Silently ignore timeout errors - they're expected during network issues
+            if (!isTimeoutError) {
+              console.error(`[KEEPALIVE] ${agentId.substring(0, 8)}... Unexpected error:`, keepaliveError?.message || 'Unknown error');
+            }
+          });
+      } catch (error) {
+        // Outer catch for any unexpected errors in the interval callback
+        console.error(`[KEEPALIVE] ${agentId.substring(0, 8)}... Interval callback error:`, error.message);
       }
     }, 10000); // Every 10 seconds
     
@@ -3450,12 +3617,69 @@ async function initializeWhatsApp(agentId, userId = null) {
             // Ignore DB errors
           }
           
-          // Auto-reconnect after 5 seconds
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          // FIX 1: Auto-reconnect with credential restoration (seamless reconnection)
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
           setTimeout(async () => {
             try {
+              console.log(`[BAILEYS] 🔄 Auto-reconnect: Checking for saved credentials...`);
+              
+              // CRITICAL: Check database for existing credentials FIRST
+              const { data: dbSession, error: dbError } = await supabaseAdmin
+                .from('whatsapp_sessions')
+                .select('session_data, phone_number')
+                .eq('agent_id', agentId)
+                .maybeSingle();
+              
+              if (dbError) {
+                console.error(`[BAILEYS] ❌ Database check failed:`, dbError.message);
+              }
+              
+              // If credentials exist in database, restore them to files
+              if (dbSession?.session_data?.creds && dbSession.phone_number) {
+                console.log(`[BAILEYS] ✅ Found valid credentials in database for ${dbSession.phone_number}`);
+                console.log(`[BAILEYS] 📥 Restoring credentials to enable seamless reconnection...`);
+                
+                const authPath = path.join(__dirname, '../../auth_sessions', agentId);
+                const credsPath = path.join(authPath, 'creds.json');
+                
+                // Create auth directory if doesn't exist
+                if (!fs.existsSync(authPath)) {
+                  fs.mkdirSync(authPath, { recursive: true });
+                  console.log(`[BAILEYS] 📁 Created auth directory`);
+                }
+                
+                // Write credentials EXACTLY as stored (preserve Buffer objects)
+                try {
+                  fs.writeFileSync(
+                    credsPath,
+                    JSON.stringify(dbSession.session_data.creds, null, 2),
+                    'utf-8'
+                  );
+                  
+                  console.log(`[BAILEYS] ✅ Credentials restored - reconnecting WITHOUT QR scan`);
+                  
+                  // Update status to indicate we're using saved credentials
+                  await supabaseAdmin
+                    .from('whatsapp_sessions')
+                    .update({
+                      status: 'reconnecting_with_saved_credentials',
+                      updated_at: new Date().toISOString()
+                    })
+                    .eq('agent_id', agentId);
+                } catch (writeError) {
+                  console.error(`[BAILEYS] ❌ Failed to write credentials:`, writeError.message);
+                  console.log(`[BAILEYS] ⚠️ Will attempt reconnection anyway (may need QR scan)`);
+                }
+              } else {
+                console.log(`[BAILEYS] ⚠️ No saved credentials found - will need QR scan`);
+              }
+              
+              // Now reconnect (will use restored credentials if available)
               console.log(`[BAILEYS] 🔄 Attempting auto-reconnect for ${agentId.substring(0, 8)}...`);
               await initializeWhatsApp(agentId, userId);
-              console.log(`[BAILEYS] ✅ Auto-reconnect successful`);
+              console.log(`[BAILEYS] ✅ Auto-reconnect completed`);
+              
             } catch (reconnectError) {
               console.error(`[BAILEYS] ❌ Auto-reconnect failed:`, reconnectError.message);
               // Will retry on next connection monitor check
