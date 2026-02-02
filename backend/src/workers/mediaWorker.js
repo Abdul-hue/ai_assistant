@@ -70,8 +70,29 @@ mediaQueue.process(concurrency, async (job) => {
     }
     
     // ✅ FIX: Check if media already processed (prevent duplicate uploads)
+    // But still send webhook if it wasn't sent before
     if (messageRecord.media_url) {
       logger.info({ messageId, existingUrl: messageRecord.media_url }, 'Media already processed, skipping upload');
+      
+      // ✅ CRITICAL: Send webhook even if media is already processed (for retries)
+      if (job.data.metadata?.webhookPayload && messageRecord.media_url) {
+        try {
+          const { forwardMessageToWebhook } = require('../services/baileysService');
+          const webhookPayload = {
+            ...job.data.metadata.webhookPayload,
+            mediaUrl: messageRecord.media_url, // Use existing media URL
+            hasMediaUrl: true,
+          };
+          
+          logger.info({ messageId, mediaUrl: messageRecord.media_url }, 'Sending webhook for already-processed media');
+          await forwardMessageToWebhook(agentId, webhookPayload);
+          logger.info({ messageId }, 'Webhook sent successfully for already-processed media');
+        } catch (webhookError) {
+          // Log but don't fail - webhook is non-critical
+          logger.error({ messageId, error: webhookError.message }, 'Failed to send webhook for already-processed media');
+        }
+      }
+      
       return { success: true, messageId, reason: 'already_processed', media_url: messageRecord.media_url };
     }
     
@@ -248,6 +269,8 @@ mediaQueue.process(concurrency, async (job) => {
               // Log but don't fail the job - webhook is non-critical
               logger.error({ messageId, error: webhookError.message }, 'Failed to send webhook after upload');
             }
+          } else {
+            logger.warn({ messageId, hasMetadata: !!job.data.metadata, hasWebhookPayload: !!job.data.metadata?.webhookPayload }, 'Webhook payload missing - webhook will not be sent');
           }
         } catch (uploadError) {
           await uploadTimer.failed(uploadError);
@@ -415,6 +438,7 @@ async function queueMessage(messageData) {
     agentId,
     mimetype,
     hasMediaUrl,
+    metadata: metadata, // ✅ CRITICAL: Include metadata (contains webhookPayload)
     timestamp: new Date().toISOString()
   };
   

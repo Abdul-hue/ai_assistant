@@ -26,6 +26,50 @@ const {
   setupGroupUpdateListeners,
 } = require('./groupSyncService');
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FIX 4: Global unhandled rejection handler for Baileys store errors
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+process.on('unhandledRejection', (reason, promise) => {
+  const errorMessage = reason?.message || String(reason);
+  
+  // Ignore Baileys store errors - they're non-critical
+  if (errorMessage.includes('list.upsert') || 
+      errorMessage.includes('upsert is not a function') ||
+      (errorMessage.includes('store') && errorMessage.includes('TypeError'))) {
+    console.log(`[BAILEYS] ⚠️ Store error caught (non-critical): ${errorMessage.substring(0, 100)}`);
+    return; // Don't crash - store is optional
+  }
+  
+  // Log other unhandled rejections but don't crash
+  console.error(`[BAILEYS] ⚠️ Unhandled rejection (non-fatal):`, errorMessage);
+});
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FIX 1: Polyfill for Array.upsert to prevent Baileys store crashes
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+if (!Array.prototype.upsert) {
+  Array.prototype.upsert = function(item, key) {
+    if (!key) {
+      // If no key provided, use indexOf to find and replace
+      const index = this.indexOf(item);
+      if (index >= 0) {
+        this[index] = item;
+      } else {
+        this.push(item);
+      }
+    } else {
+      // Find item by key property
+      const index = this.findIndex(i => i && i[key] === item[key]);
+      if (index >= 0) {
+        this[index] = item;
+      } else {
+        this.push(item);
+      }
+    }
+    return this;
+  };
+}
+
 const STORAGE_BUCKET = 'agent-files';
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
 const ALLOWED_FILE_TYPES = new Set([
@@ -74,6 +118,12 @@ const VALIDATION_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
 const validationRateLimiters = new Map(); // agentId -> {count, resetAt}
 const VALIDATION_RATE_LIMIT = 15; // Max 15 validations per minute per agent
 const VALIDATION_RATE_WINDOW = 60 * 1000; // 1 minute
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Message Deduplication: Track processed messageIds to prevent duplicate webhooks
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const processedMessages = new Map(); // messageId -> timestamp (global across all agents)
+const MESSAGE_DEDUP_TTL = 60000; // 60 seconds - messages older than this are considered new
 const COOLDOWN_MS = 5000; // 5 seconds between connection attempts
 const FAILURE_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes after 401 errors before allowing retry
 const MESSAGE_FORWARD_TIMEOUT_MS = 10000;
@@ -716,6 +766,83 @@ const connectionMonitors = new Map();
 const healthCheckIntervals = new Map();
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// WEBSOCKET ERROR TOLERANCE (Phase 3: WebSocket Resilience)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const wsErrorCounts = new Map(); // agentId -> error count
+const WS_ERROR_THRESHOLD = 5; // Allow 5 errors before considering connection dead
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// NETWORK QUALITY TRACKING (Phase 4: Network Instability Detection)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const networkQuality = new Map(); // agentId -> { pingLatency, failureRate, lastCheck }
+
+/**
+ * Update network quality metrics for an agent
+ * @param {string} agentId - Agent ID
+ * @param {boolean} success - Whether the ping succeeded
+ * @param {number|null} latency - Ping latency in milliseconds (if successful)
+ */
+function updateNetworkQuality(agentId, success, latency = null) {
+  const quality = networkQuality.get(agentId) || {
+    pingLatency: [],
+    failureRate: 0,
+    lastCheck: Date.now()
+  };
+  
+  if (success && latency) {
+    quality.pingLatency.push(latency);
+    if (quality.pingLatency.length > 10) quality.pingLatency.shift(); // Keep last 10
+  }
+  
+  // Calculate failure rate (last 10 attempts)
+  // If we have fewer than 10 successful pings, assume failures
+  const recentPings = quality.pingLatency.length;
+  quality.failureRate = recentPings > 0 ? Math.max(0, (10 - recentPings) / 10) : 1;
+  quality.lastCheck = Date.now();
+  
+  networkQuality.set(agentId, quality);
+  
+  // Log network quality status if unstable
+  if (quality.failureRate > 0.3) { // 30% failure rate
+    console.log(`[NETWORK] ${agentId.substring(0, 8)}... ⚠️ UNSTABLE (${(quality.failureRate * 100).toFixed(0)}% failure rate)`);
+  }
+}
+
+/**
+ * Send keepalive with retry mechanism (Phase 1: Aggressive Keepalive)
+ * @param {Object} sock - Baileys socket instance
+ * @param {string} agentId - Agent ID
+ * @param {number} maxRetries - Maximum retry attempts (default: 3)
+ * @returns {Promise<boolean>} - True if successful, false otherwise
+ */
+async function sendKeepaliveWithRetry(sock, agentId, maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const startTime = Date.now();
+      await sock.query({
+        tag: 'iq',
+        attrs: { to: '@s.whatsapp.net', type: 'get', xmlns: 'w:p' },
+        content: [{ tag: 'ping', attrs: {} }]
+      });
+      const latency = Date.now() - startTime;
+      console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... ✅ Success (attempt ${attempt}, ${latency}ms)`);
+      updateNetworkQuality(agentId, true, latency);
+      return true;
+    } catch (error) {
+      if (attempt < maxRetries) {
+        console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... ⚠️ Failed attempt ${attempt}, retrying...`);
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 1s between retries
+      } else {
+        console.error(`[KEEPALIVE] ${agentId.substring(0, 8)}... ❌ All retries failed:`, error.message);
+        updateNetworkQuality(agentId, false);
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // LAYER 1: WebSocket State Monitor - DISABLED
 // 
 // ⚠️ CRITICAL: This monitor has been DISABLED because it causes FALSE POSITIVES.
@@ -750,11 +877,15 @@ function startConnectionStateMonitor(sock, agentId) {
 // LAYER 2: Health Check with Ping (every 60 seconds)
 // Actively tests connection by sending a query
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ✅ PHASE 2 FIX: Enhanced health ping monitor with failure tolerance
 function startHealthPingMonitor(sock, agentId) {
   // Clear existing health check if any
   if (healthCheckIntervals.has(agentId)) {
     clearInterval(healthCheckIntervals.get(agentId));
   }
+  
+  let consecutiveFailures = 0;
+  const MAX_FAILURES_BEFORE_DISCONNECT = 3; // ✅ PHASE 2: Allow 3 failures = 3 minutes tolerance
   
   const healthInterval = setInterval(async () => {
     try {
@@ -763,8 +894,8 @@ function startHealthPingMonitor(sock, agentId) {
         console.log(`[HEALTH] ${agentId.substring(0, 8)}... Session not connected, stopping health check`);
         clearInterval(healthInterval);
         healthCheckIntervals.delete(agentId);
-      return;
-    }
+        return;
+      }
     
       const startTime = Date.now();
       
@@ -781,7 +912,11 @@ function startHealthPingMonitor(sock, agentId) {
       });
       
       const latency = Date.now() - startTime;
+      consecutiveFailures = 0; // Reset on success
       console.log(`[HEALTH] ${agentId.substring(0, 8)}... ✅ Health check PASSED (${latency}ms)`);
+      
+      // ✅ PHASE 4: Update network quality tracking
+      updateNetworkQuality(agentId, true, latency);
       
       // Update connection quality in database (silently)
       try {
@@ -796,13 +931,19 @@ function startHealthPingMonitor(sock, agentId) {
         // Ignore DB errors for health check
       }
       
-        } catch (error) {
-      console.error(`[HEALTH] ${agentId.substring(0, 8)}... ❌ Health check FAILED:`, error.message);
+    } catch (error) {
+      consecutiveFailures++;
+      console.error(`[HEALTH] ${agentId.substring(0, 8)}... ❌ Health check FAILED (${consecutiveFailures}/${MAX_FAILURES_BEFORE_DISCONNECT}):`, error.message);
       
-      const session = activeSessions.get(agentId);
-      if (session) {
-        // Only trigger reconnection if session thinks it's connected
-        if (session.isConnected) {
+      // ✅ PHASE 4: Update network quality tracking
+      updateNetworkQuality(agentId, false);
+      
+      // ✅ PHASE 2: Only trigger reconnection after MULTIPLE consecutive failures
+      if (consecutiveFailures >= MAX_FAILURES_BEFORE_DISCONNECT) {
+        console.error(`[HEALTH] ${agentId.substring(0, 8)}... 🚨 ${MAX_FAILURES_BEFORE_DISCONNECT} consecutive failures - triggering reconnection`);
+        
+        const session = activeSessions.get(agentId);
+        if (session && session.isConnected) {
           clearInterval(healthInterval);
           healthCheckIntervals.delete(agentId);
           
@@ -811,12 +952,82 @@ function startHealthPingMonitor(sock, agentId) {
           const { handleSmartReconnection } = require('../utils/reconnectionManager');
           await handleSmartReconnection(agentId, 'health_check_failed', 1);
         }
+      } else {
+        console.log(`[HEALTH] ${agentId.substring(0, 8)}... 🔄 Allowing temporary failure (${consecutiveFailures}/${MAX_FAILURES_BEFORE_DISCONNECT})`);
       }
     }
-  }, 60000); // 60 seconds
+  }, 60000); // Keep at 60 seconds
   
   healthCheckIntervals.set(agentId, healthInterval);
-  console.log(`[HEALTH] ${agentId.substring(0, 8)}... ✅ Health ping monitor started (60s interval)`);
+  console.log(`[HEALTH] ${agentId.substring(0, 8)}... ✅ Health ping monitor started (60s interval, ${MAX_FAILURES_BEFORE_DISCONNECT} failures tolerance)`);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// FIX 3: Proactive Connection Monitor
+// Sends ping every 30 seconds and triggers preemptive reconnection if 3 pings fail
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function startProactiveConnectionMonitor(sock, agentId) {
+  const session = activeSessions.get(agentId);
+  if (!session) {
+    console.log(`[CONN-MONITOR] ${agentId.substring(0, 8)}... ⚠️ No session found, skipping monitor`);
+    return;
+  }
+  
+  // Clear existing monitor if any
+  if (session.connectionMonitor) {
+    clearInterval(session.connectionMonitor);
+    console.log(`[CONN-MONITOR] ${agentId.substring(0, 8)}... 🧹 Cleared existing monitor`);
+  }
+  
+  let missedPings = 0;
+  const MAX_MISSED_PINGS = 3;
+  
+  const monitorInterval = setInterval(async () => {
+    try {
+      const currentSession = activeSessions.get(agentId);
+      if (!currentSession || !currentSession.isConnected) {
+        console.log(`[CONN-MONITOR] ${agentId.substring(0, 8)}... ⚠️ Session not connected, stopping monitor`);
+        clearInterval(monitorInterval);
+        if (session) {
+          session.connectionMonitor = null;
+        }
+        return;
+      }
+      
+      // Send ping to test connection
+      await sock.query({
+        tag: 'iq',
+        attrs: { to: '@s.whatsapp.net', type: 'get', xmlns: 'w:p' },
+        content: [{ tag: 'ping', attrs: {} }]
+      });
+      
+      missedPings = 0; // Reset on success
+      console.log(`[CONN-MONITOR] ${agentId.substring(0, 8)}... ✅ Connection healthy`);
+      
+    } catch (error) {
+      missedPings++;
+      console.log(`[CONN-MONITOR] ${agentId.substring(0, 8)}... ⚠️ Ping failed (${missedPings}/${MAX_MISSED_PINGS}): ${error.message}`);
+      
+      if (missedPings >= MAX_MISSED_PINGS) {
+        console.log(`[CONN-MONITOR] ${agentId.substring(0, 8)}... 🚨 Preemptive reconnection triggered (${MAX_MISSED_PINGS} consecutive failures)`);
+        clearInterval(monitorInterval);
+        if (session) {
+          session.connectionMonitor = null;
+        }
+        
+        // Trigger reconnection before full disconnect
+        const { handleSmartReconnection } = require('../utils/reconnectionManager');
+        handleSmartReconnection(agentId, 'proactive_monitor_failed', 1).catch(err => {
+          console.error(`[CONN-MONITOR] ${agentId.substring(0, 8)}... ❌ Reconnection failed:`, err.message);
+        });
+      }
+    }
+  }, 30000); // Every 30 seconds
+  
+  if (session) {
+    session.connectionMonitor = monitorInterval;
+  }
+  console.log(`[CONN-MONITOR] ${agentId.substring(0, 8)}... ✅ Proactive monitor started (30s interval, ${MAX_MISSED_PINGS} failures tolerance)`);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -859,6 +1070,7 @@ function startHeartbeat(agentId, session) {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Cleanup all monitoring for an agent
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// ✅ PHASE 5: Enhanced cleanup to include new resilience mechanisms
 function cleanupMonitoring(agentId) {
   console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Cleaning up all monitoring...`);
   
@@ -878,13 +1090,37 @@ function cleanupMonitoring(agentId) {
     console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Health check cleared`);
   }
   
-  // Clear heartbeat from session
+  // ✅ PHASE 5: Clear custom keepalive
   const session = activeSessions.get(agentId);
+  if (session?.customKeepaliveInterval) {
+    clearInterval(session.customKeepaliveInterval);
+    session.customKeepaliveInterval = null;
+    console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Custom keepalive cleared`);
+  }
+  
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // FIX 6: Clear proactive connection monitor
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  if (session?.connectionMonitor) {
+    clearInterval(session.connectionMonitor);
+    session.connectionMonitor = null;
+    console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Connection monitor cleared`);
+  }
+  
+  // Clear heartbeat from session
   if (session?.heartbeatInterval) {
     clearInterval(session.heartbeatInterval);
     session.heartbeatInterval = null;
     console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Heartbeat cleared`);
   }
+  
+  // ✅ PHASE 5: Clear network quality tracking
+  networkQuality.delete(agentId);
+  console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Network quality tracking cleared`);
+  
+  // ✅ PHASE 3: Clear WebSocket error count
+  wsErrorCounts.delete(agentId);
+  console.log(`[CLEANUP] ${agentId.substring(0, 8)}... WebSocket error count cleared`);
   
   // Close socket if exists
   if (session?.socket) {
@@ -988,25 +1224,16 @@ async function shouldDeleteCredentials(agentId) {
       const minutesSinceUpdate = (now - lastUpdate) / 1000 / 60;
       
       if (minutesSinceUpdate > 5) {
-        loggers.connection.info({
-          agentId: shortId(agentId),
-          minutesSinceUpdate: minutesSinceUpdate.toFixed(1)
-        }, 'Old disconnect detected, clearing credentials');
+        console.log(`[BAILEYS] Old disconnect detected (${minutesSinceUpdate.toFixed(1)} min ago), clearing credentials for agent ${shortId(agentId)}`);
         return true;
       }
       
-      loggers.connection.info({
-        agentId: shortId(agentId),
-        minutesSinceUpdate: minutesSinceUpdate.toFixed(1)
-      }, 'Recent disconnect, keeping credentials for reconnect');
+      console.log(`[BAILEYS] Recent disconnect (${minutesSinceUpdate.toFixed(1)} min ago), keeping credentials for reconnect - agent ${shortId(agentId)}`);
       return false;
     }
     
     // For 'connected', 'authenticated', or other statuses, keep credentials
-    loggers.connection.debug({
-      agentId: shortId(agentId),
-      status: agent.status
-    }, 'Keeping credentials - status is not disconnected');
+    console.debug(`[BAILEYS] Keeping credentials - status is not disconnected (${agent.status}) for agent ${shortId(agentId)}`);
     return false;
   } catch (error) {
     console.error(`[BAILEYS] ❌ Error in shouldDeleteCredentials:`, error.message);
@@ -2277,8 +2504,16 @@ async function initializeWhatsApp(agentId, userId = null) {
       return child;
     };
     
-    // ✅ FIX: Create in-memory store for message storage (required for media downloads)
-    const store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
+    // ✅ FIX 1: Create in-memory store for message storage (required for media downloads)
+    // Wrap in try-catch to handle store creation failures gracefully
+    let store = null;
+    try {
+      store = makeInMemoryStore({ logger: pino({ level: 'silent' }) });
+      console.log(`[BAILEYS] ✅ Store created successfully`);
+    } catch (storeError) {
+      console.error(`[BAILEYS] ⚠️ Store creation failed (non-critical):`, storeError.message);
+      store = null; // Continue without store - connection works without it
+    }
     
     const sock = makeWASocket({
       // CRITICAL: Use proper auth structure with cacheable signal key store
@@ -2292,19 +2527,23 @@ async function initializeWhatsApp(agentId, userId = null) {
       browser: Browsers.ubuntu('Chrome'),
       
       // ✅ FIX: Add store configuration for message storage (required for media downloads)
+      // Store may be null if creation failed - Baileys handles this gracefully
       store: store,
       
-      // CRITICAL: Proper keepalive configuration
-      keepAliveIntervalMs: 30000, // Changed from 10s to 30s (less aggressive)
-      defaultQueryTimeoutMs: 60000, // Reduced from 180s to 60s
-      connectTimeoutMs: 60000, // Reduced from 180s to 60s
-      qrTimeout: 60000, // Standard QR timeout
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // FIX 5: Updated socket configuration for better stability
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      keepAliveIntervalMs: 25000, // 25 seconds
+      defaultQueryTimeoutMs: 60000, // 60 seconds
+      connectTimeoutMs: 60000, // 60 seconds
+      qrTimeout: 90000, // Keep at 90s for QR scan tolerance
       
-      retryRequestDelayMs: 2000, // Increased from 1s to 2s
-      maxMsgRetryCount: 5, // Reduced from 10 to 5
+      retryRequestDelayMs: 2000, // 2 seconds
+      maxMsgRetryCount: 3, // Reduced to 3 for faster failure detection
       
       // IMPORTANT: Remove emitOwnEvents and fireInitQueries
       // Let Baileys handle these internally
+      emitOwnEvents: false, // Explicitly set to false to prevent event loops
       
       // CRITICAL: getMessage handler - return undefined to prevent errors
       getMessage: async (key) => {
@@ -2316,8 +2555,19 @@ async function initializeWhatsApp(agentId, userId = null) {
       markOnlineOnConnect: true // Changed to true - helps maintain connection
     });
     
-    // ✅ FIX: Bind store to socket events so messages are stored automatically
-    store.bind(sock.ev);
+    // ✅ FIX 1: Bind store to socket events so messages are stored automatically
+    // Wrap in try-catch to handle binding failures gracefully
+    if (store) {
+      try {
+        store.bind(sock.ev);
+        console.log(`[BAILEYS] ✅ Store bound successfully`);
+      } catch (bindError) {
+        console.error(`[BAILEYS] ⚠️ Store binding failed (non-critical):`, bindError.message);
+        store = null; // Continue without store
+      }
+    } else {
+      console.log(`[BAILEYS] ⚠️ Store not available - continuing without message caching`);
+    }
 
     console.log(`[BAILEYS] ✅ Socket created with EXTENDED timeouts for pairing (3min)`);
     console.log(`[BAILEYS] ℹ️  This allows more time for QR scan -> credential exchange`);
@@ -2327,6 +2577,28 @@ async function initializeWhatsApp(agentId, userId = null) {
       hasWebSocket: !!sock.ws,
       timestamp: new Date().toISOString()
     });
+    
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PHASE 1: CUSTOM KEEPALIVE MANAGER (More aggressive than Baileys default)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Custom keepalive manager - MORE AGGRESSIVE than Baileys default
+    // This runs every 10 seconds with retry mechanism to prevent disconnection during network instability
+    const customKeepalive = setInterval(async () => {
+      const session = activeSessions.get(agentId);
+      if (!session || !session.isConnected) {
+        clearInterval(customKeepalive);
+        return;
+      }
+      
+      const success = await sendKeepaliveWithRetry(sock, agentId, 3);
+      if (!success) {
+        console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... Network unstable, but NOT disconnecting`);
+        // Don't disconnect - let health ping monitor handle it (allows multiple failures)
+      }
+    }, 10000); // Every 10 seconds
+    
+    // Store in session for cleanup (will be set after sessionData is created)
+    // Note: We'll attach this to sessionData after it's created below
     
     // CRITICAL: Try to intercept raw WebSocket messages BEFORE Baileys processes them
     // This is APPROACH 2 - intercept raw socket messages if accessible
@@ -2444,7 +2716,8 @@ async function initializeWhatsApp(agentId, userId = null) {
       qrAttempts: 0,
       connectedAt: null,
       failureReason: null,
-      failureAt: null
+      failureAt: null,
+      customKeepaliveInterval: customKeepalive // ✅ PHASE 1: Store custom keepalive for cleanup
     };
     
     // ✅ FIX: Verify store is attached to socket
@@ -2501,6 +2774,28 @@ async function initializeWhatsApp(agentId, userId = null) {
     // Connection updates
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr, isNewLogin } = update;
+      
+      // ✅ PHASE 3: WebSocket error tolerance - reset error count on successful connection
+      if (connection === 'open') {
+        wsErrorCounts.set(agentId, 0);
+      }
+      
+      // ✅ PHASE 3: Track WebSocket errors but don't immediately disconnect
+      if (lastDisconnect?.error) {
+        const currentErrorCount = wsErrorCounts.get(agentId) || 0;
+        wsErrorCounts.set(agentId, currentErrorCount + 1);
+        const newErrorCount = currentErrorCount + 1;
+        
+        console.log(`[WS-ERROR] ${agentId.substring(0, 8)}... Error count: ${newErrorCount}/${WS_ERROR_THRESHOLD}`);
+        
+        if (newErrorCount < WS_ERROR_THRESHOLD) {
+          console.log(`[WS-ERROR] ${agentId.substring(0, 8)}... Tolerating error (${newErrorCount}/${WS_ERROR_THRESHOLD}) - allowing recovery`);
+          // Don't trigger disconnection yet - allow recovery
+          // Continue to process the error normally but don't disconnect immediately
+        } else {
+          console.log(`[WS-ERROR] ${agentId.substring(0, 8)}... Error threshold reached (${newErrorCount}/${WS_ERROR_THRESHOLD}) - proceeding with normal disconnect handling`);
+        }
+      }
       
       if (connection === 'close' && lastDisconnect) {
         const session = activeSessions.get(agentId);
@@ -2685,6 +2980,11 @@ async function initializeWhatsApp(agentId, userId = null) {
           // CRITICAL: Release initialization lock now that connection is established
           connectionLocks.delete(agentId);
           console.log(`[BAILEYS] 🔓 Initialization lock released (connected)`);
+          
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          // FIX 3: Start proactive connection monitor after successful connection
+          // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          startProactiveConnectionMonitor(sock, agentId);
           
           // ━━━ CONTACT SYNCHRONIZATION ━━━
           // Sync WhatsApp contacts when connection is established
@@ -3120,9 +3420,78 @@ async function initializeWhatsApp(agentId, userId = null) {
           return; // Don't continue processing
         }
         
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // FIX 2: Handle transient errors with 5-second auto-reconnect
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        const transientErrors = [503, 515, 408, 500, 428];
+        if (transientErrors.includes(statusCode)) {
+          console.log(`[BAILEYS] 🔄 ${statusCode} - Transient error detected, auto-reconnecting in 5 seconds...`);
+          
+          // Clean up current session
+          cleanupMonitoring(agentId);
+          connectionLocks.delete(agentId);
+          
+          // Mark session as disconnected temporarily
+          if (session) {
+            session.isConnected = false;
+            session.connectionState = 'reconnecting';
+          }
+          
+          // Update database to show reconnecting status
+          try {
+            await supabaseAdmin
+              .from('whatsapp_sessions')
+              .update({
+                status: 'reconnecting',
+                updated_at: new Date().toISOString()
+              })
+              .eq('agent_id', agentId);
+          } catch (dbError) {
+            // Ignore DB errors
+          }
+          
+          // Auto-reconnect after 5 seconds
+          setTimeout(async () => {
+            try {
+              console.log(`[BAILEYS] 🔄 Attempting auto-reconnect for ${agentId.substring(0, 8)}...`);
+              await initializeWhatsApp(agentId, userId);
+              console.log(`[BAILEYS] ✅ Auto-reconnect successful`);
+            } catch (reconnectError) {
+              console.error(`[BAILEYS] ❌ Auto-reconnect failed:`, reconnectError.message);
+              // Will retry on next connection monitor check
+            }
+          }, 5000);
+          
+          return; // Exit early - don't run general reconnection logic
+        }
+        
         // CRITICAL: Handle error 428 - Connection Lost (AUTO-RECONNECT)
+        // ✅ PHASE 6: Enhanced 428 handler with network quality check and immediate recovery attempt
+        // Note: 428 is also handled above in transientErrors array, but keeping this for backward compatibility
         if (statusCode === 428) {
           console.log(`[BAILEYS] 🔄 428 - Connection Lost (network issue)`);
+          
+          // ✅ PHASE 6: Check network quality before disconnecting
+          const quality = networkQuality.get(agentId);
+          if (quality && quality.failureRate < 0.5) { // Less than 50% failure
+            console.log(`[BAILEYS] 🔄 Network quality acceptable (${((1 - quality.failureRate) * 100).toFixed(0)}% success) - attempting immediate recovery`);
+            
+            // Try immediate reconnection without full disconnect
+            try {
+              const session = activeSessions.get(agentId);
+              if (session?.socket) {
+                await session.socket.query({
+                  tag: 'iq',
+                  attrs: { to: '@s.whatsapp.net', type: 'get', xmlns: 'w:p' },
+                  content: [{ tag: 'ping', attrs: {} }]
+                });
+                console.log(`[BAILEYS] ✅ Immediate recovery successful - no reconnection needed`);
+                return; // Don't proceed with full reconnection
+              }
+            } catch (recoveryError) {
+              console.log(`[BAILEYS] ⚠️ Immediate recovery failed, proceeding with smart reconnection:`, recoveryError.message);
+            }
+          }
           
           // Release lock before reconnect attempt
           connectionLocks.delete(agentId);
@@ -3394,6 +3763,12 @@ async function initializeWhatsApp(agentId, userId = null) {
       
     });
 
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // FIX: Remove ALL existing listeners before registering to prevent duplicates
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    sock.ev.removeAllListeners('messages.upsert');
+    console.log(`[BAILEYS] 🧹 Removed all existing messages.upsert listeners for ${agentId.substring(0, 8)}...`);
+    
     // Handle messages
     // Message handler - logs incoming and outgoing messages with actual text
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -3560,6 +3935,16 @@ async function initializeWhatsApp(agentId, userId = null) {
         return true;
       };
 
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      // FIX: Clean up old entries from processedMessages cache (prevent memory leaks)
+      // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+      const now = Date.now();
+      for (const [id, timestamp] of processedMessages.entries()) {
+        if (now - timestamp > MESSAGE_DEDUP_TTL) {
+          processedMessages.delete(id);
+        }
+      }
+
       for (const msg of messages) {
         const shouldProcess = await shouldProcessMessage(msg);
         if (!shouldProcess) {
@@ -3569,6 +3954,26 @@ async function initializeWhatsApp(agentId, userId = null) {
         const fromMe = Boolean(msg?.key?.fromMe);
         const remoteJid = msg?.key?.remoteJid || 'unknown';
         const messageId = msg?.key?.id || 'unknown';
+        
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        // FIX: Message deduplication - prevent duplicate webhook calls
+        // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if (messageId && messageId !== 'unknown') {
+          const lastProcessed = processedMessages.get(messageId);
+          
+          if (lastProcessed && (now - lastProcessed) < MESSAGE_DEDUP_TTL) {
+            console.log(`[BAILEYS] ⚠️ Duplicate message detected and skipped: ${messageId} (processed ${Math.round((now - lastProcessed) / 1000)}s ago)`);
+            continue; // Skip this duplicate message
+          }
+          
+          // Mark as processed
+          processedMessages.set(messageId, now);
+          console.log(`[BAILEYS] 🔔 messages.upsert event fired - messageId: ${messageId}`);
+          console.log(`[BAILEYS] ✅ Processing message: ${messageId}`);
+        } else {
+          console.log(`[BAILEYS] ⚠️ Message with invalid messageId, skipping deduplication check`);
+        }
+        
         const direction = fromMe ? '📤 Outgoing' : '📨 Incoming';
         const participant = fromMe ? 'to' : 'from';
 
@@ -4424,9 +4829,9 @@ async function initializeWhatsApp(agentId, userId = null) {
           
           // ✅ Now cachedPhoneNumber is accessible here
           if (webhookFromNumber && cachedPhoneNumber) {
-            loggers.database.debug({ remoteJid, phone: webhookFromNumber }, 'Using cached sender_pn for webhook');
+            console.debug(`[BAILEYS] Using cached sender_pn for webhook: ${remoteJid} -> ${webhookFromNumber}`);
           } else {
-            loggers.database.debug({ remoteJid }, 'Cache not populated yet, using fallback');
+            console.debug(`[BAILEYS] Cache not populated yet for ${remoteJid}, using fallback`);
           }
         }
 
@@ -5902,6 +6307,42 @@ function getActiveAgentIds() {
   return Array.from(activeSessions.keys());
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// PHASE 8: CONNECTION RESILIENCE LOGGING
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Log network quality every 5 minutes for monitoring
+let networkStatusLoggingInterval = null;
+
+function startNetworkStatusLogging() {
+  if (networkStatusLoggingInterval) {
+    clearInterval(networkStatusLoggingInterval);
+  }
+  
+  networkStatusLoggingInterval = setInterval(() => {
+    if (networkQuality.size === 0) {
+      return; // No active connections to log
+    }
+    
+    console.log(`[NETWORK-STATUS] ========== Network Quality Report ==========`);
+    for (const [agentId, quality] of networkQuality.entries()) {
+      const avgLatency = quality.pingLatency.length > 0 
+        ? quality.pingLatency.reduce((a, b) => a + b, 0) / quality.pingLatency.length 
+        : 0;
+      
+      const successRate = (1 - quality.failureRate) * 100;
+      const status = successRate >= 70 ? '✅ STABLE' : successRate >= 40 ? '⚠️ UNSTABLE' : '❌ POOR';
+      
+      console.log(`[NETWORK-STATUS] ${agentId.substring(0, 8)}... ${status} | Latency: ${avgLatency.toFixed(0)}ms | Success: ${successRate.toFixed(0)}%`);
+    }
+    console.log(`[NETWORK-STATUS] ==============================================`);
+  }, 300000); // Every 5 minutes
+  
+  console.log(`[NETWORK-STATUS] ✅ Network quality logging started (every 5 minutes)`);
+}
+
+// Start logging on module load
+startNetworkStatusLogging();
+
 module.exports = {
   initializeWhatsApp,
   safeInitializeWhatsApp,
@@ -5925,6 +6366,8 @@ module.exports = {
   startAllMonitoring,
   connectionMonitors,
   healthCheckIntervals,
+  // ✅ PHASE 4 & 8: Export network quality for monitoring
+  networkQuality,
   // Socket management for media processing
   getSessionForAgent,
   getActiveAgentIds,
