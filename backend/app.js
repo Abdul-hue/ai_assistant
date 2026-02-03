@@ -232,23 +232,7 @@ const allowedOrigins = [
 const uniqueAllowedOrigins = [...new Set(allowedOrigins)].filter(Boolean);
 
 const corsOptions = {
-  origin: (origin, callback) => {
-    // Allow same-origin requests (no origin header) - these are safe
-    // Same-origin requests occur when browser loads page from same host
-    if (!origin) {
-      // In production, allow same-origin requests (browser loading frontend from same server)
-      // This is safe because same-origin requests don't need CORS protection
-      return callback(null, true);
-    }
-    
-    // SECURITY: Exact match only - no wildcards or pattern matching
-    if (uniqueAllowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    
-    console.warn(`⚠️ SECURITY: CORS rejected unauthorized origin: ${origin}`);
-    return callback(new Error('Not allowed by CORS'), false);
-  },
+  origin: true, // ✅ Allow all origins (CORS for everyone)
   credentials: true, // ✅ CRITICAL: Required for HttpOnly cookies
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Idempotency-Key'], // ✅ Allow idempotency header
@@ -260,10 +244,7 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
-console.log('✅ CORS configured for', uniqueAllowedOrigins.length, 'origins');
-if (process.env.NODE_ENV !== 'production') {
-  console.log('   Allowed origins:', uniqueAllowedOrigins.join(', '));
-}
+console.log('✅ CORS configured to allow all origins');
 
 // ============================================================================
 // RATE LIMITING - SELECTIVE (Security Enhancement)
