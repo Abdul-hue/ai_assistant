@@ -66,12 +66,22 @@ router.post('/session', async (req, res) => {
     }
 
     // Set HttpOnly cookies for both access and refresh tokens
+    const isProduction = process.env.NODE_ENV === 'production';
     const COOKIE_OPTIONS_BASE = {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
+      secure: isProduction, // true only in production (HTTPS required)
+      sameSite: 'lax', // Changed from 'strict' to 'lax' for same-domain setup
       path: '/',
     };
+
+    // DEBUG: Log cookie configuration
+    console.log('🍪 Setting cookies with config:', {
+      httpOnly: COOKIE_OPTIONS_BASE.httpOnly,
+      secure: COOKIE_OPTIONS_BASE.secure,
+      sameSite: COOKIE_OPTIONS_BASE.sameSite,
+      environment: process.env.NODE_ENV,
+      isProduction: isProduction,
+    });
 
     res.cookie('sb_access_token', access_token, {
       ...COOKIE_OPTIONS_BASE,
@@ -87,6 +97,12 @@ router.post('/session', async (req, res) => {
 
     console.log('✅ Supabase session cookies set for:', user.email);
     
+    // DEBUG: Log response headers (temporary - remove in production later)
+    const setCookieHeaders = res.getHeader('Set-Cookie');
+    if (setCookieHeaders) {
+      console.log('📤 Set-Cookie headers:', Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders]);
+    }
+    
     const responseData = { 
       success: true,
       message: 'Session cookies created',
@@ -96,6 +112,17 @@ router.post('/session', async (req, res) => {
         role: user.user_metadata?.role || 'user',
         fullName: user.user_metadata?.full_name,
         avatarUrl: user.user_metadata?.avatar_url,
+      },
+      // DEBUG: Include cookie config in response (remove in production later)
+      debug: isProduction ? undefined : {
+        cookieConfig: {
+          httpOnly: COOKIE_OPTIONS_BASE.httpOnly,
+          secure: COOKIE_OPTIONS_BASE.secure,
+          sameSite: COOKIE_OPTIONS_BASE.sameSite,
+          path: COOKIE_OPTIONS_BASE.path,
+        },
+        environment: process.env.NODE_ENV,
+        isProduction: isProduction
       }
     };
 
@@ -261,20 +288,17 @@ router.get('/session-token', authMiddleware, async (req, res) => {
 router.post('/logout', (req, res) => {
   console.log('👋 User logging out');
   
-  // Clear both Supabase cookies
-  res.clearCookie('sb_access_token', { 
+  // Clear both Supabase cookies (must match original cookie settings)
+  const isProduction = process.env.NODE_ENV === 'production';
+  const clearCookieOptions = {
     path: '/',
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict'
-  });
+    secure: isProduction,
+    sameSite: 'lax' // Changed from 'strict' to 'lax' to match cookie setting
+  };
   
-  res.clearCookie('sb_refresh_token', { 
-    path: '/',
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'strict'
-  });
+  res.clearCookie('sb_access_token', clearCookieOptions);
+  res.clearCookie('sb_refresh_token', clearCookieOptions);
   
   res.json({ 
     success: true, 

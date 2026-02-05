@@ -5,8 +5,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useToast } from '@/hooks/use-toast';
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+import { API_URL } from '@/config';
 
 // WhatsApp Contact interface
 export interface WhatsAppContact {
@@ -263,6 +262,85 @@ export function useToggleGroupImportant(agentId: string) {
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['whatsapp-groups', agentId] });
+    },
+  });
+}
+
+/**
+ * Delete a single group
+ */
+export function useDeleteGroup() {
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+
+  return useMutation<unknown, Error, { agentId: string; groupId: string }>({
+    mutationFn: async ({ agentId, groupId }) => {
+      const response = await fetch(`${API_URL}/api/agents/${agentId}/groups/${groupId}`, {
+        method: 'DELETE',
+        credentials: 'include',
+      });
+
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => ({}));
+        throw new Error(errorPayload.error || 'Failed to delete group');
+      }
+
+      return response.json();
+    },
+    onSuccess: (_, variables) => {
+      toast({
+        title: 'Group deleted',
+        description: 'The group was removed successfully.',
+      });
+      queryClient.invalidateQueries({ queryKey: ['whatsapp-groups', variables.agentId] });
+    },
+    onError: (error) => {
+      toast({
+        variant: 'destructive',
+        title: 'Delete failed',
+        description: error.message,
+      });
+    },
+  });
+}
+
+/**
+ * Delete all groups for an agent
+ */
+export function useDeleteAllGroups() {
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+
+  return useMutation<unknown, Error, string>({
+    mutationFn: async (agentId) => {
+      const response = await fetch(`${API_URL}/api/agents/${agentId}/groups`, {
+        method: 'DELETE',
+        credentials: 'include',
+      });
+
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => ({}));
+        throw new Error(errorPayload.error || 'Failed to delete groups');
+      }
+
+      return response.json();
+    },
+    onSuccess: (data: { deleted_count?: number }, agentId) => {
+      const count = data?.deleted_count ?? 0;
+      toast({
+        title: 'All groups deleted',
+        description: count > 0 
+          ? `Successfully deleted ${count} group${count !== 1 ? 's' : ''}.`
+          : 'All groups were removed successfully.',
+      });
+      queryClient.invalidateQueries({ queryKey: ['whatsapp-groups', agentId] });
+    },
+    onError: (error) => {
+      toast({
+        variant: 'destructive',
+        title: 'Delete failed',
+        description: error.message,
+      });
     },
   });
 }

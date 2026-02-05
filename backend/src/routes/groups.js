@@ -193,4 +193,100 @@ router.patch('/contacts/:contactId/important', authMiddleware, async (req, res) 
   }
 });
 
+/**
+ * DELETE /api/groups/:groupId
+ * Delete a specific group by ID
+ */
+router.delete('/:groupId', authMiddleware, async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const userId = req.user.id;
+
+    // Verify group belongs to user's agent
+    const { data: group, error: groupError } = await supabaseAdmin
+      .from('groups')
+      .select('id, agent_id, name, agents!inner(user_id)')
+      .eq('id', groupId)
+      .single();
+
+    if (groupError || !group) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    // Check if agent belongs to user
+    const agentUserId = group.agents?.user_id || (group.agents && Array.isArray(group.agents) ? group.agents[0]?.user_id : null);
+    if (agentUserId !== userId) {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    // Delete the group (cascade will handle group_participants)
+    const { error: deleteError } = await supabaseAdmin
+      .from('groups')
+      .delete()
+      .eq('id', groupId)
+      .eq('agent_id', group.agent_id);
+
+    if (deleteError) {
+      console.error('[GROUPS] Failed to delete group:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete group' });
+    }
+
+    console.log('[GROUPS] Group deleted successfully:', { groupId, groupName: group.name });
+    return res.json({ 
+      success: true,
+      message: 'Group deleted successfully' 
+    });
+  } catch (error) {
+    console.error('[GROUPS] Delete group error:', error);
+    return res.status(500).json({ error: 'Failed to delete group' });
+  }
+});
+
+/**
+ * DELETE /api/groups/agent/:agentId
+ * Delete all groups for an agent
+ */
+router.delete('/agent/:agentId', authMiddleware, async (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const userId = req.user.id;
+
+    // Verify agent belongs to user
+    const { data: agent, error: agentError } = await supabaseAdmin
+      .from('agents')
+      .select('id')
+      .eq('id', agentId)
+      .eq('user_id', userId)
+      .single();
+
+    if (agentError || !agent) {
+      return res.status(404).json({ error: 'Agent not found or unauthorized' });
+    }
+
+    // Delete all groups for this agent (cascade will handle group_participants)
+    const { data: deletedGroups, error: deleteError } = await supabaseAdmin
+      .from('groups')
+      .delete()
+      .eq('agent_id', agentId)
+      .select('id');
+
+    if (deleteError) {
+      console.error('[GROUPS] Failed to delete groups:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete groups' });
+    }
+
+    const count = deletedGroups?.length || 0;
+    console.log('[GROUPS] All groups deleted successfully:', { agentId, count });
+    
+    return res.json({ 
+      success: true,
+      message: 'All groups deleted successfully', 
+      deleted_count: count 
+    });
+  } catch (error) {
+    console.error('[GROUPS] Delete all groups error:', error);
+    return res.status(500).json({ error: 'Failed to delete groups' });
+  }
+});
+
 module.exports = router;

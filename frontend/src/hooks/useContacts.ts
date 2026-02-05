@@ -99,6 +99,7 @@ export const useDeleteContact = () => {
       });
       queryClient.invalidateQueries({ queryKey: ['contacts', variables.agentId] });
       queryClient.invalidateQueries({ queryKey: ['contactCount', variables.agentId] });
+      queryClient.invalidateQueries({ queryKey: ['whatsapp-contacts', variables.agentId] });
     },
     onError: (error) => {
       toast({
@@ -128,13 +129,17 @@ export const useDeleteAllContacts = () => {
 
       return response.json();
     },
-    onSuccess: (_, agentId) => {
+    onSuccess: (data: { deleted_count?: number }, agentId) => {
+      const count = data?.deleted_count ?? 0;
       toast({
-        title: 'Contacts deleted',
-        description: 'All contacts were removed successfully.',
+        title: 'All contacts deleted',
+        description: count > 0 
+          ? `Successfully deleted ${count} contact${count !== 1 ? 's' : ''}.`
+          : 'All contacts were removed successfully.',
       });
       queryClient.invalidateQueries({ queryKey: ['contacts', agentId] });
       queryClient.invalidateQueries({ queryKey: ['contactCount', agentId] });
+      queryClient.invalidateQueries({ queryKey: ['whatsapp-contacts', agentId] });
     },
     onError: (error) => {
       toast({

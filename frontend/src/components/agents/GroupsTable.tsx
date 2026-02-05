@@ -1,6 +1,7 @@
-import { useWhatsAppGroups, useToggleGroupImportant } from '@/hooks/useWhatsAppData';
+import { useWhatsAppGroups, useToggleGroupImportant, useDeleteGroup, useDeleteAllGroups } from '@/hooks/useWhatsAppData';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ImportantStar } from '@/components/ui/ImportantStar';
+import { Button } from '@/components/ui/button';
 import {
   Table,
   TableBody,
@@ -9,11 +10,23 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { 
   Users, 
   Loader2,
-  AlertCircle
+  AlertCircle,
+  Trash2
 } from 'lucide-react';
+import { useState } from 'react';
 
 interface GroupsTableProps {
   agentId: string;
@@ -22,12 +35,46 @@ interface GroupsTableProps {
 export default function GroupsTable({ agentId }: GroupsTableProps) {
   const { data: groups = [], isLoading, error } = useWhatsAppGroups(agentId);
   const toggleImportant = useToggleGroupImportant(agentId);
+  const deleteGroup = useDeleteGroup();
+  const deleteAllGroups = useDeleteAllGroups();
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deleteAllDialogOpen, setDeleteAllDialogOpen] = useState(false);
+  const [groupToDelete, setGroupToDelete] = useState<{ id: string; name: string } | null>(null);
 
   const handleToggleImportant = async (groupId: string, currentValue: boolean) => {
     await toggleImportant.mutateAsync({
       groupId,
       is_important: !currentValue,
     });
+  };
+
+  const handleDeleteClick = (group: { id: string; groupName: string }) => {
+    setGroupToDelete({ id: group.id, name: group.groupName });
+    setDeleteDialogOpen(true);
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!groupToDelete) return;
+    
+    try {
+      await deleteGroup.mutateAsync({
+        agentId,
+        groupId: groupToDelete.id,
+      });
+      setDeleteDialogOpen(false);
+      setGroupToDelete(null);
+    } catch (error) {
+      // Error is handled by the hook's onError
+    }
+  };
+
+  const handleDeleteAll = async () => {
+    try {
+      await deleteAllGroups.mutateAsync(agentId);
+      setDeleteAllDialogOpen(false);
+    } catch (error) {
+      // Error is handled by the hook's onError
+    }
   };
 
   if (isLoading) {
@@ -68,10 +115,24 @@ export default function GroupsTable({ agentId }: GroupsTableProps) {
 
   return (
     <div className="space-y-4">
-      {/* Group Count */}
-      <div className="flex items-center gap-2">
-        <Users className="h-4 w-4" />
-        <span className="font-medium">{groups?.length || 0} groups</span>
+      {/* Group Count and Delete All Button */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Users className="h-4 w-4" />
+          <span className="font-medium">{groups?.length || 0} group{groups?.length !== 1 ? 's' : ''}</span>
+        </div>
+        {groups && groups.length > 0 && (
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={() => setDeleteAllDialogOpen(true)}
+            disabled={deleteAllGroups.isPending}
+            className="gap-2"
+          >
+            <Trash2 className="h-4 w-4" />
+            {deleteAllGroups.isPending ? 'Deleting...' : 'Delete All'}
+          </Button>
+        )}
       </div>
 
       {/* Loading State */}
@@ -107,11 +168,12 @@ export default function GroupsTable({ agentId }: GroupsTableProps) {
                 <TableRow>
                   <TableHead className="w-12"></TableHead>
                   <TableHead>Group Name</TableHead>
+                  <TableHead className="w-12"></TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {groups.map((group) => (
-                  <TableRow key={group.id}>
+                  <TableRow key={group.id} className="group">
                     <TableCell>
                       <ImportantStar
                         isImportant={group.is_important || false}
@@ -121,6 +183,17 @@ export default function GroupsTable({ agentId }: GroupsTableProps) {
                       />
                     </TableCell>
                     <TableCell className="font-medium">{group.groupName}</TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 text-muted-foreground hover:text-destructive opacity-0 group-hover:opacity-100 transition-opacity md:opacity-0"
+                        onClick={() => handleDeleteClick(group)}
+                        disabled={deleteGroup.isPending}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -135,18 +208,74 @@ export default function GroupsTable({ agentId }: GroupsTableProps) {
                   <div className="flex-1">
                     <p className="font-medium">{group.groupName}</p>
                   </div>
-                  <ImportantStar
-                    isImportant={group.is_important || false}
-                    onToggle={() => handleToggleImportant(group.id, group.is_important || false)}
-                    disabled={toggleImportant.isPending}
-                    size="md"
-                  />
+                  <div className="flex items-center gap-2">
+                    <ImportantStar
+                      isImportant={group.is_important || false}
+                      onToggle={() => handleToggleImportant(group.id, group.is_important || false)}
+                      disabled={toggleImportant.isPending}
+                      size="md"
+                    />
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                      onClick={() => handleDeleteClick(group)}
+                      disabled={deleteGroup.isPending}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
                 </div>
               </div>
             ))}
           </div>
         </>
       )}
+
+      {/* Delete Single Group Confirmation Dialog */}
+      <AlertDialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete Group</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to delete <strong>{groupToDelete?.name}</strong>? This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteGroup.isPending}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleDeleteConfirm}
+              disabled={deleteGroup.isPending}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleteGroup.isPending ? 'Deleting...' : 'Delete'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Delete All Groups Confirmation Dialog */}
+      <AlertDialog open={deleteAllDialogOpen} onOpenChange={setDeleteAllDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete All Groups</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to delete all <strong>{groups?.length || 0} group{groups?.length !== 1 ? 's' : ''}</strong>? 
+              This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteAllGroups.isPending}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleDeleteAll}
+              disabled={deleteAllGroups.isPending}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleteAllGroups.isPending ? 'Deleting...' : 'Delete All'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

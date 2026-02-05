@@ -119,6 +119,7 @@ const Auth = () => {
         headers: {
           "Content-Type": "application/json",
         },
+        credentials: 'include', // SECURITY: Send HttpOnly cookies for authentication
         body: JSON.stringify({
           email: signupData.email,
           password: signupData.password,

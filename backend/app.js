@@ -1,6 +1,25 @@
 require('dotenv').config();
 
 // ============================================================================
+// ENVIRONMENT CHECK (CRITICAL: Must run first)
+// ============================================================================
+console.log('==========================================');
+console.log('🔧 ENVIRONMENT CONFIGURATION');
+console.log('==========================================');
+console.log('NODE_ENV:', process.env.NODE_ENV || '⚠️ NOT SET (defaulting to development)');
+console.log('PORT:', process.env.PORT || 3001);
+console.log('==========================================\n');
+
+// Set default NODE_ENV if not set
+if (!process.env.NODE_ENV) {
+  console.warn('⚠️ WARNING: NODE_ENV not set, defaulting to "development"');
+  process.env.NODE_ENV = 'development';
+}
+
+const isProduction = process.env.NODE_ENV === 'production';
+console.log(`🚀 Running in ${isProduction ? 'PRODUCTION' : 'DEVELOPMENT'} mode\n`);
+
+// ============================================================================
 // PORT AVAILABILITY CHECK - MUST RUN BEFORE ANY SERVICE INITIALIZATION
 // ============================================================================
 // Check port availability BEFORE loading any services that might auto-initialize
@@ -212,7 +231,7 @@ const defaultAllowedOrigins = [
   'http://localhost:5173',  // Vite dev server
   'http://localhost:8080',  // Alternative dev server
   'http://localhost:3000',  // React dev server
-  'https://pa.duhanashrah.ai/',  // Production frontend domain
+  'https://pa.duhanashrah.ai',  // Production frontend domain (no trailing slash)
 ];
 
 // Production allowed origins (always included)
@@ -231,8 +250,48 @@ const allowedOrigins = [
 // Remove duplicates and empty strings
 const uniqueAllowedOrigins = [...new Set(allowedOrigins)].filter(Boolean);
 
+// Environment-aware CORS configuration
 const corsOptions = {
-  origin: true, // ✅ Allow all origins (CORS for everyone)
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, Postman, curl, etc.)
+    if (!origin) {
+      return callback(null, true);
+    }
+    
+    // In production, only allow specific origins
+    if (isProduction) {
+      const productionOrigins = [
+        'https://pa.duhanashrah.ai',
+        'https://www.pa.duhanashrah.ai',
+        ...productionAllowedOrigins
+      ];
+      
+      if (productionOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        console.warn(`⚠️ CORS blocked origin: ${origin}`);
+        callback(new Error('Not allowed by CORS'));
+      }
+    } else {
+      // In development, allow localhost variations
+      const devOrigins = [
+        'http://localhost:5173',
+        'http://localhost:5174',
+        'http://localhost:3000',
+        'http://localhost:8080',
+        'http://127.0.0.1:5173',
+        'http://127.0.0.1:3000',
+        ...uniqueAllowedOrigins
+      ];
+      
+      if (devOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        console.warn(`⚠️ CORS blocked origin: ${origin}`);
+        callback(new Error('Not allowed by CORS'));
+      }
+    }
+  },
   credentials: true, // ✅ CRITICAL: Required for HttpOnly cookies
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Idempotency-Key'], // ✅ Allow idempotency header
@@ -244,7 +303,10 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 
-console.log('✅ CORS configured to allow all origins');
+const corsMessage = isProduction 
+  ? `✅ CORS configured for PRODUCTION (restricted origins)`
+  : `✅ CORS configured for DEVELOPMENT (localhost allowed)`;
+console.log(corsMessage);
 
 // ============================================================================
 // RATE LIMITING - SELECTIVE (Security Enhancement)
@@ -344,13 +406,26 @@ app.get('/', (req, res) => {
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
+  const productionOrigins = isProduction 
+    ? ['https://pa.duhanashrah.ai', 'https://www.pa.duhanashrah.ai', ...productionAllowedOrigins]
+    : [];
+  const devOrigins = isProduction 
+    ? []
+    : ['http://localhost:5173', 'http://localhost:5174', 'http://localhost:3000', 'http://localhost:8080'];
+  
+  const allowedOriginsList = isProduction ? productionOrigins : devOrigins;
+  
   const healthCheck = {
     status: 'ok',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     environment: process.env.NODE_ENV || 'development',
-    cors: 'enabled',
-    allowedOrigins: allowedOrigins.length,
+    isProduction: isProduction,
+    cors: {
+      enabled: true,
+      allowedOrigins: allowedOriginsList,
+      credentials: true
+    },
     env: {
       databaseUrl: process.env.DATABASE_URL ? 'configured' : 'missing',
       supabaseUrl: process.env.SUPABASE_URL ? 'configured' : 'missing',

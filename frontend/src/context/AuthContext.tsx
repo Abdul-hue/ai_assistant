@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useState, useRef, useCallb
 import type { User, Session, AuthChangeEvent } from '@supabase/supabase-js';
 import { supabase } from '@/integrations/supabase/client';
 import { fetchProfile as fetchProfileApi, type Profile } from '@/lib/api/profile';
-import { API_URL } from '@/config';
+import { API_URL, buildApiUrl } from '@/config';
 
 // Types
 interface AuthContextType {
@@ -67,7 +67,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     // Check for existing session on mount with proper error handling
     const initializeAuth = async () => {
       try {
-        const response = await fetch(`${API_URL}/api/auth/me`, {
+        const response = await fetch(buildApiUrl('/api/auth/me'), {
           credentials: 'include',
         });
         
@@ -85,7 +85,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
           
           // Restore Supabase client session from cookies
           try {
-            const tokenResponse = await fetch(`${API_URL}/api/auth/session-token`, {
+            const tokenResponse = await fetch(buildApiUrl('/api/auth/session-token'), {
               credentials: 'include',
             });
             
@@ -171,7 +171,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         try {
           console.log('✅ Creating session cookies...');
 
-          const response = await fetch(`${API_URL}/api/auth/session`, {
+          const response = await fetch(buildApiUrl('/api/auth/session'), {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -203,7 +203,20 @@ export function AuthProvider({ children }: AuthProviderProps) {
           const userData = await response.json() as { user: User };
           console.log('✅ Session cookies created for:', userData.user.email);
           
+          // DEBUG: Check if cookies are in the response
+          const setCookieHeader = response.headers.get('Set-Cookie');
+          console.log('🍪 Set-Cookie header received:', setCookieHeader ? 'Yes' : 'No');
+          if (setCookieHeader) {
+            console.log('🍪 Cookie details:', setCookieHeader.substring(0, 100) + '...');
+          }
+          
           setUser(userData.user);
+          
+          // CRITICAL: Wait for browser to process Set-Cookie headers
+          // Cookies are set in the response, but browser needs time to store them
+          // This is especially important in production where cookies are HttpOnly
+          await new Promise(resolve => setTimeout(resolve, 200));
+          
           await loadProfile();
 
           // SECURITY: Clean up Supabase localStorage tokens
@@ -306,7 +319,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const logout = async (): Promise<void> => {
     try {
       // Step 1: Clear backend HttpOnly cookies
-      await fetch(`${API_URL}/api/auth/logout`, {
+      await fetch(buildApiUrl('/api/auth/logout'), {
         method: 'POST',
         credentials: 'include',
       });

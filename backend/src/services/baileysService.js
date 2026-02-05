@@ -20,6 +20,7 @@ const https = require('https');
 const {
   syncContactsForAgent,
   setupContactUpdateListeners,
+  cleanupPeriodicSync,
 } = require('./contactSyncService');
 const {
   syncGroupsForAgent,
@@ -56,8 +57,9 @@ process.on('unhandledRejection', (reason, promise) => {
   
   // Ignore timeout errors from keepalive - they're expected and handled
   if (isKeepaliveError) {
-    // Silently ignore - these are expected during network instability
-    return;
+    // Suppress non-fatal Baileys timeout errors
+    console.log(`[BAILEYS] ⚠️ Keepalive timeout (non-critical, will retry)`);
+    return; // Don't log full stack trace
   }
   
   // Log other unhandled rejections but don't crash
@@ -128,6 +130,12 @@ const connectionLocks = new Map(); // agentId -> boolean
 const lastConnectionAttempt = new Map(); // agentId -> timestamp ms
 const last401Failure = new Map(); // agentId -> timestamp ms (prevents auto-retry after 401)
 const recentPairings = new Map(); // agentId -> timestamp ms (tracks when credentials were last saved from QR scan)
+// Connection stability management
+const heartbeats = new Map(); // agentId -> intervalId
+const autoSaveIntervals = new Map(); // agentId -> intervalId
+const reconnectionAttempts = new Map(); // agentId -> attemptCount
+const maxReconnectionAttempts = 5;
+const reconnectionDelay = 5000; // Start with 5 seconds
 // Cache for @lid JID to actual phone number mapping (for linked device messages)
 // Format: "@lid JID" -> "phone@s.whatsapp.net"
 const lidToPhoneCache = new Map();
@@ -836,13 +844,28 @@ function updateNetworkQuality(agentId, success, latency = null) {
  * @returns {Promise<boolean>} - True if successful, false otherwise
  */
 async function sendKeepaliveWithRetry(sock, agentId, maxRetries = 3) {
+  // Check network quality before sending keepalive
+  const quality = networkQuality.get(agentId);
+  if (quality && quality.failureRate > 0.7) {
+    // Skip ping if network quality is poor (70%+ failure rate)
+    console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... ⏭️ Skipping ping - poor network quality (${Math.round(quality.failureRate * 100)}% failure rate)`);
+    return true; // Don't send ping, avoid timeout
+  }
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const startTime = Date.now();
+      // Increase timeout to 30 seconds (was default 10s)
       await sock.query({
         tag: 'iq',
-        attrs: { to: '@s.whatsapp.net', type: 'get', xmlns: 'w:p' },
-        content: [{ tag: 'ping', attrs: {} }]
+        attrs: { 
+          id: sock.generateMessageTag(),
+          to: '@s.whatsapp.net', 
+          type: 'get', 
+          xmlns: 'w:p' 
+        },
+        content: [{ tag: 'ping', attrs: {} }],
+        timeout: 30000 // 30 seconds instead of default 10s
       });
       const latency = Date.now() - startTime;
       console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... ✅ Success (attempt ${attempt}, ${latency}ms)`);
@@ -862,7 +885,7 @@ async function sendKeepaliveWithRetry(sock, agentId, maxRetries = 3) {
         if (!isTimeoutError) {
           console.log(`[KEEPALIVE] ${agentId.substring(0, 8)}... ⚠️ Failed attempt ${attempt}, retrying...`);
         }
-        await new Promise(resolve => setTimeout(resolve, 1000)); // 1s between retries
+        await new Promise(resolve => setTimeout(resolve, 2000 * attempt)); // Exponential backoff: 2s, 4s, 6s
       } else {
         // Only log non-timeout errors on final failure
         if (!isTimeoutError) {
@@ -1106,11 +1129,161 @@ function startHeartbeat(agentId, session) {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Connection Stability: Heartbeat System
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+function setupHeartbeat(agentId, sock) {
+  // Clear existing heartbeat
+  if (heartbeats.has(agentId)) {
+    clearInterval(heartbeats.get(agentId));
+  }
+
+  // Send heartbeat every 30 seconds
+  const heartbeatInterval = setInterval(async () => {
+    try {
+      if (sock && sock.user) {
+        // Update last heartbeat in database
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({ 
+            last_heartbeat: new Date().toISOString(),
+            connection_quality: JSON.stringify({
+              lastPing: Date.now(),
+              isAlive: true
+            })
+          })
+          .eq('agent_id', agentId);
+        
+        // Send presence update to keep connection alive
+        await sock.sendPresenceUpdate('available').catch(err => {
+          console.log(`[BAILEYS-${agentId.substring(0, 8)}] Presence update failed:`, err.message);
+        });
+        
+        console.log(`[BAILEYS-${agentId.substring(0, 8)}] ❤️ Heartbeat sent`);
+      }
+    } catch (error) {
+      console.error(`[BAILEYS-${agentId.substring(0, 8)}] Heartbeat failed:`, error.message);
+    }
+  }, 30000);
+
+  heartbeats.set(agentId, heartbeatInterval);
+  console.log(`[BAILEYS-${agentId.substring(0, 8)}] 💓 Heartbeat system started`);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Connection Stability: Auto-Save Session System
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async function saveSession(agentId) {
+  try {
+    const session = activeSessions.get(agentId);
+    if (!session || !session.saveCreds) return;
+    
+    // Force save credentials
+    await session.saveCreds();
+    
+    console.log(`[BAILEYS-${agentId.substring(0, 8)}] 💾 Session saved successfully`);
+  } catch (error) {
+    console.error(`[BAILEYS-${agentId.substring(0, 8)}] Failed to save session:`, error);
+  }
+}
+
+function setupAutoSave(agentId) {
+  // Clear existing auto-save
+  if (autoSaveIntervals.has(agentId)) {
+    clearInterval(autoSaveIntervals.get(agentId));
+  }
+
+  // Auto-save session every 60 seconds
+  const autoSaveInterval = setInterval(async () => {
+    await saveSession(agentId);
+  }, 60000);
+  
+  autoSaveIntervals.set(agentId, autoSaveInterval);
+  console.log(`[BAILEYS-${agentId.substring(0, 8)}] 🔄 Auto-save enabled (60s interval)`);
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Connection Stability: Auto-Reconnection Handler
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+async function handleConnectionClose(agentId, lastDisconnect) {
+  const statusCode = lastDisconnect?.error?.output?.statusCode;
+  const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+  
+  console.log(`[BAILEYS-${agentId.substring(0, 8)}] Connection closed:`, {
+    statusCode,
+    reason: lastDisconnect?.error?.output?.payload?.message || lastDisconnect?.error?.message,
+    shouldReconnect
+  });
+
+  if (shouldReconnect) {
+    const attempts = reconnectionAttempts.get(agentId) || 0;
+    
+    if (attempts < maxReconnectionAttempts) {
+      reconnectionAttempts.set(agentId, attempts + 1);
+      
+      // Exponential backoff: 5s, 10s, 20s, 40s, 80s
+      const delay = reconnectionDelay * Math.pow(2, attempts);
+      
+      console.log(`[BAILEYS-${agentId.substring(0, 8)}] 🔄 Reconnecting in ${delay}ms (attempt ${attempts + 1}/${maxReconnectionAttempts})`);
+      
+      await supabaseAdmin
+        .from('whatsapp_sessions')
+        .update({
+          status: 'reconnecting',
+          reconnection_count: attempts + 1,
+          last_reconnection: new Date().toISOString()
+        })
+        .eq('agent_id', agentId);
+      
+      setTimeout(async () => {
+        console.log(`[BAILEYS-${agentId.substring(0, 8)}] ⚡ Starting reconnection attempt ${attempts + 1}`);
+        try {
+          await initializeWhatsApp(agentId);
+        } catch (error) {
+          console.error(`[BAILEYS-${agentId.substring(0, 8)}] Reconnection failed:`, error);
+        }
+      }, delay);
+    } else {
+      console.error(`[BAILEYS-${agentId.substring(0, 8)}] ❌ Max reconnection attempts reached`);
+      await supabaseAdmin
+        .from('whatsapp_sessions')
+        .update({
+          status: 'failed',
+          is_active: false,
+          last_error: 'Max reconnection attempts exceeded'
+        })
+        .eq('agent_id', agentId);
+      reconnectionAttempts.delete(agentId);
+    }
+  } else {
+    // Logged out - clear everything
+    console.log(`[BAILEYS-${agentId.substring(0, 8)}] 🚪 Logged out, clearing session`);
+    await disconnectWhatsApp(agentId);
+  }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Cleanup all monitoring for an agent
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // ✅ PHASE 5: Enhanced cleanup to include new resilience mechanisms
 function cleanupMonitoring(agentId) {
   console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Cleaning up all monitoring...`);
+  
+  // Clean up periodic contact sync
+  cleanupPeriodicSync(agentId);
+  
+  // Clear heartbeat
+  if (heartbeats.has(agentId)) {
+    clearInterval(heartbeats.get(agentId));
+    heartbeats.delete(agentId);
+    console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Heartbeat cleared`);
+  }
+  
+  // Clear auto-save
+  if (autoSaveIntervals.has(agentId)) {
+    clearInterval(autoSaveIntervals.get(agentId));
+    autoSaveIntervals.delete(agentId);
+    console.log(`[CLEANUP] ${agentId.substring(0, 8)}... Auto-save cleared`);
+  }
   
   // Clear connection state monitor
   const monitor = connectionMonitors.get(agentId);
@@ -1316,7 +1489,8 @@ async function clearAuthState(agentId) {
     console.log(`[BAILEYS] ✅ Database auth state cleared`);
     
     // 3. Remove from active sessions
-    await removeAgentFromActiveSessions(agentId);
+    activeSessions.delete(agentId);
+    cleanupMonitoring(agentId);
     
     // 4. Clear connection locks
     connectionLocks.delete(agentId);
@@ -1862,6 +2036,49 @@ async function initializeWhatsApp(agentId, userId = null) {
   console.log(`\n[BAILEYS] ==================== INITIALIZATION START ====================`);
   console.log(`[BAILEYS] Initializing WhatsApp for agent: ${agentId.substring(0, 40)}`);
   console.log(`[BAILEYS] Node: ${process.version}, Platform: ${process.platform}`);
+  
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // Instance Conflict Prevention: Check for existing active instance
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // Prevent multiple instances
+  if (activeSessions.has(agentId)) {
+    const existingSession = activeSessions.get(agentId);
+    if (existingSession?.isConnected) {
+      console.log(`[BAILEYS] ⚠️ Already connected, skipping`);
+      return {
+        success: true,
+        status: 'connected',
+        qrCode: null,
+        phoneNumber: existingSession.phoneNumber,
+        isActive: true
+      };
+    }
+  }
+  
+  // Check database for existing active instance
+  try {
+    const { data: existing } = await supabaseAdmin
+      .from('whatsapp_sessions')
+      .select('*')
+      .eq('agent_id', agentId)
+      .maybeSingle();
+    
+    if (existing?.is_active && existing.instance_pid !== INSTANCE_PID) {
+      const lastHeartbeat = existing.last_heartbeat ? new Date(existing.last_heartbeat) : null;
+      const timeSinceHeartbeat = lastHeartbeat ? Date.now() - lastHeartbeat.getTime() : Infinity;
+      
+      if (timeSinceHeartbeat < 60000) { // Active within last minute
+        throw new Error(`Another instance (PID: ${existing.instance_pid}) is already running for this connection`);
+      } else {
+        console.log(`[BAILEYS] 🔄 Taking over from stale instance (last heartbeat: ${Math.round(timeSinceHeartbeat/1000)}s ago)`);
+      }
+    }
+  } catch (error) {
+    if (error.message.includes('Another instance')) {
+      throw error;
+    }
+    console.warn(`[BAILEYS] ⚠️ Error checking for existing instance:`, error.message);
+  }
   
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // CRITICAL: Prevent race condition - only ONE initialization at a time per agent
@@ -2482,32 +2699,53 @@ async function initializeWhatsApp(agentId, userId = null) {
       .maybeSingle();
     
     const isLoggedOut = dbStatus?.status === 'logged_out';
+    const isConflict = dbStatus?.status === 'conflict';
     
-    // ✅ FIX 4: Force QR if logged_out OR no credentials
-    // If status is 'logged_out', we MUST generate QR (credentials were cleared)
-    const willUseCredentials = !isLoggedOut && 
+    // ✅ FIX: If credentials show registered=false AND we're not just after pairing, they're likely invalid
+    // registered=false is normal right after QR scan, but if it persists, credentials might be stale
+    const credsRegistered = state.creds?.registered !== false;
+    const credsAreStale = !credsRegistered && !justPairedRecently && !isReconnectingAfterPairing;
+    
+    // ✅ FIX 4: Force QR if logged_out, conflict, OR stale credentials
+    // If status is 'logged_out' or 'conflict', we MUST generate QR (credentials were cleared/invalidated)
+    const willUseCredentials = !isLoggedOut && !isConflict && !credsAreStale &&
                               ((hasPairedDevice && hasSignalKeys && hasDeviceId) || 
                                (isReconnectingAfterPairing && justPairedRecently && hasSignalKeys));
     
-    const shouldGenerateQR = isLoggedOut || !willUseCredentials;
+    const shouldGenerateQR = isLoggedOut || isConflict || credsAreStale || !willUseCredentials;
     
     if (isLoggedOut) {
       console.log('[BAILEYS] 🚨 Status is "logged_out" - FORCING QR generation (credentials invalidated)');
+    }
+    
+    if (isConflict) {
+      console.log('[BAILEYS] 🚨 Status is "conflict" - FORCING QR generation (credentials invalidated)');
+    }
+    
+    if (credsAreStale) {
+      console.log('[BAILEYS] 🚨 Credentials show registered=false and not recently paired - FORCING QR generation');
     }
     
     console.log('[BAILEYS] 🔍 Connection Strategy:', {
       hasDeviceId,
       hasSignalKeys,
       hasPairedDevice,
-      willUseCredentials: hasPairedDevice,
+      credsRegistered,
+      credsAreStale,
+      isLoggedOut,
+      isConflict,
+      willUseCredentials,
       willGenerateQR: shouldGenerateQR,
       deviceId: hasDeviceId ? state.creds.me.id.split(':')[0] : null
     });
     
-    // If we have paired device, clear QR trackers - expect direct connection
-    if (hasPairedDevice) {
+    // If we have paired device AND credentials are valid, clear QR trackers - expect direct connection
+    if (hasPairedDevice && willUseCredentials) {
       console.log('[BAILEYS] ✅ Using existing credentials - expecting direct connection (no QR)');
       qrGenerationTracker.delete(agentId);
+    } else if (shouldGenerateQR) {
+      console.log('[BAILEYS] 📱 Will generate QR code - credentials invalid or missing');
+      qrGenerationTracker.set(agentId, Date.now());
     }
     
     // CRITICAL: Fetch latest Baileys version for compatibility
@@ -2675,15 +2913,15 @@ async function initializeWhatsApp(agentId, userId = null) {
       store: store,
       
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      // FIX 5: Updated socket configuration for better stability
+      // Connection stability settings - prevent auto-disconnections
       // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-      keepAliveIntervalMs: 25000, // 25 seconds
-      defaultQueryTimeoutMs: 60000, // 60 seconds
-      connectTimeoutMs: 60000, // 60 seconds
+      keepAliveIntervalMs: 30000, // Send keepalive every 30s
+      defaultQueryTimeoutMs: 60000, // 1 minute timeout
+      connectTimeoutMs: 60000,
       qrTimeout: 90000, // Keep at 90s for QR scan tolerance
       
-      retryRequestDelayMs: 2000, // 2 seconds
-      maxMsgRetryCount: 3, // Reduced to 3 for faster failure detection
+      retryRequestDelayMs: 250,
+      maxMsgRetryCount: 5,
       
       // IMPORTANT: Remove emitOwnEvents and fireInitQueries
       // Let Baileys handle these internally
@@ -2691,12 +2929,12 @@ async function initializeWhatsApp(agentId, userId = null) {
       
       // CRITICAL: getMessage handler - return undefined to prevent errors
       getMessage: async (key) => {
-        return undefined;
+        return { conversation: 'Message not available' };
       },
       
       generateHighQualityLinkPreview: false,
       syncFullHistory: false,
-      markOnlineOnConnect: true // Changed to true - helps maintain connection
+      markOnlineOnConnect: true // Helps maintain connection
     });
     
     // ✅ FIX 1: Bind store to socket events so messages are stored automatically
@@ -2723,10 +2961,11 @@ async function initializeWhatsApp(agentId, userId = null) {
     });
     
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // PHASE 1: CUSTOM KEEPALIVE MANAGER (More aggressive than Baileys default)
+    // PHASE 1: CUSTOM KEEPALIVE MANAGER (Balanced keepalive)
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // Custom keepalive manager - MORE AGGRESSIVE than Baileys default
-    // This runs every 10 seconds with retry mechanism to prevent disconnection during network instability
+    // Custom keepalive manager - runs every 30 seconds with 30s timeout
+    // Reduced frequency to prevent timeout errors and reduce server load
+    const KEEPALIVE_INTERVAL = 30000; // 30 seconds (was 10s)
     const customKeepalive = setInterval(async () => {
       try {
         const session = activeSessions.get(agentId);
@@ -2762,7 +3001,7 @@ async function initializeWhatsApp(agentId, userId = null) {
         // Outer catch for any unexpected errors in the interval callback
         console.error(`[KEEPALIVE] ${agentId.substring(0, 8)}... Interval callback error:`, error.message);
       }
-    }, 10000); // Every 10 seconds
+    }, KEEPALIVE_INTERVAL); // Every 30 seconds (reduced from 10s to prevent timeouts)
     
     // Store in session for cleanup (will be set after sessionData is created)
     // Note: We'll attach this to sessionData after it's created below
@@ -2963,24 +3202,6 @@ async function initializeWhatsApp(agentId, userId = null) {
           console.log(`[WS-ERROR] ${agentId.substring(0, 8)}... Error threshold reached (${newErrorCount}/${WS_ERROR_THRESHOLD}) - proceeding with normal disconnect handling`);
         }
       }
-      
-      if (connection === 'close' && lastDisconnect) {
-        const session = activeSessions.get(agentId);
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const hasQR = !!session?.qrCode;
-        const wasPairing = hasQR && !session?.isConnected;
-        const errorMessage = lastDisconnect?.error?.message || '';
-        
-        // Only log significant close events (not normal QR timeout)
-        if (statusCode && statusCode !== 515) { // 515 = QR timeout, expected
-          console.log(`[BAILEYS] ❌ Connection closed: ${statusCode} - ${errorMessage || 'unknown'}`);
-        }
-        
-        if (wasPairing && statusCode && statusCode !== 515) {
-          // Connection closed during pairing (not QR timeout)
-          console.log(`[BAILEYS] ⚠️ Connection closed during pairing - network issue or server rejection`);
-        }
-      }
 
       // Handle QR code - ONLY process if we don't have valid paired credentials
       if (qr) {
@@ -3055,11 +3276,48 @@ async function initializeWhatsApp(agentId, userId = null) {
       // Connection connecting state
       if (connection === 'connecting') {
         console.log(`[BAILEYS] 🔄 Connecting to WhatsApp...`);
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({ connection_state: 'connecting' })
+          .eq('agent_id', agentId);
+      }
+      
+      // Connection closed
+      if (connection === 'close') {
+        // Stop heartbeat
+        if (heartbeats.has(agentId)) {
+          clearInterval(heartbeats.get(agentId));
+          heartbeats.delete(agentId);
+        }
+        
+        // Stop auto-save
+        if (autoSaveIntervals.has(agentId)) {
+          clearInterval(autoSaveIntervals.get(agentId));
+          autoSaveIntervals.delete(agentId);
+        }
+        
+        console.log(`[BAILEYS] 🔴 Connection closed`);
+        
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({
+            status: 'disconnected',
+            is_active: false,
+            disconnected_at: new Date().toISOString(),
+            last_error: lastDisconnect?.error?.message || 'Connection closed'
+          })
+          .eq('agent_id', agentId);
+        
+        // Handle reconnection logic
+        await handleConnectionClose(agentId, lastDisconnect);
       }
 
       // Connection success
       if (connection === 'open') {
         console.log(`\n[BAILEYS] ========== 🎉 CONNECTION SUCCESS 🎉 ==========`);
+        
+        // Connection successful - reset reconnection attempts
+        reconnectionAttempts.delete(agentId);
         
         qrGenerationTracker.delete(agentId);
         console.log(`[BAILEYS] 🛑 QR generation disabled for ${agentId.substring(0, 40)} (connection open)`);
@@ -3086,7 +3344,10 @@ async function initializeWhatsApp(agentId, userId = null) {
                 qr_code: null,
                 qr_generated_at: null,
                 last_connected: new Date().toISOString(),
+                connected_at: new Date().toISOString(),
                 updated_at: new Date().toISOString(),
+                last_error: null,
+                reconnection_count: 0,
                 // Instance tracking
                 instance_id: INSTANCE_ID,
                 instance_hostname: INSTANCE_HOSTNAME,
@@ -3117,7 +3378,17 @@ async function initializeWhatsApp(agentId, userId = null) {
             session.socketReadyState = session.socket?.ws?.readyState ?? null;
             session.failureReason = null;
             session.failureAt = null;
+            session.saveCreds = state.saveCreds; // Store saveCreds function for auto-save
           }
+          
+          // Start heartbeat system
+          setupHeartbeat(agentId, sock);
+          
+          // Start auto-save system
+          setupAutoSave(agentId);
+          
+          // Save session immediately
+          await saveSession(agentId);
           
           emitAgentEvent(agentId, 'connected', {
             phoneNumber: cleanPhone
@@ -3468,7 +3739,8 @@ async function initializeWhatsApp(agentId, userId = null) {
           clearReconnectionState(agentId);
           
           // Remove from active sessions
-          await removeAgentFromActiveSessions(agentId);
+          activeSessions.delete(agentId);
+          cleanupMonitoring(agentId);
         }
         
         // Emit disconnected event
@@ -5538,6 +5810,21 @@ async function disconnectWhatsApp(agentId) {
       // STEP 2: Stop health check, heartbeat, connection monitor, and backup intervals
       console.log(`[BAILEYS] 🛑 Step 2: Stopping all intervals...`);
       try {
+        // Clear heartbeat
+        if (heartbeats.has(agentId)) {
+          clearInterval(heartbeats.get(agentId));
+          heartbeats.delete(agentId);
+        }
+        
+        // Clear auto-save
+        if (autoSaveIntervals.has(agentId)) {
+          clearInterval(autoSaveIntervals.get(agentId));
+          autoSaveIntervals.delete(agentId);
+        }
+        
+        // Clear reconnection attempts
+        reconnectionAttempts.delete(agentId);
+        
         // REMOVED: healthCheckInterval - no longer used
         if (session.heartbeatInterval) {
           clearInterval(session.heartbeatInterval);
@@ -5547,6 +5834,10 @@ async function disconnectWhatsApp(agentId) {
           clearInterval(session.backupInterval);
           session.backupInterval = null;
         }
+        
+        // Save session one last time before disconnect
+        await saveSession(agentId);
+        
         cleanupSteps.intervalsCleared = true;
         console.log(`[BAILEYS] ✅ All intervals cleared`);
       } catch (intervalError) {
@@ -6566,6 +6857,72 @@ function startNetworkStatusLogging() {
 
 // Start logging on module load
 startNetworkStatusLogging();
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Graceful Shutdown Handler
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+const setupGracefulShutdown = () => {
+  const cleanup = async () => {
+    console.log('🛑 Shutting down gracefully...');
+    
+    for (const [agentId, session] of activeSessions) {
+      try {
+        console.log(`[BAILEYS-${agentId.substring(0, 8)}] 💾 Saving session before shutdown...`);
+        
+        // Save session one last time
+        await saveSession(agentId);
+        
+        // Clear heartbeats
+        if (heartbeats.has(agentId)) {
+          clearInterval(heartbeats.get(agentId));
+          heartbeats.delete(agentId);
+        }
+        
+        // Clear auto-save
+        if (autoSaveIntervals.has(agentId)) {
+          clearInterval(autoSaveIntervals.get(agentId));
+          autoSaveIntervals.delete(agentId);
+        }
+        
+        // Update database
+        await supabaseAdmin
+          .from('whatsapp_sessions')
+          .update({
+            is_active: false,
+            status: 'stopped',
+            disconnected_at: new Date().toISOString()
+          })
+          .eq('agent_id', agentId);
+        
+        // Close socket gracefully
+        if (session?.socket) {
+          session.socket.end();
+        }
+        
+        console.log(`[BAILEYS-${agentId.substring(0, 8)}] ✅ Cleaned up successfully`);
+      } catch (error) {
+        console.error(`[BAILEYS-${agentId.substring(0, 8)}] Error during cleanup:`, error);
+      }
+    }
+    
+    console.log('👋 Shutdown complete');
+    process.exit(0);
+  };
+  
+  process.on('SIGTERM', cleanup);
+  process.on('SIGINT', cleanup);
+  process.on('uncaughtException', async (error) => {
+    console.error('💥 Uncaught exception:', error);
+    await cleanup();
+  });
+  process.on('unhandledRejection', async (reason, promise) => {
+    console.error('💥 Unhandled rejection at:', promise, 'reason:', reason);
+    // Don't call cleanup on unhandled rejection - let the existing handler deal with it
+  });
+};
+
+// Setup graceful shutdown on module load
+setupGracefulShutdown();
 
 module.exports = {
   initializeWhatsApp,
